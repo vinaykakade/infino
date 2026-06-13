@@ -4,7 +4,7 @@ Read `[CONTRIBUTING.md](CONTRIBUTING.md)` first — it covers prerequisites, bui
 
 ## Project overview
 
-**Infino is a fast retrieval engine that keeps your data on cheap object storage (like Amazon S3) and runs SQL, full-text search, and vector search over it from a single system**. One file (a "superfile") is a valid Apache Parquet file with embedded BM25 + vector indexes spliced into it. The `supertable` layer composes many superfiles into a queryable table with snapshot-isolated reads, append-only writes, and atomic-commit manifest. Object-storage-native; no daemon, no managed service.
+**Infino is a fast retrieval engine that stores your data on object storage (like Amazon S3) and runs SQL, full-text search, and vector search over it from a single system**. One file (a "superfile") is a valid Apache Parquet file with embedded BM25 + vector indexes spliced into it. The `supertable` layer composes many superfiles into a queryable table with snapshot-isolated reads, append-only writes, and atomic-commit manifest. Object-storage-native; no daemon, no managed service.
 
 For the plain-language tour — what Infino is, the mental model, and how it compares to other systems — see `docs/architecture/overview.md`. For design references, read `docs/architecture/superfile.md` and `docs/architecture/supertable.md` before touching format or manifest code.
 
@@ -235,7 +235,7 @@ storage/superfile/supertable layers, which are themselves internal.
 
 - **Entry points** — `connect(uri)` and `connect_with(uri, ConnectOptions)`, returning a `Connection`.
 - `**Connection`** — `create_table`, `open_table`, `drop_table` (logical by default; `purge = true` also deletes the table's storage subtree), `list_tables`, `query_sql`.
-- `**Supertable**` (the table handle) — `append`, `update`, `delete`, `schema`, plus the sync search surface. All four search methods (`bm25_search`, `vector_search`, and the unranked `token_match` / `exact_match`) return Arrow rows (`Vec<RecordBatch>`) and take a `projection: Option<&[&str]>` naming the output columns (`_id`, any visible scalar column, or the trailing `score`); `None` returns the whole row, and only the projected scalar columns are decoded — `Some(&["_id", "score"])` is the no-scalar-decode path. The async kernels and the superfile-local hit representation stay on the internal `SupertableReader`; the public methods resolve to the stable `_id` before returning.
+- `**Supertable**` (the table handle) — `append`, `update`, `delete`, `schema`, plus the sync search surface. All four search methods (`bm25_search`, `vector_search`, and the unranked `token_match` / `exact_match`) return Arrow rows (`Vec<RecordBatch>`) and take a `projection: Option<&[&str]>` naming the output columns (`_id`, any visible scalar column, or the trailing `score`); `None` returns the engine-native `_id` + `score` pair (no scalar decode — `_id` reads from its dedicated id pages), and materializing row data is an explicit opt-in by naming the columns to decode. The async kernels and the superfile-local hit representation stay on the internal `SupertableReader`; the public methods resolve to the stable `_id` before returning.
 - **Supporting types** — `ConnectOptions`, `ColdFetchMode`, `IndexSpec`, `Metric`, `BoolMode`, `VectorSearchOptions`, `MutationStats`, the `InfinoError` enum, and `BUILDER_ID`.
 
 Everything else — `SupertableReader`/`SupertableWriter`, the manifest

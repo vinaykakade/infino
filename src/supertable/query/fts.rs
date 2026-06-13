@@ -9,13 +9,13 @@
 //! [`Supertable`](super::super::Supertable):
 //!
 //! ```ignore
-//! // Full rows (`_id`, scalar columns, `score`); projection `None`.
-//! let rows: Vec<RecordBatch> =
+//! // Bare call: `_id` + `score` only — no scalar decode.
+//! let ids: Vec<RecordBatch> =
 //!     table.bm25_search("title", "rust async", 10, BoolMode::Or, None)?;
 //!
-//! // Just `_id` + `score` (no scalar decode): project them explicitly.
-//! let ids: Vec<RecordBatch> =
-//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, Some(&["_id", "score"]))?;
+//! // Materialize row data by naming the columns to decode.
+//! let rows: Vec<RecordBatch> =
+//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, Some(&["_id", "title", "score"]))?;
 //!
 //! // Unranked candidate sets (Arrow rows, score == 0.0).
 //! let any = table.token_match("title", "rust async", BoolMode::Or, None)?;
@@ -82,6 +82,89 @@ use crate::supertable::manifest::{Manifest, SuperfileEntry};
 use crate::supertable::query::SuperfileHit;
 use crate::supertable::query::exec::common::resolve_hits_named;
 use crate::supertable::query::prune::{PruneLeaf, select_superfiles};
+
+/// Cross-segment top-k score sharing for the BM25 fan-out.
+///
+/// Every segment kernel runs an independent top-k; without
+/// coordination, segment N knows nothing about the k hits segments
+/// 1..N-1 already produced, so it scores blocks the global result can
+/// never use. This shares the running **global kth-best score** as a
+/// floor: each kernel reads it at start and seeds its pruning
+/// structures (BMW block skips, the MaxScore essential boundary, AND
+/// block-max bars) from it; each finishing kernel merges its surviving
+/// scores back, monotonically raising the floor for the segments still
+/// running.
+///
+/// Correctness: the floor only ever prunes docs scoring **strictly
+/// below** the published kth-best (kernels apply it via
+/// `floor.next_down()` comparisons), and the published floor is always
+/// ≤ the final global kth-best, so every doc that could appear in the
+/// merged top-k survives in some segment's result — the merged output
+/// is identical to an uncoordinated run, including score ties. Only
+/// the amount of *skipped work* depends on segment completion order.
+struct SharedTopK {
+    k: usize,
+    /// Min-heap (via `Reverse`) of the best `k` scores seen so far.
+    heap: std::sync::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<OrdScore>>>,
+    /// f32 bits of the current floor; `NEG_INFINITY` until `k` scores
+    /// have been seen. Monotonically non-decreasing.
+    floor_bits: std::sync::atomic::AtomicU32,
+}
+
+/// Total-order f32 wrapper for the [`SharedTopK`] heap (BM25 scores
+/// are finite, but `f32` still needs an `Ord` shim).
+#[derive(PartialEq)]
+struct OrdScore(f32);
+impl Eq for OrdScore {}
+impl PartialOrd for OrdScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrdScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl SharedTopK {
+    fn new(k: usize) -> Arc<Self> {
+        Arc::new(Self {
+            k,
+            heap: std::sync::Mutex::new(std::collections::BinaryHeap::new()),
+            floor_bits: std::sync::atomic::AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+        })
+    }
+
+    /// The current global floor — `NEG_INFINITY` until k scores merged.
+    fn floor(&self) -> f32 {
+        f32::from_bits(self.floor_bits.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Merge one finished segment's (tombstone-surviving) scores and
+    /// publish the new kth-best as the floor once k scores are known.
+    fn merge(&self, scores: impl IntoIterator<Item = f32>) {
+        let mut heap = self.heap.lock().expect("SharedTopK mutex poisoned");
+        for s in scores {
+            if heap.len() < self.k {
+                heap.push(std::cmp::Reverse(OrdScore(s)));
+            } else if let Some(std::cmp::Reverse(OrdScore(min))) = heap.peek()
+                && s > *min
+            {
+                heap.pop();
+                heap.push(std::cmp::Reverse(OrdScore(s)));
+            }
+        }
+        if heap.len() == self.k
+            && let Some(std::cmp::Reverse(OrdScore(min))) = heap.peek()
+        {
+            // The heap min only rises, so a plain store stays monotone
+            // under the lock.
+            self.floor_bits
+                .store(min.to_bits(), std::sync::atomic::Ordering::Release);
+        }
+    }
+}
 
 impl SupertableReader {
     /// Single-column BM25 search across the pinned manifest's
@@ -155,38 +238,73 @@ impl SupertableReader {
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
         let fanout = fanout_for(mode, positives.len(), !negatives.is_empty());
         let work_units = build_work_units(&kept_refs, fanout, pool_threads);
-        let units: Vec<(Arc<SuperfileEntry>, Option<(u32, u32)>)> =
-            work_units.into_iter().map(|u| (u.entry, u.range)).collect();
+        let units: Vec<(Arc<SuperfileEntry>, (Option<(u32, u32)>, uuid::Uuid))> = work_units
+            .into_iter()
+            .map(|u| {
+                let suid = u.entry.superfile_id;
+                (u.entry, (u.range, suid))
+            })
+            .collect();
 
         let term_arc: Arc<Vec<String>> = Arc::new(positives);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives);
         let column_arc = Arc::new(column_owned);
+
+        // Cross-segment threshold sharing: each unit reads the global
+        // kth-best floor before searching and merges its surviving
+        // scores back after — late units skip every block that can't
+        // beat what earlier units already found. Tombstoned hits are
+        // excluded from the merge so deleted rows never raise the bar.
+        let shared = SharedTopK::new(k);
+        let tombstones = self.tombstone_cache.clone();
+        let now = std::time::Instant::now();
 
         // One shared fan-out (`query::dispatch::fanout`) — the same
         // orchestrator the vector path uses. It warms the tombstone
         // sidecars in one batch, opens each superfile reader and runs the
         // kernel under `tokio::spawn` so cold GETs overlap, then tags +
         // tombstone-filters each unit's hits. The per-unit `params` is
-        // the optional doc-id sub-range; `None` searches the whole
-        // superfile.
-        let kernel = move |r: Arc<SuperfileReader>, range: Option<(u32, u32)>| {
+        // the optional doc-id sub-range (`None` searches the whole
+        // superfile) plus the superfile id for the tombstone-aware merge.
+        let kernel = move |r: Arc<SuperfileReader>,
+                           (range, suid): (Option<(u32, u32)>, uuid::Uuid)| {
             let column_arc = Arc::clone(&column_arc);
             let term_arc = Arc::clone(&term_arc);
             let neg_arc = Arc::clone(&neg_arc);
+            let shared = Arc::clone(&shared);
+            let tombstones = tombstones.clone();
             async move {
                 let term_refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
-                match range {
+                let floor = shared.floor();
+                let hits = match range {
                     // Ranged units exist only for negation-free queries
-                    // (`build_or_work_units` never slices otherwise).
+                    // (`fanout_for` never slices otherwise).
                     Some((start, end)) => r
-                        .bm25_search_or_range_pretokenized(&column_arc, &term_refs, k, start, end)
+                        .bm25_search_or_range_pretokenized_with_floor(
+                            &column_arc,
+                            &term_refs,
+                            k,
+                            start,
+                            end,
+                            floor,
+                        )
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string())),
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?,
                     None if neg_arc.is_empty() => r
-                        .bm25_search_pretokenized(&column_arc, &term_refs, k, mode)
+                        .bm25_search_pretokenized_with_floor(
+                            &column_arc,
+                            &term_refs,
+                            k,
+                            mode,
+                            floor,
+                        )
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string())),
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?,
                     None => {
+                        // Negated queries run unfloored (the excluding
+                        // kernel carries no cross-segment floor today);
+                        // their survivors still merge below, which is
+                        // harmless bookkeeping.
                         let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
                         r.bm25_search_pretokenized_excluding(
                             &column_arc,
@@ -196,9 +314,24 @@ impl SupertableReader {
                             mode,
                         )
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?
                     }
+                };
+                // Raise the global floor with this unit's surviving
+                // scores. Sidecars were prefetched by the dispatcher,
+                // so the bitmap lookup is an in-memory hit; on a cache
+                // miss/error we simply don't merge (a lower floor is
+                // always safe).
+                match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
+                    Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
+                        hits.iter()
+                            .filter(|(d, _)| !bitmap.contains(*d))
+                            .map(|(_, s)| *s),
+                    ),
+                    Some(Err(_)) => {}
+                    _ => shared.merge(hits.iter().map(|(_, s)| *s)),
                 }
+                Ok(hits)
             }
         };
         let per_unit = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
@@ -408,8 +541,8 @@ impl SupertableReader {
             let hits = self.bm25_search_async(column, query, k, mode).await?;
             // `projection` selects columns by name (any of `_id`, the
             // visible scalar columns, or the trailing `score`); `None`
-            // returns the whole row. The shared resolver decodes only
-            // the projected columns.
+            // returns `_id` + `score` only. The shared resolver decodes
+            // only the projected columns.
             let batch = resolve_hits_named(self, &hits, projection, "bm25_search")
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))?;
@@ -642,8 +775,9 @@ impl Supertable {
     ///
     /// `projection` selects output columns by name (any of `_id`, the
     /// visible scalar columns, or the trailing `score`); `None` returns
-    /// the whole row. Only the projected scalar columns are decoded, so
-    /// `Some(&["_id", "score"])` is the cheap "just the hits" path.
+    /// the engine-native result — `_id` + `score` only. Only the
+    /// projected scalar columns are decoded, so materializing row data
+    /// is an explicit opt-in by column name.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -655,12 +789,12 @@ impl Supertable {
     /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
     /// # posts.append(&RecordBatch::try_new(
     /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))])?)?;
-    /// // `None` projection returns full rows:
-    /// let rows = posts.bm25_search("body", "fox", 10, BoolMode::Or, None)?;
-    /// assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-    /// // Project just `_id` + `score` → no scalar decode at all:
-    /// let hits = posts.bm25_search("body", "fox", 10, BoolMode::Or, Some(&["_id", "score"]))?;
+    /// // Bare call → `_id` + `score`, no scalar decode:
+    /// let hits = posts.bm25_search("body", "fox", 10, BoolMode::Or, None)?;
     /// assert_eq!(hits[0].num_columns(), 2);
+    /// // Name columns to materialize row data:
+    /// let rows = posts.bm25_search("body", "fox", 10, BoolMode::Or, Some(&["_id", "body", "score"]))?;
+    /// assert_eq!(rows[0].num_columns(), 3);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn bm25_search(

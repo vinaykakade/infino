@@ -10,11 +10,11 @@
 //!
 //! ```ignore
 //! let opts = VectorSearchOptions::new();
-//! // Full rows (`_id`, scalar columns, `score`); projection `None`.
-//! let rows: Vec<RecordBatch> = table.vector_search("emb", &query_vec, 10, opts, None)?;
-//! // Just `_id` + `score` (no scalar decode): project them explicitly.
-//! let ids: Vec<RecordBatch> =
-//!     table.vector_search("emb", &query_vec, 10, opts, Some(&["_id", "score"]))?;
+//! // Bare call: `_id` + `score` only — no scalar decode.
+//! let ids: Vec<RecordBatch> = table.vector_search("emb", &query_vec, 10, opts, None)?;
+//! // Materialize row data by naming the columns to decode.
+//! let rows: Vec<RecordBatch> =
+//!     table.vector_search("emb", &query_vec, 10, opts, Some(&["_id", "title", "score"]))?;
 //! ```
 //!
 //! Internally these drive the async kernel on the snapshot-pinned
@@ -66,7 +66,7 @@ use std::sync::Arc;
 
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::reader::VectorSearchOptions;
-use crate::superfile::vector::distance::{Metric, distance};
+use crate::superfile::vector::distance::Metric;
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::SuperfileEntry;
@@ -157,18 +157,18 @@ impl SupertableReader {
 
         let mut scored: Vec<(usize, u32, f32)> = Vec::new();
         let mut fallback: Vec<usize> = Vec::new();
-        let mut deq = vec![0f32; query.len()];
+        // Folded Sq8-domain scoring (`ClusterCentroids::score_clusters_into`):
+        // Σq / ‖q‖² once per query, then one SIMD Sq8 dot per cluster over
+        // the contiguous code rows — no per-cluster dequantize, no scratch.
+        let sum_q: f32 = query.iter().sum();
+        let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
         for (si, entry) in superfiles.iter().enumerate() {
             match entry.vector_summary.get(column) {
                 Some(vs) if !vs.clusters.is_empty() && vs.clusters.dim as usize == query.len() => {
-                    let cl = &vs.clusters;
-                    for c in 0..cl.n_cent as usize {
-                        if cl.counts[c] == 0 {
-                            continue;
-                        }
-                        cl.dequantize_into(c, &mut deq);
-                        scored.push((si, c as u32, distance(metric, query, &deq)));
-                    }
+                    vs.clusters
+                        .score_clusters_into(metric, query, sum_q, norm_q_sq, |c, score| {
+                            scored.push((si, c, score));
+                        });
                 }
                 _ => fallback.push(si),
             }
@@ -261,8 +261,8 @@ impl SupertableReader {
             let hits = self.vector_search_async(column, query, k, options).await?;
             // `projection` selects output columns by name (`_id`, the
             // visible scalar columns, or the trailing `score`); `None`
-            // returns the whole row. The shared resolver decodes only
-            // the projected columns.
+            // returns `_id` + `score` only. The shared resolver decodes
+            // only the projected columns.
             let batch = resolve_hits_named(self, &hits, projection, "vector_search")
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))?;
@@ -338,10 +338,10 @@ impl Supertable {
     ///
     /// `projection` selects output columns by name (any of `_id`, the
     /// visible scalar columns, or the trailing `score`); `None` returns
-    /// the whole row. Only the projected scalar columns are decoded —
-    /// kNN is usually a retrieval step, so `Some(&["_id", "score"])` is
-    /// the cheap path when full rows are fetched in a follow-up only
-    /// for the hits you keep.
+    /// the engine-native result — `_id` + `score` only. Only the
+    /// projected scalar columns are decoded — kNN is usually a
+    /// retrieval step, so materializing row data is an explicit opt-in
+    /// by column name for the hits you keep.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -360,11 +360,12 @@ impl Supertable {
     /// # let col = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vec![Some(data.iter().copied().map(Some).collect::<Vec<_>>())], 16);
     /// # vecs.append(&RecordBatch::try_new(schema, vec![Arc::new(col)])?)?;
     /// # let mut query = vec![0.0f32; 16]; query[0] = 1.0;
-    /// // Project just `_id` + `score` → no scalar decode at all:
-    /// let hits = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), Some(&["_id", "score"]))?;
+    /// // Bare call → `_id` + `score`, no scalar decode:
+    /// let hits = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), None)?;
     /// assert_eq!(hits[0].num_columns(), 2);
-    /// // `None` projection returns full rows:
-    /// let rows = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), None)?;
+    /// // Explicit projection names the same columns (scalar columns,
+    /// // when present, materialize row data):
+    /// let rows = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), Some(&["_id", "score"]))?;
     /// assert!(rows.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```

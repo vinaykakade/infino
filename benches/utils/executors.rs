@@ -255,10 +255,58 @@ pub mod fts {
     /// A reader the FTS executor can run a BM25 query against. Hides
     /// whether the bytes are an in-memory superfile or an object-store
     /// supertable consumer.
+    ///
+    /// Two measurement surfaces per tier, mirroring the search-engine
+    /// phases:
+    ///
+    ///   * [`bm25_rows`](FtsRead::bm25_rows) — the **query phase**:
+    ///     id + score, no row materialization. Superfile = the raw
+    ///     kernel (`bm25_hits_async`); supertable = the public
+    ///     `bm25_search(.., None)` (bare projection — arithmetic `_id`
+    ///     resolve, no Parquet).
+    ///   * [`bm25_rows_fetched`](FtsRead::bm25_rows_fetched) — the
+    ///     **fetch phase**: same search plus materializing the text
+    ///     column for the top-k rows. Superfile = kernel +
+    ///     `take_by_local_doc_ids`; supertable = the public
+    ///     `bm25_search(.., Some([_id, column, score]))`.
     pub trait FtsRead {
-        /// Run one BM25 search; return the materialized hit/row count
-        /// (used as a black-box sink so the search is not optimized out).
+        /// Query phase: one BM25 search returning id + score; the hit
+        /// count is the black-box sink so the search is not optimized
+        /// out.
         fn bm25_rows(&self, column: &str, query: &str, k: usize, mode: InfinoBoolMode) -> usize;
+
+        /// Fetch phase: query + materialize the searched column for
+        /// the top-k hits.
+        fn bm25_rows_fetched(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: InfinoBoolMode,
+        ) -> usize;
+    }
+
+    /// Fetch-phase measurement for a raw superfile reader: kernel hits,
+    /// then materialize the searched column for the top-k rows. Shared
+    /// by the warm reader impl and the cold guard so the two tiers of
+    /// the superfile battery measure the identical operation.
+    pub fn superfile_rows_fetched(
+        reader: &SuperfileReader,
+        column: &str,
+        query: &str,
+        k: usize,
+        mode: InfinoBoolMode,
+    ) -> usize {
+        let hits = crate::tiers::block_on(reader.bm25_hits_async(column, query, k, mode))
+            .expect("superfile bm25_search");
+        if hits.is_empty() {
+            return 0;
+        }
+        let locals: Vec<u32> = hits.iter().map(|&(doc, _)| doc).collect();
+        reader
+            .take_by_local_doc_ids(&locals, &[column])
+            .expect("superfile take rows")
+            .num_rows()
     }
 
     impl FtsRead for SuperfileReader {
@@ -266,6 +314,16 @@ pub mod fts {
             crate::tiers::block_on(self.bm25_hits_async(column, query, k, mode))
                 .expect("superfile bm25_search")
                 .len()
+        }
+
+        fn bm25_rows_fetched(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: InfinoBoolMode,
+        ) -> usize {
+            superfile_rows_fetched(self, column, query, k, mode)
         }
     }
 
@@ -277,18 +335,36 @@ pub mod fts {
                 .map(|b| b.num_rows())
                 .sum()
         }
+
+        fn bm25_rows_fetched(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: InfinoBoolMode,
+        ) -> usize {
+            self.bm25_search(column, query, k, mode, Some(&["_id", column, "score"]))
+                .expect("supertable bm25_search fetched")
+                .iter()
+                .map(|b| b.num_rows())
+                .sum()
+        }
     }
 
-    /// Warm p50 (+ per-query RSS) for one query.
+    /// Warm p50 (+ per-query RSS) for one query: `p50` is the query
+    /// phase (id + score), `p50_fetched` the fetch phase (+ the text
+    /// column for the top-k rows).
     #[derive(Clone, Debug)]
     pub struct FtsQueryStat {
         pub name: &'static str,
         pub p50: Duration,
+        pub p50_fetched: Duration,
         pub rss: RssStats,
     }
 
     /// Measure the warm battery against an already-warm reader: one
-    /// untimed prewarm per query, then `iters` timed iterations.
+    /// untimed prewarm per query, then `iters` timed iterations for
+    /// the query phase and `iters` for the fetch phase.
     pub fn measure_warm<R: FtsRead>(
         reader: &R,
         battery: &[FtsQuery],
@@ -312,10 +388,19 @@ pub mod fts {
                     samples.push(t.elapsed());
                     std::hint::black_box(rows);
                 }
+                let _ = reader.bm25_rows_fetched(column, &query, k, mode);
+                let mut fetched_samples = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t = Instant::now();
+                    let rows = reader.bm25_rows_fetched(column, &query, k, mode);
+                    fetched_samples.push(t.elapsed());
+                    std::hint::black_box(rows);
+                }
                 let rss = sampler.stop_stats();
                 FtsQueryStat {
                     name: q.name,
                     p50: p50(&mut samples),
+                    p50_fetched: p50(&mut fetched_samples),
                     rss,
                 }
             })
@@ -371,8 +456,10 @@ pub mod fts {
         match stat {
             Some(q) => {
                 let ns = q.p50.as_secs_f64() * NS_PER_SEC;
+                let fetched_ns = q.p50_fetched.as_secs_f64() * NS_PER_SEC;
                 vec![
                     metric(ns, fmt_time(ns), Better::Lower),
+                    metric(fetched_ns, fmt_time(fetched_ns), Better::Lower),
                     metric(
                         q.rss.peak_rss_bytes as f64,
                         rss::fmt_bytes(q.rss.peak_rss_bytes),
@@ -390,7 +477,7 @@ pub mod fts {
                     ),
                 ]
             }
-            None => vec![text("—"), text("—"), text("—"), text("—")],
+            None => vec![text("—"), text("—"), text("—"), text("—"), text("—")],
         }
     }
 
@@ -440,7 +527,7 @@ pub mod fts {
         let mut header_cols = vec!["Query".to_string()];
         if warm_map.is_some() {
             header_cols.extend(
-                ["warm", "Peak RSS", "Median RSS", "P90 RSS"]
+                ["warm", "warm +fetch", "Peak RSS", "Median RSS", "P90 RSS"]
                     .iter()
                     .map(|s| s.to_string()),
             );
@@ -497,6 +584,7 @@ pub mod fts {
 
 pub mod vector {
     use super::*;
+    use std::collections::HashMap;
     use std::hint::black_box;
 
     use infino::superfile::SuperfileReader;
@@ -620,6 +708,14 @@ pub mod vector {
         sum / queries.len() as f32
     }
 
+    /// Largest doc count that still calibrates with the exhaustive
+    /// 54-point grid sweep per target. Each grid point costs one full
+    /// `mean_recall` battery (100 searches), so the sweep is fine on
+    /// small corpora and pathological at scale — past this cap the
+    /// staircase calibration below exploits recall/latency
+    /// monotonicity to evaluate O(P + R) points instead of P × R × 3.
+    pub const FULL_CALIBRATION_MAX_DOCS: usize = 1_000_000;
+
     /// Lowest-p50 `(probe, refine)` clearing `target_recall`; `None` if no
     /// grid point reaches it. Timing is p50 over a single query.
     pub fn calibrate<R: VectorRead>(
@@ -666,6 +762,161 @@ pub mod vector {
             );
         }
         best
+    }
+
+    /// Memoized `mean_recall` at one grid point — the unit of work the
+    /// staircase walk economizes (one evaluation = a full query
+    /// battery against the engine).
+    #[allow(clippy::too_many_arguments)]
+    fn eval_grid_point<R: VectorRead>(
+        reader: &R,
+        column: &str,
+        queries: &[Vec<f32>],
+        truths: &[Vec<u32>],
+        k: usize,
+        probe: usize,
+        refine: usize,
+        memo: &mut HashMap<(usize, usize), f32>,
+        log_prefix: &str,
+    ) -> f32 {
+        if let Some(&r) = memo.get(&(probe, refine)) {
+            return r;
+        }
+        // Announce BEFORE the work: one evaluation is a full query
+        // battery (minutes at large scale), and a run that logs only
+        // on completion is indistinguishable from a hung one.
+        eprintln!(
+            "    [{log_prefix}] staircase eval p={probe} r={refine} ({} queries)...",
+            queries.len()
+        );
+        let recall = mean_recall(reader, column, queries, truths, k, probe, refine);
+        eprintln!("    [{log_prefix}]   → recall {recall:.3}");
+        memo.insert((probe, refine), recall);
+        recall
+    }
+
+    /// Staircase calibration for corpora past
+    /// [`FULL_CALIBRATION_MAX_DOCS`] — same outputs as running
+    /// [`calibrate`] per target, at a fraction of the evaluations.
+    ///
+    /// Exploits the two monotonicities of IVF search:
+    ///
+    ///   * **recall** is non-decreasing in both `nprobe` and `rerank`,
+    ///     so (a) one evaluation of the most expensive corner answers
+    ///     reachability for every target, and (b) per target, the
+    ///     minimum refine that clears is non-increasing as probe grows
+    ///     — the clearing boundary is a staircase walkable in
+    ///     O(P + R) evaluations instead of P × R;
+    ///   * **latency** is increasing in both axes, so the lowest-p50
+    ///     clearing point lies on that staircase frontier — only
+    ///     frontier points pay the p50 timing loop.
+    ///
+    /// A memo cache shares evaluations and timings across the three
+    /// targets, so the whole calibration costs ~O(P + R) engine
+    /// batteries total.
+    pub fn calibrate_staircase<R: VectorRead>(
+        reader: &R,
+        column: &str,
+        queries: &[Vec<f32>],
+        truths: &[Vec<u32>],
+        k: usize,
+        log_prefix: &str,
+    ) -> Vec<Option<Calibrated>> {
+        let mut recall_memo: HashMap<(usize, usize), f32> = HashMap::new();
+        let mut p50_memo: HashMap<(usize, usize), f32> = HashMap::new();
+
+        // No upfront reachability probe: it would pre-pay the single
+        // most expensive grid point (max probe × max refine). The walk
+        // answers reachability on its own — an unreachable target
+        // misses across every row and its last evaluation IS that
+        // corner; a reachable one never pays it at all.
+        let p_max = *PROBES.last().expect("non-empty probe grid");
+        let r_max = *REFINES.last().expect("non-empty refine grid");
+
+        RECALL_TARGETS
+            .iter()
+            .map(|&target| {
+                // Walk from (smallest probe, largest refine): a clear
+                // step moves refine down (tighter), a miss moves probe
+                // up (wider). Each row's minimal clearing refine joins
+                // the frontier — at most min(P, R) + 1 points.
+                let mut frontier: Vec<(usize, usize, f32)> = Vec::new();
+                let mut p_i = 0usize;
+                let mut r_i = REFINES.len() - 1;
+                let mut row_clear: Option<(usize, f32)> = None;
+                while p_i < PROBES.len() {
+                    let recall = eval_grid_point(
+                        reader,
+                        column,
+                        queries,
+                        truths,
+                        k,
+                        PROBES[p_i],
+                        REFINES[r_i],
+                        &mut recall_memo,
+                        log_prefix,
+                    );
+                    if recall >= target {
+                        row_clear = Some((r_i, recall));
+                        if r_i == 0 {
+                            // Can't tighten refine further; wider
+                            // probes only add latency at refine 0.
+                            break;
+                        }
+                        r_i -= 1;
+                    } else {
+                        // Row's minimal clearing refine was the last
+                        // clearing step (if any); move to next probe.
+                        if let Some((ri, rec)) = row_clear.take() {
+                            frontier.push((PROBES[p_i], REFINES[ri], rec));
+                        }
+                        p_i += 1;
+                    }
+                }
+                if let Some((ri, rec)) = row_clear.take() {
+                    frontier.push((PROBES[p_i.min(PROBES.len() - 1)], REFINES[ri], rec));
+                }
+                if frontier.is_empty() {
+                    // No row cleared, so the walk's last evaluation was
+                    // the (max probe, max refine) corner — the grid's
+                    // recall ceiling.
+                    let peak = recall_memo
+                        .get(&(p_max, r_max))
+                        .copied()
+                        .unwrap_or_default();
+                    eprintln!(
+                        "    [{log_prefix}] no point hit recall ≥ {target:.2}; peak = {peak:.3}"
+                    );
+                    return None;
+                }
+                // Lowest-p50 frontier point wins; timings memoized
+                // across targets (frontiers overlap heavily).
+                let mut best: Option<Calibrated> = None;
+                for (probe, refine, recall) in frontier {
+                    let p50 = *p50_memo.entry((probe, refine)).or_insert_with(|| {
+                        let q0 = &queries[0];
+                        corpus::p50_micros(
+                            || {
+                                let _ = reader.topk_global(column, q0, k, probe, refine);
+                            },
+                            CALIBRATION_P50_ITERS,
+                        )
+                    });
+                    let cand = Calibrated {
+                        probe,
+                        refine,
+                        recall,
+                        p50_micros: p50,
+                    };
+                    best = match best {
+                        None => Some(cand),
+                        Some(b) if cand.p50_micros < b.p50_micros => Some(cand),
+                        Some(b) => Some(b),
+                    };
+                }
+                best
+            })
+            .collect()
     }
 
     /// Warm p50 (+ RSS) for one config on an already-warm reader.
@@ -842,6 +1093,7 @@ pub mod vector {
         warm_reader: &R,
         open_cold: impl Fn() -> G,
         column: &str,
+        n_docs: usize,
         k: usize,
         default_nprobe: usize,
         default_rerank: usize,
@@ -889,16 +1141,28 @@ pub mod vector {
             );
             eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
 
-            let cal: Vec<Option<Calibrated>> = RECALL_TARGETS
-                .iter()
-                .map(|&target| {
-                    eprintln!(
-                        "[{log_prefix}] calibrating recall@{target:.2}: grid over probes/refines ({} queries)...",
-                        q_cal.len(),
-                    );
-                    calibrate(warm_reader, column, q_cal, gt_cal, target, k, log_prefix)
-                })
-                .collect();
+            // Small corpora afford the exhaustive grid; past the cap the
+            // staircase walk gets the same answers from O(P + R)
+            // evaluations (see `calibrate_staircase`).
+            let cal: Vec<Option<Calibrated>> = if n_docs <= FULL_CALIBRATION_MAX_DOCS {
+                RECALL_TARGETS
+                    .iter()
+                    .map(|&target| {
+                        eprintln!(
+                            "[{log_prefix}] calibrating recall@{target:.2}: grid over probes/refines ({} queries)...",
+                            q_cal.len(),
+                        );
+                        calibrate(warm_reader, column, q_cal, gt_cal, target, k, log_prefix)
+                    })
+                    .collect()
+            } else {
+                eprintln!(
+                    "[{log_prefix}] calibrating {} targets: staircase walk over the (probe, refine) grid ({} queries)...",
+                    RECALL_TARGETS.len(),
+                    q_cal.len(),
+                );
+                calibrate_staircase(warm_reader, column, q_cal, gt_cal, k, log_prefix)
+            };
 
             for (i, &target) in RECALL_TARGETS.iter().enumerate() {
                 match cal[i] {

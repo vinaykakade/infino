@@ -199,6 +199,12 @@ pub struct BuilderOptions {
 /// (uncompressed bytes). At 16 bytes/row (`Decimal128`) this is
 /// ~512 rows/page, vs the ~65 536-row single page a default
 /// (1 MiB) limit produces for a full row group.
+///
+/// Non-id columns keep parquet's default page size: shrinking them
+/// was measured (320K-doc segments, k=10) to leave full-row resolve
+/// flat and regress the `[_id, score]` path 8× — per-hit resolve
+/// cost scales with page COUNT (selection planning / offset-index
+/// walks), not page decode volume.
 pub const DEFAULT_ID_PAGE_SIZE_LIMIT: usize = 8 * 1024;
 
 impl BuilderOptions {

@@ -284,7 +284,7 @@ pub fn run() {
         "[supertable] ingesting {} docs ({} commits) per shape to object storage, \
          one isolated process per shape...",
         fmt_count(n_docs),
-        supertable::N_COMMIT_CHUNKS
+        supertable::n_commits()
     );
 
     let shape_results = run_ingest_shapes_isolated();
@@ -305,7 +305,7 @@ pub fn run() {
             "Supertable — ingest, multi-superfile / object-store ({} docs × dim={}, {} commits)",
             fmt_count(n_docs),
             crate::corpus::DIM,
-            supertable::N_COMMIT_CHUNKS
+            supertable::n_commits()
         ),
         note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). \
                Each shape is built in its own subprocess, so Peak/Median/P90 RSS are measured from a \
@@ -489,7 +489,7 @@ pub mod fts {
             title: format!(
                 "Supertable FTS — ingest, multi-superfile / object-store ({} docs, {} commits)",
                 fmt_count(n_docs),
-                supertable::N_COMMIT_CHUNKS
+                supertable::n_commits()
             ),
             note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
             blocks: vec![Block {
@@ -512,6 +512,12 @@ pub mod fts {
         eprintln!(
             "[supertable_fts] warm: opening shared consumer, prewarm + wait_until_warm once..."
         );
+        // Phase-boundary RSS splits (anonymous heap vs mmap'd files):
+        // the discriminator for "where do the warm-phase GiBs live" —
+        // ingest leftovers show up as anonymous bloat already present
+        // before the consumer opens; promotion double-residency shows
+        // up as anonymous ≈ file_backed after warm-up.
+        crate::rss::log_rss_breakdown("supertable_fts before consumer open");
         let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
         let reader = consumer.reader();
         let first = &FTS_BATTERY[0];
@@ -528,6 +534,7 @@ pub mod fts {
         consumer
             .wait_until_warm(Duration::from_secs(600))
             .expect("supertable warm promotion");
+        crate::rss::log_rss_breakdown("supertable_fts after wait_until_warm");
         eprintln!(
             "[supertable_fts] warm: cache hot — timing {} queries × {WARM_ITERS} iters via bm25_search...",
             FTS_BATTERY.len(),
@@ -540,6 +547,7 @@ pub mod fts {
             WARM_ITERS,
             "supertable_fts",
         );
+        crate::rss::log_rss_breakdown("supertable_fts after warm battery");
         drop(consumer);
         drop(cache_dir);
         out
@@ -590,6 +598,22 @@ pub mod fts {
                 .reader()
                 .bm25_search(column, query, k, mode, None)
                 .expect("cold bm25_search")
+                .iter()
+                .map(|b| b.num_rows())
+                .sum()
+        }
+
+        fn bm25_rows_fetched(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: infino::superfile::fts::reader::BoolMode,
+        ) -> usize {
+            self.consumer
+                .reader()
+                .bm25_search(column, query, k, mode, Some(&["_id", column, "score"]))
+                .expect("cold bm25_search fetched")
                 .iter()
                 .map(|b| b.num_rows())
                 .sum()
@@ -665,7 +689,7 @@ pub mod vector {
                     "Supertable vector — ingest, multi-superfile / object-store ({} docs × dim={}, {} commits)",
                     fmt_count(n_docs),
                     DIM,
-                    supertable::N_COMMIT_CHUNKS
+                    supertable::n_commits()
                 ),
                 note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
                 blocks: vec![Block {
@@ -690,10 +714,12 @@ pub mod vector {
             let rerank = fixed_rerank_mult();
 
             // The ingested vectors are still mmapped from the prepared
-            // corpus — reuse them for brute-force ground truth instead
-            // of regenerating 10M×384 floats. Skip-calibration needs no
-            // ground truth (no recall gate / grid), so the expensive
-            // brute-force pass is elided there.
+            // corpus — queries and ground truth come from them instead
+            // of a regeneration. Skip-calibration needs no ground truth
+            // (no recall gate / grid), so the brute-force pass is elided
+            // there; otherwise both query batches share ONE streamed
+            // oracle pass: the pass is I/O-bound over a corpus several
+            // times RAM, so its cost is corpus bytes, not query count.
             let vslice = corpus
                 .vectors()
                 .expect("vector modality prepared a vector corpus")
@@ -718,13 +744,19 @@ pub mod vector {
                 (Vec::new(), Vec::new())
             } else {
                 eprintln!(
-                    "[supertable_vector] computing brute-force ground truth over the ingested corpus...",
+                    "[supertable_vector] brute-force ground truth: one streamed pass, {} queries...",
+                    q_correct.len() + q_cal.len(),
                 );
-                (
-                    corpus::ground_truth(vslice, n_docs, &q_correct, TOP_K),
-                    corpus::ground_truth(vslice, n_docs, &q_cal, TOP_K),
-                )
+                let all_queries: Vec<Vec<f32>> =
+                    q_correct.iter().chain(q_cal.iter()).cloned().collect();
+                let mut gt_all = corpus::ground_truth(vslice, n_docs, &all_queries, TOP_K);
+                let gt_cal = gt_all.split_off(q_correct.len());
+                (gt_all, gt_cal)
             };
+            // Queries + ground truth extracted; free the corpus pages
+            // + temp file so the warm/cold samplers measure the engine
+            // only.
+            drop(corpus);
 
             // One consumer drives correctness + calibration. Full cache
             // promotion (prewarm + wait_until_warm) only matters for the
@@ -761,6 +793,7 @@ pub mod vector {
                 &consumer,
                 || SupertableVecColdGuard::open(&built),
                 supertable::VEC_COLUMN,
+                n_docs,
                 TOP_K,
                 nprobe,
                 rerank,
@@ -842,7 +875,7 @@ pub mod sql {
                 title: format!(
                     "Supertable SQL — ingest, multi-superfile / object-store ({} rows, {} commits)",
                     fmt_count(n_docs),
-                    supertable::N_COMMIT_CHUNKS
+                    supertable::n_commits()
                 ),
                 note: "Build path: `SupertableWriter::append` + `commit` to object storage (production path). Throughput is rows/s; `Superfiles` is the committed superfile count. Δ is vs the previous run.".into(),
                 blocks: vec![Block {

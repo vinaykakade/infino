@@ -539,6 +539,16 @@ pub mod fts {
                     .len()
             })
         }
+
+        fn bm25_rows_fetched(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: InfinoBoolMode,
+        ) -> usize {
+            exec_fts::superfile_rows_fetched(&self.reader, column, query, k, mode)
+        }
     }
 
     // ─── Result rendering (run-to-run deltas via report.rs) ───────────────
@@ -833,6 +843,7 @@ pub mod vector {
                 index.reader(),
                 open_cold,
                 VEC_COLUMN,
+                n_docs,
                 TOP_K,
                 DEFAULT_NPROBE,
                 DEFAULT_RERANK_MULT,
@@ -855,19 +866,25 @@ pub mod vector {
 
             struct SuperfileVecColdGuard {
                 _cache_dir: tempfile::TempDir,
-                cache: Arc<infino::supertable::reader_cache::DiskCacheStore>,
-                uri: infino::supertable::manifest::SuperfileUri,
+                reader: Arc<infino::superfile::SuperfileReader>,
             }
             impl SuperfileVecColdGuard {
+                /// The reader open (footer + KV fetch over the object
+                /// store) happens HERE so the cold driver bills it to
+                /// the "cold open" leg — mirroring the FTS guard. A
+                /// constructor that only builds the cache makes the
+                /// open column measure an empty struct while the
+                /// search column silently absorbs the open cost.
                 fn open(
                     storage: Arc<dyn infino::supertable::storage::StorageProvider>,
                     uri: infino::supertable::manifest::SuperfileUri,
                 ) -> Self {
                     let (cache_dir, cache) = tiers::fresh_superfile_cache(storage);
+                    let reader =
+                        tiers::block_on(async { cache.reader(&uri).await.expect("cold reader") });
                     Self {
                         _cache_dir: cache_dir,
-                        cache,
-                        uri,
+                        reader,
                     }
                 }
             }
@@ -881,8 +898,7 @@ pub mod vector {
                     rerank: usize,
                 ) -> Vec<(u32, f32)> {
                     tiers::block_on(async {
-                        let reader = self.cache.reader(&self.uri).await.expect("cold reader");
-                        reader
+                        self.reader
                             .vector_hits_async(
                                 column,
                                 query,
