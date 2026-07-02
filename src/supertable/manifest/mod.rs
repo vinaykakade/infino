@@ -262,6 +262,70 @@ impl ManifestSnapshot {
         }
     }
 
+    /// A *materialized* empty manifest at `manifest_id = 0`, ready to persist.
+    /// Unlike [`Self::empty`] (which is in-process-only, `list: None`), this
+    /// carries a `Some(list)`, so [`Self::write`] emits the initial (empty)
+    /// manifest list + pointer. `Supertable::create` persists this on durable
+    /// storage so the table is openable immediately — before its first append,
+    /// after a reopen, or from another process — without shifting the
+    /// `manifest_id` sequence (the first append still commits `manifest_id 1`).
+    pub(crate) fn materialized_empty(options: Arc<SupertableOptions>) -> Self {
+        let strategy = options.effective_partition_strategy();
+        let list = Self::build_list(&options, strategy, 0, Vec::new());
+        let loader = options.storage.as_ref().map(|storage| {
+            Arc::new(ManifestPartLoader::new_with_cache(
+                storage.clone(),
+                &list,
+                options.manifest_disk_cache.clone(),
+            ))
+        });
+        Self {
+            superfile_list: SuperfileList::empty(options),
+            list: Some(list),
+            parts: DashMap::new(),
+            loader,
+        }
+    }
+
+    /// Build a manifest list from the supertable `options` at `manifest_id`,
+    /// carrying `parts`. Shared by the commit path ([`Self::update`]) and the
+    /// initial empty-manifest materialization ([`Self::materialized_empty`]) so
+    /// the options→list field mapping lives in one place.
+    fn build_list(
+        options: &SupertableOptions,
+        strategy: PartitionStrategy,
+        manifest_id: u64,
+        parts: Vec<ManifestPartEntry>,
+    ) -> Manifest {
+        Manifest {
+            format_version: LIST_FORMAT_VERSION.into(),
+            manifest_id,
+            options_hash: options_hash::compute_options_hash(options, &strategy),
+            schema: Vec::new(),
+            id_column: options.id_column.clone(),
+            fts_columns: options
+                .fts_columns
+                .iter()
+                .map(|f| list::FtsColumnInfo {
+                    column: f.column.clone(),
+                })
+                .collect(),
+            vector_columns: options
+                .vector_columns
+                .iter()
+                .map(|v| list::VectorColumnInfo {
+                    column: v.column.clone(),
+                    dim: v.dim,
+                    n_cent: v.n_cent,
+                    rot_seed: v.rot_seed,
+                    metric: format!("{:?}", v.metric).to_lowercase(),
+                })
+                .collect(),
+            partition_strategy: strategy,
+            parts,
+        }
+    }
+
     pub fn get_manifest_id(&self) -> u64 {
         self.superfile_list.manifest_id
     }
@@ -830,34 +894,12 @@ impl ManifestSnapshot {
             out_list_entries_after_removal.push(fresh_entry);
         }
 
-        let opts_hash = options_hash::compute_options_hash(opts.as_ref(), &strategy);
-        let new_list = Manifest {
-            format_version: LIST_FORMAT_VERSION.into(),
-            manifest_id: self.get_next_manifest_id(),
-            options_hash: opts_hash,
-            schema: Vec::new(),
-            id_column: opts.id_column.clone(),
-            fts_columns: opts
-                .fts_columns
-                .iter()
-                .map(|f| list::FtsColumnInfo {
-                    column: f.column.clone(),
-                })
-                .collect(),
-            vector_columns: opts
-                .vector_columns
-                .iter()
-                .map(|v| list::VectorColumnInfo {
-                    column: v.column.clone(),
-                    dim: v.dim,
-                    n_cent: v.n_cent,
-                    rot_seed: v.rot_seed,
-                    metric: format!("{:?}", v.metric).to_lowercase(),
-                })
-                .collect(),
-            partition_strategy: strategy,
-            parts: out_list_entries_after_removal,
-        };
+        let new_list = Self::build_list(
+            opts.as_ref(),
+            strategy,
+            self.get_next_manifest_id(),
+            out_list_entries_after_removal,
+        );
 
         let ids_to_remove = entries_to_remove
             .iter()
