@@ -1823,10 +1823,10 @@ impl FtsReader {
         let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
         let dl_norm_k1 = &col_meta.dl_norm_k1;
 
-        // Top-k min-heap; see `TopKEntry` for the reversed ordering
-        // that makes `peek()` the current kth-best score.
-        let mut heap: BinaryHeap<TopKEntry> =
-            BinaryHeap::with_capacity(k.min(term_meta.num_blocks * BLOCK_LEN).max(1));
+        // Bounded top-k via grow-and-select (see `BoundedTopK`): a long
+        // common-term posting list churns a per-doc heap hard at large
+        // k, and that heap churn — not the scoring — dominates this scan.
+        let mut topk = BoundedTopK::new(k, floor_eff);
         let mut buf_d = vec![0u32; BLOCK_LEN];
         let mut buf_t = vec![0u32; BLOCK_LEN];
 
@@ -1836,14 +1836,13 @@ impl FtsReader {
             let (_, block_offset_in_term, block_max_bm25) = term_meta.skip_entry(postings, i);
 
             // Floor skip: nothing in this block can reach the caller's
-            // floor — dead regardless of local heap state.
+            // floor — dead regardless of local top-k state.
             if block_max_bm25 <= floor_eff {
                 continue;
             }
-            // BMW skip: heap full AND this block can't beat the kth-best.
-            if heap.len() >= k
-                && let Some(TopKEntry(min_score, _)) = heap.peek()
-                && block_max_bm25 <= *min_score
+            // BMW skip: top-k full AND this block can't beat the kth-best.
+            if let Some(bar) = topk.prune_bar()
+                && block_max_bm25 <= bar
             {
                 continue;
             }
@@ -1866,24 +1865,14 @@ impl FtsReader {
                 }
                 let tf = buf_t[j];
                 let score = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1.get(doc_id));
-                // Floor gate: strictly-below-floor docs are dead to the
-                // caller; keeping them out also keeps the heap's min
-                // (the BMW skip bar) honest.
-                if score <= floor_eff {
-                    continue;
-                }
-                if heap.len() < k {
-                    heap.push(TopKEntry(score, doc_id));
-                } else if let Some(TopKEntry(min_score, _)) = heap.peek()
-                    && score > *min_score
-                {
-                    heap.pop();
-                    heap.push(TopKEntry(score, doc_id));
-                }
+                // `offer` applies the floor/kth-best gate (strict `>`),
+                // matching the heap's admission and keeping the pruning
+                // bar honest.
+                topk.offer(score, doc_id);
             }
         }
 
-        Ok(drain_top_k_desc(heap))
+        Ok(topk.into_sorted())
     }
 
     /// Build one `TermCursor` per term that resolves in the FST.
@@ -3071,10 +3060,11 @@ impl FtsReader {
             }
         }
 
-        let initial_cap = k.min(self.n_docs as usize).max(1);
-        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
-        // Floor-seeded threshold, identical to the MaxScore path.
-        let mut threshold: f32 = floor_eff.max(0.0);
+        // Bounded top-k via grow-and-select (see `BoundedTopK`). A
+        // no-dominant-term union can't prune (that's why it routes here),
+        // so it scores the whole union and the per-doc heap churn — not
+        // pruning — is the cost; the select-based collector sheds it.
+        let mut topk = BoundedTopK::new(k, floor_eff.max(0.0));
 
         // Per-window state, allocated once and reused across windows.
         // Cleared lazily during the drain (only touched slots), so reset
@@ -3172,21 +3162,12 @@ impl FtsReader {
                     {
                         continue;
                     }
-                    if heap.len() < k {
-                        heap.push(TopKEntry(score, doc));
-                        if heap.len() == k {
-                            threshold = heap.peek().expect("non-empty").0.max(threshold);
-                        }
-                    } else if score > threshold {
-                        heap.pop();
-                        heap.push(TopKEntry(score, doc));
-                        threshold = heap.peek().expect("non-empty").0.max(threshold);
-                    }
+                    topk.offer(score, doc);
                 }
             }
         }
 
-        Ok(drain_top_k_desc(heap))
+        Ok(topk.into_sorted())
     }
 
     /// Exhaustive union walk for multi-term OR. No threshold-driven
@@ -3253,9 +3234,10 @@ impl FtsReader {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = &col_meta.dl_norm_k1;
 
-        let initial_cap = k.min(self.n_docs as usize).max(1);
-        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
-        let mut threshold: f32 = 0.0;
+        // Bounded top-k via grow-and-select (see `BoundedTopK`): the
+        // exhaustive union scores every doc in the union with no pruning,
+        // so admission churn is the whole cost above scoring.
+        let mut topk = BoundedTopK::new(k, 0.0);
 
         loop {
             // Find smallest current doc_id across all live cursors —
@@ -3300,21 +3282,10 @@ impl FtsReader {
                 score += bm25::score_simd_x4(idfs, tfs, norm);
             }
 
-            // Top-K update. `threshold` mirrors `heap.peek().0` so
-            // the replace-or-skip branch doesn't re-peek per iter.
-            if heap.len() < k {
-                heap.push(TopKEntry(score, candidate));
-                if heap.len() == k {
-                    threshold = heap.peek().expect("non-empty").0;
-                }
-            } else if score > threshold {
-                heap.pop();
-                heap.push(TopKEntry(score, candidate));
-                threshold = heap.peek().expect("non-empty").0;
-            }
+            topk.offer(score, candidate);
         }
 
-        Ok(drain_top_k_desc(heap))
+        Ok(topk.into_sorted())
     }
 
     /// Multi-term OR dispatch. Routes everything to MaxScore+BMM.
@@ -3480,6 +3451,106 @@ fn drain_top_k_desc(heap: BinaryHeap<TopKEntry>) -> Vec<(u32, f32)> {
             .then(a.0.cmp(&b.0))
     });
     out
+}
+
+/// Order two candidates best-first: higher score wins, and on a score
+/// tie the smaller doc_id wins — the same total order `drain_top_k_desc`
+/// produces and the same tie-break `TopKEntry` encodes.
+#[inline]
+fn cmp_best_first(a: &(f32, u32), b: &(f32, u32)) -> Ordering {
+    b.0.partial_cmp(&a.0)
+        .unwrap_or(Ordering::Equal)
+        .then(a.1.cmp(&b.1))
+}
+
+/// Bounded top-k collector that replaces the per-doc binary heap with a
+/// grow-and-select buffer. Admitting a doc is an amortized-O(1) push;
+/// the buffer is periodically reduced to its k best with a single
+/// `select_nth_unstable` (quickselect, O(m)). Scanning a long posting
+/// list therefore costs O(N) admissions + O(N) total selection instead
+/// of the heap's O(N log k) — and it sheds the heap's worst case, where
+/// a near-sorted score stream forces a pop+push at almost every doc
+/// (the dominant cost of large-k single-term / union scans).
+///
+/// `threshold` is the k-th best score kept so far: below capacity it is
+/// the caller's floor (admit everything above it), and once the buffer
+/// has been selected down to k it is the current k-th best — a *lower
+/// bound* on the final k-th best between selections, so using it to
+/// filter admissions or to skip a block never drops a doc that belongs
+/// in the top k. Results come out in the exact `(score desc, doc asc)`
+/// order the heap path produces.
+struct BoundedTopK {
+    k: usize,
+    /// Compaction trigger: buffer is selected back down to `k` once it
+    /// reaches this. Slack over `k` amortizes the selection cost.
+    cap: usize,
+    buf: Vec<(f32, u32)>,
+    threshold: f32,
+    full: bool,
+}
+
+impl BoundedTopK {
+    /// Buffer slack multiple over `k`: the buffer grows to `SLACK * k`
+    /// candidates before each quickselect, so selection runs once per
+    /// `~(SLACK-1)*k` admissions.
+    const SLACK: usize = 2;
+
+    fn new(k: usize, floor: f32) -> Self {
+        let cap = k.saturating_mul(Self::SLACK).max(1);
+        Self {
+            k,
+            cap,
+            buf: Vec::with_capacity(cap),
+            threshold: floor,
+            full: false,
+        }
+    }
+
+    /// Current k-th best score once the buffer has filled to k, else
+    /// `None`. The block-max pruning bar: a block whose max BM25 can't
+    /// beat this can't contribute a top-k doc.
+    #[inline]
+    fn prune_bar(&self) -> Option<f32> {
+        self.full.then_some(self.threshold)
+    }
+
+    /// Offer one scored doc. Strict `> threshold` matches the heap's
+    /// `score > min` admission (score-ties at the bar are dropped).
+    #[inline]
+    fn offer(&mut self, score: f32, doc_id: u32) {
+        if score > self.threshold {
+            self.buf.push((score, doc_id));
+            if self.buf.len() >= self.cap {
+                self.select_top_k();
+            }
+        }
+    }
+
+    /// Reduce the buffer to its k best and raise `threshold` to the new
+    /// k-th best. No-op until there are more than k candidates.
+    fn select_top_k(&mut self) {
+        if self.k == 0 {
+            self.buf.clear();
+            self.full = true;
+            return;
+        }
+        if self.buf.len() <= self.k {
+            return;
+        }
+        // Partition so the k best occupy buf[0..k]; buf[k-1] is the
+        // k-th best under the result order.
+        self.buf.select_nth_unstable_by(self.k - 1, cmp_best_first);
+        self.threshold = self.buf[self.k - 1].0;
+        self.buf.truncate(self.k);
+        self.full = true;
+    }
+
+    /// Final k best in `(doc_id, score)` form, `(score desc, doc asc)`.
+    fn into_sorted(mut self) -> Vec<(u32, f32)> {
+        self.select_top_k();
+        self.buf.sort_unstable_by(cmp_best_first);
+        self.buf.into_iter().map(|(s, d)| (d, s)).collect()
+    }
 }
 
 /// One member term of a [`PhraseCursor`]: its posting cursor, its
