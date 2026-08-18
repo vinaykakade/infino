@@ -16,17 +16,100 @@ use crate::superfile::{
     error::FtsError,
     format::{
         self,
-        fts::{
-            POSITION_SUBINDEX_ENTRIES_PER_BLOCK, POSITION_SUBINDEX_STRIDE, U32_BYTES, U64_BYTES,
-            skip_entry, term_meta,
-        },
+        fts::{POSITION_SUBINDEX_STRIDE, U32_BYTES, U64_BYTES, skip_entry, term_meta},
     },
     fts::{
-        block256::{self, BLOCK_LEN, decode_block, decode_block_doc_ids},
-        bm25,
+        block256, bm25,
         builder::{SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
+        posting,
     },
 };
+
+/// Maximum posting-block length across codecs — cursor buffers are sized to this
+/// so one cursor can hold either a 128-doc (`posting`) or 256-doc (`block256`)
+/// block.
+const BLOCK_LEN_MAX: usize = block256::BLOCK_LEN;
+
+/// Which posting-block codec a superfile uses, selected by its FTS version:
+/// `V1`–`V4` → 128-doc blocks (`posting` / `BitPacker4x`); `V5` → 256-doc blocks
+/// (`block256` / `BitPacker8x`). One reader binary handles both — the block size,
+/// decode routine, and a couple of header-field offsets differ between the two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PostingCodec {
+    Block128,
+    Block256,
+}
+
+impl PostingCodec {
+    /// Select the codec from the FTS blob version.
+    #[inline]
+    pub(super) fn from_version(version: u32) -> Self {
+        if version == format::fts::VERSION_V5 {
+            PostingCodec::Block256
+        } else {
+            PostingCodec::Block128
+        }
+    }
+
+    #[inline]
+    pub(super) fn block_len(self) -> usize {
+        match self {
+            PostingCodec::Block128 => posting::BLOCK_LEN,
+            PostingCodec::Block256 => block256::BLOCK_LEN,
+        }
+    }
+
+    /// Decode a block's doc ids + tfs; `dest`s must be `>= BLOCK_LEN_MAX`.
+    #[inline]
+    pub(super) fn decode_block(self, bytes: &[u8], doc_ids: &mut [u32], tfs: &mut [u32]) -> usize {
+        match self {
+            PostingCodec::Block128 => posting::decode_block(bytes, doc_ids, tfs),
+            PostingCodec::Block256 => block256::decode_block(bytes, doc_ids, tfs),
+        }
+    }
+
+    /// Decode only a block's doc ids; `dest` must be `>= BLOCK_LEN_MAX`.
+    #[inline]
+    pub(super) fn decode_block_doc_ids(self, bytes: &[u8], doc_ids: &mut [u32]) -> usize {
+        match self {
+            PostingCodec::Block128 => posting::decode_block_doc_ids(bytes, doc_ids),
+            PostingCodec::Block256 => block256::decode_block_doc_ids(bytes, doc_ids),
+        }
+    }
+
+    /// Header byte offset of the block `encoding` discriminant.
+    #[inline]
+    pub(super) fn encoding_off(self) -> usize {
+        match self {
+            PostingCodec::Block128 => posting::ENCODING_OFF,
+            PostingCodec::Block256 => block256::ENCODING_OFF,
+        }
+    }
+
+    /// Header byte offset of `tf_bits`.
+    #[inline]
+    pub(super) fn tf_bits_off(self) -> usize {
+        match self {
+            PostingCodec::Block128 => posting::TF_BITS_OFF,
+            PostingCodec::Block256 => block256::TF_BITS_OFF,
+        }
+    }
+
+    /// `encoding` byte value for a bitset block (identical in both codecs).
+    #[inline]
+    pub(super) fn encoding_bitset(self) -> u8 {
+        match self {
+            PostingCodec::Block128 => posting::ENCODING_BITSET,
+            PostingCodec::Block256 => block256::ENCODING_BITSET,
+        }
+    }
+
+    /// Position sub-index entries per block (`block_len / stride`).
+    #[inline]
+    pub(super) fn subindex_entries_per_block(self) -> usize {
+        self.block_len() / POSITION_SUBINDEX_STRIDE
+    }
+}
 
 /// Parsed per-(column, term) metadata header from the postings
 /// region. The byte layout is documented once, on the writer side —
@@ -63,6 +146,11 @@ pub(super) struct TermMeta {
     /// skip table on a `VERSION_V3` positional term. `None` on
     /// `V1`/`V2` (no sub-index) and on positionless terms.
     pub(super) subindex_start: Option<usize>,
+    /// Position sub-index entries per posting block for this blob's codec
+    /// (`block_len / POSITION_SUBINDEX_STRIDE`: 8 for 128-doc blocks, 16 for
+    /// 256-doc). Stored so the sub-index layout is read with the right stride
+    /// regardless of the blob's block size.
+    pub(super) subindex_entries_per_block: usize,
 }
 
 impl TermMeta {
@@ -75,6 +163,7 @@ impl TermMeta {
         metadata_offset: usize,
         positional: bool,
         has_subindex: bool,
+        entries_per_block: usize,
     ) -> Result<Self, FtsError> {
         // Positional columns carry the extended 32-byte header (the
         // term's positions offset + length after `num_blocks`); the
@@ -138,8 +227,7 @@ impl TermMeta {
         // table, which the writer already shifted past the sub-index).
         let subindex_start = match has_subindex {
             true => {
-                let subindex_end =
-                    skip_end + num_blocks * POSITION_SUBINDEX_ENTRIES_PER_BLOCK * U32_BYTES;
+                let subindex_end = skip_end + num_blocks * entries_per_block * U32_BYTES;
                 if subindex_end > postings.len() {
                     return Err(FtsError::Read(ReadError::MalformedVersion(
                         "position sub-index runs past postings region".into(),
@@ -157,6 +245,7 @@ impl TermMeta {
             positions_offset,
             positions_length,
             subindex_start,
+            subindex_entries_per_block: entries_per_block,
         })
     }
 
@@ -176,7 +265,7 @@ impl TermMeta {
     ) -> Option<(u32, usize)> {
         let start = self.subindex_start?;
         let slot = pair_in_block / POSITION_SUBINDEX_STRIDE;
-        let idx = block * POSITION_SUBINDEX_ENTRIES_PER_BLOCK + slot;
+        let idx = block * self.subindex_entries_per_block + slot;
         let at = start + idx * U32_BYTES;
         let checkpoint = read_u32_le(&postings[at..at + U32_BYTES]);
         let runs_to_skip = pair_in_block % POSITION_SUBINDEX_STRIDE;
@@ -353,6 +442,10 @@ pub(crate) struct TermCursor {
     /// PACKED block it already holds while probing membership across a
     /// run of ascending target docs.
     pub(super) decoded_block: usize,
+    /// The posting-block codec this cursor's superfile uses (128-doc for
+    /// `V1`–`V4`, 256-doc for `V5`). All block decode + bitset-header access
+    /// routes through it.
+    pub(super) codec: PostingCodec,
 }
 
 impl TermCursor {
@@ -368,13 +461,20 @@ impl TermCursor {
         global_idf: Option<f32>,
         header_probed: bool,
         count_only: bool,
+        codec: PostingCodec,
     ) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
 
         // The plain-term cursor never decodes positions, so it needs no
         // sub-index (it reads block offsets straight from the skip table).
-        let term_meta = TermMeta::parse(postings, metadata_offset, positional, false)?;
+        let term_meta = TermMeta::parse(
+            postings,
+            metadata_offset,
+            positional,
+            false,
+            codec.subindex_entries_per_block(),
+        )?;
         let local_idf = bm25::idf(n_docs, term_meta.df);
         let idf = global_idf.unwrap_or(local_idf);
         // Stored per-block BMW upper bounds bake in the LOCAL idf. Only a
@@ -422,8 +522,8 @@ impl TermCursor {
             term_max_bm25,
             df: term_meta.df,
             blocks,
-            block_doc_ids: vec![0u32; BLOCK_LEN],
-            block_tfs: vec![0u32; BLOCK_LEN],
+            block_doc_ids: vec![0u32; BLOCK_LEN_MAX],
+            block_tfs: vec![0u32; BLOCK_LEN_MAX],
             block_n: 0,
             current_block: 0,
             pos: 0,
@@ -432,6 +532,7 @@ impl TermCursor {
             header_probed,
             count_only,
             decoded_block: usize::MAX,
+            codec,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -452,6 +553,7 @@ impl TermCursor {
         n_docs: u64,
         dl_norm_k1: f32,
         global_idf: Option<f32>,
+        codec: PostingCodec,
     ) -> Self {
         let idf = global_idf.unwrap_or_else(|| bm25::idf(n_docs, 1));
         let idf_x_k1p1 = idf * (bm25::K1 + 1.0);
@@ -467,8 +569,8 @@ impl TermCursor {
             block_max_bm25,
         }]);
 
-        let mut block_doc_ids = vec![0u32; BLOCK_LEN];
-        let mut block_tfs = vec![0u32; BLOCK_LEN];
+        let mut block_doc_ids = vec![0u32; BLOCK_LEN_MAX];
+        let mut block_tfs = vec![0u32; BLOCK_LEN_MAX];
         block_doc_ids[0] = doc_id;
         block_tfs[0] = tf;
 
@@ -489,10 +591,13 @@ impl TermCursor {
             // never call `decode_current_block`, so the flag is inert.
             count_only: false,
             decoded_block: 0,
+            // Inert: an inline cursor never decodes a block.
+            codec,
         }
     }
 
     pub(super) fn decode_current_block(&mut self) {
+        let codec = self.codec;
         let block = self.blocks[self.current_block];
         // Borrow in place rather than clone an owned `Bytes` (disjoint from the
         // `&mut self.block_*` decode targets, which are separate fields).
@@ -500,8 +605,8 @@ impl TermCursor {
         // Count-only cursors skip the tf half of the block; the count
         // kernels never read `block_tfs`, so it is left stale.
         self.block_n = match self.count_only {
-            true => decode_block_doc_ids(bytes, &mut self.block_doc_ids),
-            false => decode_block(bytes, &mut self.block_doc_ids, &mut self.block_tfs),
+            true => codec.decode_block_doc_ids(bytes, &mut self.block_doc_ids),
+            false => codec.decode_block(bytes, &mut self.block_doc_ids, &mut self.block_tfs),
         };
         self.pos = 0;
         self.decoded_block = self.current_block;
@@ -534,14 +639,17 @@ impl TermCursor {
         // every membership probe; over a long driver it was ~11% of the
         // intersection-count time (and wasted on the PACKED path, which
         // only reads the encoding byte before falling to the decode cache).
+        let codec = self.codec;
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        if raw[block256::ENCODING_OFF] == block256::ENCODING_BITSET {
+        // `BASE_OFF` (4) and `HEADER_SIZE` (8) are identical across codecs; only
+        // the `encoding`/`tf_bits` offsets and the block length differ.
+        if raw[codec.encoding_off()] == codec.encoding_bitset() {
             let base = read_u32_le(&raw[block256::BASE_OFF..block256::BASE_OFF + 4]);
             if doc < base {
                 return false;
             }
             let bit = (doc - base) as usize;
-            let tfs_size = BLOCK_LEN * raw[block256::TF_BITS_OFF] as usize / 8;
+            let tfs_size = codec.block_len() * raw[codec.tf_bits_off()] as usize / 8;
             let bitset_end = raw.len() - tfs_size;
             let word_at = block256::HEADER_SIZE + (bit / 64) * 8;
             if word_at + 8 > bitset_end {
@@ -815,5 +923,41 @@ impl TermCursor {
                 self.decode_current_block();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::PostingCodec;
+    use crate::superfile::format;
+
+    #[test]
+    fn from_version_selects_block_size_and_subindex_stride() {
+        // V1–V4 → the 128-doc codec; V5 → the 256-doc codec.
+        for v in [
+            format::fts::VERSION_V1_LEGACY,
+            format::fts::VERSION_V2,
+            format::fts::VERSION_V3,
+            format::fts::VERSION_V4,
+        ] {
+            assert_eq!(PostingCodec::from_version(v), PostingCodec::Block128);
+            assert_eq!(PostingCodec::from_version(v).block_len(), 128);
+        }
+        assert_eq!(
+            PostingCodec::from_version(format::fts::VERSION_V5),
+            PostingCodec::Block256
+        );
+        assert_eq!(
+            PostingCodec::from_version(format::fts::VERSION_V5).block_len(),
+            256
+        );
+        // Header-offset differences: encoding byte 3→2, tf_bits 2→1.
+        assert_eq!(PostingCodec::Block128.encoding_off(), 3);
+        assert_eq!(PostingCodec::Block256.encoding_off(), 2);
+        assert_eq!(PostingCodec::Block128.tf_bits_off(), 2);
+        assert_eq!(PostingCodec::Block256.tf_bits_off(), 1);
+        // Sub-index entries per block scale with the block size.
+        assert_eq!(PostingCodec::Block128.subindex_entries_per_block(), 8);
+        assert_eq!(PostingCodec::Block256.subindex_entries_per_block(), 16);
     }
 }

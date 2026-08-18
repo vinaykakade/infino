@@ -24,7 +24,7 @@ use std::{
 use bytes::Bytes;
 
 use super::{
-    cursor::{TermCursor, TermMeta},
+    cursor::{PostingCodec, TermCursor, TermMeta},
     filter::ExcludeFilter,
     metadata::{ColumnMeta, FtsColumnConfig, NormTable, OpenOptions},
     phrase::{AnyCursor, PhraseCursor},
@@ -43,7 +43,7 @@ use crate::superfile::{
         },
     },
     fts::{
-        block256::{self, BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
+        block256::{self, BLOCK_LEN},
         builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
         dict::{DictReader, make_key},
         fst_value::FstValue,
@@ -522,6 +522,10 @@ pub struct FtsReader {
     /// bitset-encoded, so the unranked count kernels prefer membership
     /// bit-tests (no decode) over decoding a common term's blocks.
     pub(super) has_bitset_blocks: bool,
+    /// Posting-block codec selected by the blob version: 128-doc (`V1`–`V4`) or
+    /// 256-doc (`V5`). Threaded into every cursor so decode + bitset-header
+    /// access match the on-disk block size.
+    pub(super) codec: PostingCodec,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
 }
@@ -698,6 +702,8 @@ impl FtsReader {
             || version == format::fts::VERSION_V5;
         let has_bitset_blocks =
             version == format::fts::VERSION_V4 || version == format::fts::VERSION_V5;
+        // Block codec by version: V1–V4 = 128-doc, V5 = 256-doc.
+        let codec = PostingCodec::from_version(version);
         let header_size = match positional_blob {
             true => format::fts::HEADER_SIZE_V2,
             false => FTS_HEADER_SIZE,
@@ -958,6 +964,7 @@ impl FtsReader {
             positions_range,
             has_position_subindex,
             has_bitset_blocks,
+            codec,
             columns,
             column_id_by_name,
         })
@@ -1212,6 +1219,7 @@ impl FtsReader {
                             0,
                             true,
                             self.has_position_subindex,
+                            self.codec.subindex_entries_per_block(),
                         )?;
                         positional.push((Some(term_meta), None));
                     }
@@ -1349,7 +1357,13 @@ impl FtsReader {
                     // one `decode_run` per doc in posting order. Read the slice
                     // once and walk it in lockstep with the doc cursor.
                     let position_bytes = if positional {
-                        let meta = TermMeta::parse(term_bytes.as_ref(), 0, true, false)?;
+                        let meta = TermMeta::parse(
+                            term_bytes.as_ref(),
+                            0,
+                            true,
+                            false,
+                            self.codec.subindex_entries_per_block(),
+                        )?;
                         let region = positions_region.as_ref().ok_or_else(|| {
                             FtsError::Read(ReadError::MalformedVersion(
                                 "positional column missing a positions region".into(),
@@ -1367,8 +1381,9 @@ impl FtsReader {
                     };
                     let mut pos_at = 0usize;
 
-                    let mut cursor =
-                        TermCursor::new(term_bytes, n_docs, positional, None, false, false)?;
+                    let mut cursor = TermCursor::new(
+                        term_bytes, n_docs, positional, None, false, false, self.codec,
+                    )?;
                     while !cursor.is_exhausted() {
                         while cursor.pos < cursor.block_n {
                             let doc_id = cursor.block_doc_ids[cursor.pos];
@@ -1702,19 +1717,20 @@ pub(super) fn or_cursor_into_bitset(
     for block in c.blocks.iter() {
         let bytes = c.bytes.slice(block.block_byte_offset..block.block_byte_end);
         let bytes = bytes.as_ref();
-        if bytes[block256::ENCODING_OFF] == ENCODING_BITSET {
+        if bytes[c.codec.encoding_off()] == c.codec.encoding_bitset() {
             // Word-OR the presence bitset in at its aligned base word.
-            // Tfs trail; the bitset is everything between them.
+            // Tfs trail; the bitset is everything between them. (BASE_OFF/
+            // HEADER_SIZE are codec-invariant; tf_bits offset + block len differ.)
             let base_word =
                 read_u32_le(&bytes[block256::BASE_OFF..block256::BASE_OFF + 4]) as usize / 64;
-            let tf_bits = bytes[block256::TF_BITS_OFF] as usize;
-            let tfs_size = BLOCK_LEN * tf_bits / 8;
+            let tf_bits = bytes[c.codec.tf_bits_off()] as usize;
+            let tfs_size = c.codec.block_len() * tf_bits / 8;
             let presence = &bytes[block256::HEADER_SIZE..bytes.len() - tfs_size];
             for (i, chunk) in presence.chunks_exact(8).enumerate() {
                 dest[base_word + i] |= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
             }
         } else {
-            let n = decode_block_doc_ids(bytes, scratch);
+            let n = c.codec.decode_block_doc_ids(bytes, scratch);
             for &d in &scratch[..n] {
                 dest[(d >> 6) as usize] |= 1u64 << (d & 63);
             }

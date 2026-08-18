@@ -64,6 +64,12 @@ pub const BLOCK_LEN: usize = BitPacker4x::BLOCK_LEN;
 /// base_doc_id).
 pub const HEADER_SIZE: usize = 8;
 
+/// Header byte offset of `tf_bits` (byte 2, after doc_count + delta_bits).
+pub const TF_BITS_OFF: usize = 2;
+
+/// Header byte offset of the base doc id (LE u32, bytes 4..8).
+pub const BASE_OFF: usize = 4;
+
 /// Header byte offset of the block `encoding` field (formerly reserved).
 pub const ENCODING_OFF: usize = 3;
 

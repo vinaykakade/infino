@@ -4814,9 +4814,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "step 4 (dual codec): synthesizes a v1 (128-doc) blob, but the reader \
-                currently decodes only the 256-doc codec. Re-enable once the reader \
-                dispatches the block codec by version (v1–v4 → 128, v5 → 256)."]
+    #[ignore = "superseded by the step-6 dual-read gate. The reader now dispatches the \
+                block codec by version (done, step 4), but this test synthesizes a 'v1' \
+                blob by *relabeling* a real blob's version — and real blobs are now v5 \
+                (256-doc), so relabeling to v1 would decode 256-format bytes as 128. A \
+                genuine dual-read test needs a real 128-format blob producer (step 6)."]
     async fn new_code_reads_synthesized_v1_blob() {
         use crate::superfile::fts::reader::{BoolMode, FtsReader};
 

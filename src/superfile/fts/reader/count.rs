@@ -406,7 +406,7 @@ mod tests {
 
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
-        block256::{self, ENCODING_BITSET, ENCODING_PACKED},
+        block256::{ENCODING_BITSET, ENCODING_PACKED},
         builder::FtsBuilder,
         tokenize::AsciiLowerTokenizer,
     };
@@ -677,7 +677,7 @@ mod tests {
         let mix = &cursors[0];
         let (mut saw_bitset, mut saw_packed) = (false, false);
         for blk in mix.blocks.iter() {
-            match mix.bytes.as_ref()[blk.block_byte_offset + block256::ENCODING_OFF] {
+            match mix.bytes.as_ref()[blk.block_byte_offset + mix.codec.encoding_off()] {
                 ENCODING_BITSET => saw_bitset = true,
                 ENCODING_PACKED => saw_packed = true,
                 other => panic!("unexpected encoding byte {other}"),

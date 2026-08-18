@@ -29,7 +29,7 @@ use crate::{
         ReadError,
         error::FtsError,
         fts::{
-            block256::{BLOCK_LEN, decode_block},
+            block256::BLOCK_LEN,
             bm25,
             dict::{DictReader, make_key},
             fst_value::FstValue,
@@ -840,7 +840,13 @@ impl FtsReader {
         // Gated: an unmetered process must not pay the procfs reads on
         // the most common query shape.
         let kernel_start = metering_active().then(thread_cpu_ns).flatten();
-        let term_meta = TermMeta::parse(postings, metadata_offset, col_meta.positions, false)?;
+        let term_meta = TermMeta::parse(
+            postings,
+            metadata_offset,
+            col_meta.positions,
+            false,
+            self.codec.subindex_entries_per_block(),
+        )?;
 
         let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
         let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
@@ -849,7 +855,8 @@ impl FtsReader {
         // Top-k min-heap; see `TopKEntry` for the reversed ordering
         // that makes `peek()` the current kth-best score.
         let mut heap: BinaryHeap<TopKEntry> =
-            BinaryHeap::with_capacity(k.min(term_meta.num_blocks * BLOCK_LEN).max(1));
+            BinaryHeap::with_capacity(k.min(term_meta.num_blocks * self.codec.block_len()).max(1));
+        // Buffers sized to the max block length so either codec's block fits.
         let mut buf_d = vec![0u32; BLOCK_LEN];
         let mut buf_t = vec![0u32; BLOCK_LEN];
 
@@ -877,7 +884,7 @@ impl FtsReader {
                 [metadata_offset + block_offset_in_term..metadata_offset + block_end_in_term];
 
             //  Actual number of real docs in that block.
-            let n = decode_block(block_bytes, &mut buf_d, &mut buf_t);
+            let n = self.codec.decode_block(block_bytes, &mut buf_d, &mut buf_t);
 
             for j in 0..n {
                 let doc_id = buf_d[j];
@@ -1013,6 +1020,7 @@ impl FtsReader {
                         self.n_docs as u64,
                         dl_norm_k1,
                         gidf,
+                        self.codec,
                     ));
                 }
                 Resolved::Pfor {
@@ -1027,6 +1035,7 @@ impl FtsReader {
                         gidf,
                         header_probed,
                         count_only,
+                        self.codec,
                     )?);
                 }
             }
