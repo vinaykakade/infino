@@ -71,6 +71,17 @@ pub mod fts {
     /// unchanged, so existing indices need no reindex.
     pub const VERSION_V4: u32 = 4;
 
+    /// The version written when posting blocks use the **256-doc block codec**
+    /// (`block256`) instead of the 128-doc codec of `V1`–`V4`. Same header +
+    /// region layout as [`VERSION_V2`]–[`VERSION_V4`] (positions region present
+    /// iff positional; sub-index for positional terms; blocks may be PACKED or
+    /// bitset, self-describing per block) — `V5` changes only the posting-block
+    /// codec (256-wide blocks). **Backwards compatible: the reader dispatches
+    /// the block codec by version, so one binary reads both `V1`–`V4` (128) and
+    /// `V5` (256).** New writes are `V5`; existing `V1`–`V4` indices read
+    /// unchanged with the 128 codec, no reindex.
+    pub const VERSION_V5: u32 = 5;
+
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
     /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.

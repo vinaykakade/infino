@@ -578,20 +578,22 @@ impl FtsReader {
             && version != format::fts::VERSION_V2
             && version != format::fts::VERSION_V3
             && version != format::fts::VERSION_V4
+            && version != format::fts::VERSION_V5
         {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
             ))));
         }
         // The FST directory starts right after whichever header
-        // applies; a v2/v3/v4 header's extension bytes are already in the
+        // applies; a v2/v3/v4/v5 header's extension bytes are already in the
         // fetched span (and in the overlay below), so
-        // `open_with_source` re-reads them without another GET. (v3/v4 share
-        // v2's header size.)
+        // `open_with_source` re-reads them without another GET. (v3–v5 share
+        // v2's header size; v5 differs only in the posting-block codec.)
         let header_size = match version {
             v if v == format::fts::VERSION_V2
                 || v == format::fts::VERSION_V3
-                || v == format::fts::VERSION_V4 =>
+                || v == format::fts::VERSION_V4
+                || v == format::fts::VERSION_V5 =>
             {
                 format::fts::HEADER_SIZE_V2
             }
@@ -681,15 +683,21 @@ impl FtsReader {
             v if v == format::fts::VERSION_V2 => true,
             v if v == format::fts::VERSION_V3 => true,
             v if v == format::fts::VERSION_V4 => true,
+            v if v == format::fts::VERSION_V5 => true,
             _ => {
                 return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                     "fts section version {version}"
                 ))));
             }
         };
-        let has_position_subindex =
-            version == format::fts::VERSION_V3 || version == format::fts::VERSION_V4;
-        let has_bitset_blocks = version == format::fts::VERSION_V4;
+        // v3–v5 carry the per-term position sub-index for positional terms; v4/v5
+        // may store dense blocks in the bitset encoding. v5 additionally uses the
+        // 256-doc block codec (selected below by version, not by these flags).
+        let has_position_subindex = version == format::fts::VERSION_V3
+            || version == format::fts::VERSION_V4
+            || version == format::fts::VERSION_V5;
+        let has_bitset_blocks =
+            version == format::fts::VERSION_V4 || version == format::fts::VERSION_V5;
         let header_size = match positional_blob {
             true => format::fts::HEADER_SIZE_V2,
             false => FTS_HEADER_SIZE,

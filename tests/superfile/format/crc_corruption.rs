@@ -319,8 +319,9 @@ fn corrupt_fts_positions_region_rejected() {
             .expect("version bytes"),
     );
     assert_eq!(
-        version, 4,
-        "positional superfile must embed a v4 FTS blob (dense corpus ⇒ bitset blocks)"
+        version, 5,
+        "new code writes a v5 FTS blob (256-doc block codec); the positions region \
+         + CRC discipline is version-independent, so the corruption check still applies"
     );
     let positions_off_rel = u64::from_le_bytes(
         bytes[fts_off + 48..fts_off + 56]

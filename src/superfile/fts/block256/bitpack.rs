@@ -103,12 +103,35 @@ pub fn unpack(bits: u32, packed: &[u32], out: &mut [u32]) {
         "unpack: packed too short ({}) for bits {bits}",
         packed.len()
     );
-    let mask = low_mask(bits);
+    // Dispatch to a width-specialized decoder so the shift/mask/word offsets are
+    // compile-time constants — the ROWS loop unrolls and the 8-lane inner loop
+    // lowers to one wide vector op per row (AVX2 on x86-64, NEON on aarch64).
+    // A single runtime-`bits` decoder cannot: variable shift amounts and word
+    // indices block both unrolling and vectorization. This mirrors a
+    // per-bit-width family of decoders (decode1..decode32) rather than one
+    // generic loop.
+    macro_rules! dispatch {
+        ($($b:literal)+) => {
+            match bits {
+                $($b => unpack_const::<$b>(packed, out),)+
+                _ => unreachable!("bits in 1..=32 checked above"),
+            }
+        };
+    }
+    dispatch!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32);
+}
+
+/// Width-specialized decode: `B` is a const so every `word`/`off`/`spans`/`mask`
+/// below folds to a constant, the `ROWS` loop unrolls, and the 8-lane body
+/// vectorizes. `packed` is pre-checked to hold `B * LANES` words.
+#[inline]
+fn unpack_const<const B: u32>(packed: &[u32], out: &mut [u32]) {
+    let mask = low_mask(B);
     for row in 0..ROWS {
-        let bitpos = row as u32 * bits;
+        let bitpos = row as u32 * B;
         let word = (bitpos / 32) as usize;
         let off = bitpos % 32;
-        let spans = off + bits > 32;
+        let spans = off + B > 32;
         for lane in 0..LANES {
             let mut v = u64::from(packed[word * LANES + lane]) >> off;
             if spans {
