@@ -47,11 +47,16 @@ pub const BLOCK_LEN: usize = PACK_BLOCK_LEN;
 /// Fixed block header size in bytes.
 pub const HEADER_SIZE: usize = 8;
 
-const DELTA_BITS_OFF: usize = 0;
-const TF_BITS_OFF: usize = 1;
-const ENCODING_OFF: usize = 2;
-const COUNT_M1_OFF: usize = 3;
-const BASE_OFF: usize = 4;
+/// Header byte offset of `delta_bits`.
+pub const DELTA_BITS_OFF: usize = 0;
+/// Header byte offset of `tf_bits`.
+pub const TF_BITS_OFF: usize = 1;
+/// Header byte offset of the `encoding` discriminant.
+pub const ENCODING_OFF: usize = 2;
+/// Header byte offset of `count - 1`.
+pub const COUNT_M1_OFF: usize = 3;
+/// Header byte offset of the base doc id (LE u32, 4 bytes).
+pub const BASE_OFF: usize = 4;
 
 /// Doc ids stored as PFOR deltas (bit-packed via [`bitpack`]).
 pub const ENCODING_PACKED: u8 = 0;

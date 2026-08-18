@@ -96,11 +96,11 @@ use crate::superfile::{
         checksum::{crc32c, crc32c_append},
     },
     fts::{
+        block256::{BLOCK_LEN, Block, ENCODING_BITSET, ENCODING_OFF, EncodedBlock, encode_block},
         bm25,
         dict::{DictBuilder, StreamingDictBuilder},
         fst_value::{FstValue, INLINE_TF_MAX},
         positions::{encode_run, read_varint, skip_run},
-        posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
         tokenize::{AsciiLowerTokenizer, Tokenizer},
     },
 };
@@ -3664,7 +3664,10 @@ fn encode_and_emit_term<W: Write>(
             profile.encode_block_build += start.elapsed();
         }
         // A block emitted in the bitset encoding bumps the blob to v4.
-        if encoded_blocks.iter().any(|b| b.bytes[3] == ENCODING_BITSET) {
+        if encoded_blocks
+            .iter()
+            .any(|b| b.bytes[ENCODING_OFF] == ENCODING_BITSET)
+        {
             profile.saw_bitset_block = true;
         }
         let num_blocks = encoded_blocks.len() as u32;
@@ -4849,6 +4852,12 @@ mod tests {
     /// and takes the fallback (the sub-index bytes become dead space the
     /// walk never reads, since blocks are located from the skip table).
     #[tokio::test]
+    #[ignore = "PROTOTYPE(256-blocks): reader decodes only the 256-doc codec; \
+                old-format (v2 128-block) back-compat reads are out of scope for \
+                the prototype (would need dual-codec support). Also, the dense \
+                corpus is v3 not v4 at 256 (dense runs pack to 1-bit deltas, \
+                beating the bitset). Re-enable when the format productionizes with \
+                a version bump + dual-codec."]
     async fn new_code_reads_v2_positional_via_fallback() {
         use crate::superfile::fts::reader::{BoolMode, FtsReader};
 

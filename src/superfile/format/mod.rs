@@ -22,7 +22,7 @@ pub const CRC_BYTES: usize = 4;
 
 /// FTS section magic bytes and constants.
 pub mod fts {
-    use crate::superfile::fts::posting::BLOCK_LEN;
+    use crate::superfile::fts::block256::BLOCK_LEN;
 
     /// 8-byte magic at the start of the FTS blob: `INF` + `FTS` +
     /// `01`. The trailing `01` is a fixed part of the section

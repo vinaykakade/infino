@@ -43,11 +43,11 @@ use crate::superfile::{
         },
     },
     fts::{
+        block256::{self, BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
         builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
         dict::{DictReader, make_key},
         fst_value::FstValue,
         positions::decode_run,
-        posting::{self, BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
         tokenize::{Tokenizer, tokenizer_for_name},
     },
     lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
@@ -1694,13 +1694,14 @@ pub(super) fn or_cursor_into_bitset(
     for block in c.blocks.iter() {
         let bytes = c.bytes.slice(block.block_byte_offset..block.block_byte_end);
         let bytes = bytes.as_ref();
-        if bytes[posting::ENCODING_OFF] == ENCODING_BITSET {
+        if bytes[block256::ENCODING_OFF] == ENCODING_BITSET {
             // Word-OR the presence bitset in at its aligned base word.
             // Tfs trail; the bitset is everything between them.
-            let base_word = read_u32_le(&bytes[4..8]) as usize / 64;
-            let tf_bits = bytes[2] as usize;
+            let base_word =
+                read_u32_le(&bytes[block256::BASE_OFF..block256::BASE_OFF + 4]) as usize / 64;
+            let tf_bits = bytes[block256::TF_BITS_OFF] as usize;
             let tfs_size = BLOCK_LEN * tf_bits / 8;
-            let presence = &bytes[posting::HEADER_SIZE..bytes.len() - tfs_size];
+            let presence = &bytes[block256::HEADER_SIZE..bytes.len() - tfs_size];
             for (i, chunk) in presence.chunks_exact(8).enumerate() {
                 dest[base_word + i] |= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
             }

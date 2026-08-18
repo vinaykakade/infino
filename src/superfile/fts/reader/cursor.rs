@@ -22,9 +22,9 @@ use crate::superfile::{
         },
     },
     fts::{
+        block256::{self, BLOCK_LEN, decode_block, decode_block_doc_ids},
         bm25,
         builder::{SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
-        posting::{self, BLOCK_LEN, decode_block, decode_block_doc_ids},
     },
 };
 
@@ -535,15 +535,15 @@ impl TermCursor {
         // intersection-count time (and wasted on the PACKED path, which
         // only reads the encoding byte before falling to the decode cache).
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        if raw[posting::ENCODING_OFF] == posting::ENCODING_BITSET {
-            let base = read_u32_le(&raw[4..8]);
+        if raw[block256::ENCODING_OFF] == block256::ENCODING_BITSET {
+            let base = read_u32_le(&raw[block256::BASE_OFF..block256::BASE_OFF + 4]);
             if doc < base {
                 return false;
             }
             let bit = (doc - base) as usize;
-            let tfs_size = BLOCK_LEN * raw[2] as usize / 8;
+            let tfs_size = BLOCK_LEN * raw[block256::TF_BITS_OFF] as usize / 8;
             let bitset_end = raw.len() - tfs_size;
-            let word_at = posting::HEADER_SIZE + (bit / 64) * 8;
+            let word_at = block256::HEADER_SIZE + (bit / 64) * 8;
             if word_at + 8 > bitset_end {
                 return false; // past this block's presence bits ⇒ absent
             }

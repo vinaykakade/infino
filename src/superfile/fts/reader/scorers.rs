@@ -19,7 +19,7 @@ use super::{
 };
 use crate::superfile::{
     error::FtsError,
-    fts::{bm25, posting::BLOCK_LEN},
+    fts::{block256::BLOCK_LEN, bm25},
 };
 
 /// Intersection cardinality by a rarest-driven membership walk: iterate the

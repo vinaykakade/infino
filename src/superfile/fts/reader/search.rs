@@ -29,10 +29,10 @@ use crate::{
         ReadError,
         error::FtsError,
         fts::{
+            block256::{BLOCK_LEN, decode_block},
             bm25,
             dict::{DictReader, make_key},
             fst_value::FstValue,
-            posting::{BLOCK_LEN, decode_block},
         },
     },
 };
