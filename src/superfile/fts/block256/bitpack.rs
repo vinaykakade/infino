@@ -91,10 +91,11 @@ pub fn pack(bits: u32, values: &[u32; BLOCK_LEN], out: &mut [u32]) {
 /// # Panics
 /// - `bits > 32`.
 /// - `packed.len() < packed_len_u32(bits)`.
-pub fn unpack(bits: u32, packed: &[u32], out: &mut [u32; BLOCK_LEN]) {
+pub fn unpack(bits: u32, packed: &[u32], out: &mut [u32]) {
     assert!(bits <= 32, "unpack: bits {bits} > 32");
+    assert!(out.len() >= BLOCK_LEN, "unpack: out < BLOCK_LEN");
     if bits == 0 {
-        *out = [0u32; BLOCK_LEN];
+        out[..BLOCK_LEN].fill(0);
         return;
     }
     assert!(
