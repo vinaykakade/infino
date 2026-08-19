@@ -467,46 +467,95 @@ unsafe fn unpack_neon(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
         }
         let bits = bits as usize;
         let p = primitive(bits);
-        let num_ints = BLOCK * p / 32;
         let n_out = bits * 8;
         debug_assert!(bytes.len() >= n_out * 4);
         let mask_full = lane_mask(p, bits);
+        // Shift levels and the leftover (straddle) bit count. `n_levels` full
+        // levels take `n_levels * bits` bits from the top of each packed word;
+        // `rem_int` is what remains for the straddle (0 ⇒ dividing width, no tail).
+        let n_levels = (p - bits) / bits + 1;
+        let rem_int = p - n_levels * bits;
 
-        // Shift levels, 8 lanes/iteration (two NEON registers), reading packed words
-        // straight from `bytes` via unaligned `vld1q` (no intermediate buffer).
-        // `vshlq_u32` with a negative (uniform) count is a per-lane logical right
-        // shift. `n_out` is always a multiple of 8 (`bits * 8`), so the step is exact.
+        // Word-outer, load-once: read each packed word a single time (two 4-lane
+        // registers) and emit all of its shift levels — and, for a non-dividing
+        // width, its straddle leftover — before advancing. `vshlq_u32` with a
+        // negative (uniform) count is a per-lane logical right shift. Output level
+        // `l` lands at `dest[l * n_out + i]`; `n_out` is a multiple of 8 so the
+        // 8-lane step is exact. This reads the packed input once instead of once
+        // per level (+ once for the leftover), the bulk of the decode's loads.
         let maskv = vdupq_n_u32(mask_full);
         let bp = bytes.as_ptr();
         let dp = dest.as_mut_ptr();
-        let mut idx = 0usize;
-        let mut shift = p as i32 - bits as i32;
-        loop {
-            let negv = vdupq_n_s32(-shift);
+        if rem_int == 0 && p == 8 {
+            // Dividing primitive-8 widths (1/2/4 — the tf / dense-delta hot path).
+            // No straddle and no `tmp` (so the hot small widths never pay its
+            // zero-init), and the expand8 fan-out is fused into the level store:
+            // each collapsed word is complete when produced, so scatter its four
+            // byte lanes straight to slots k / 64+k / 128+k / 192+k instead of
+            // writing 64 collapsed words and re-reading them in a separate pass.
+            let lane = vdupq_n_u32(0xFF);
             let mut i = 0usize;
             while i < n_out {
                 let w0 = vld1q_u32(bp.add(i * 4).cast::<u32>());
                 let w1 = vld1q_u32(bp.add((i + 4) * 4).cast::<u32>());
-                vst1q_u32(dp.add(idx), vandq_u32(vshlq_u32(w0, negv), maskv));
-                vst1q_u32(dp.add(idx + 4), vandq_u32(vshlq_u32(w1, negv), maskv));
+                let mut shift = p as i32 - bits as i32;
+                let mut base = i;
+                while shift >= 0 {
+                    let negv = vdupq_n_s32(-shift);
+                    let c0 = vandq_u32(vshlq_u32(w0, negv), maskv);
+                    let c1 = vandq_u32(vshlq_u32(w1, negv), maskv);
+                    vst1q_u32(dp.add(base), vandq_u32(vshrq_n_u32::<24>(c0), lane));
+                    vst1q_u32(dp.add(base + 64), vandq_u32(vshrq_n_u32::<16>(c0), lane));
+                    vst1q_u32(dp.add(base + 128), vandq_u32(vshrq_n_u32::<8>(c0), lane));
+                    vst1q_u32(dp.add(base + 192), vandq_u32(c0, lane));
+                    vst1q_u32(dp.add(base + 4), vandq_u32(vshrq_n_u32::<24>(c1), lane));
+                    vst1q_u32(dp.add(base + 68), vandq_u32(vshrq_n_u32::<16>(c1), lane));
+                    vst1q_u32(dp.add(base + 132), vandq_u32(vshrq_n_u32::<8>(c1), lane));
+                    vst1q_u32(dp.add(base + 196), vandq_u32(c1, lane));
+                    shift -= bits as i32;
+                    base += n_out;
+                }
                 i += 8;
-                idx += 8;
             }
-            shift -= bits as i32;
-            if shift < 0 {
-                break;
-            }
+            return;
         }
-        // Non-dividing widths: mask each word to its leftover bits (8-lane), then run
-        // the generated branchless per-width stitch to reassemble the straddle values.
-        if idx < num_ints {
-            let cmaskv = vdupq_n_u32(lane_mask(p, (shift + bits as i32) as usize));
+        if rem_int == 0 {
+            // Dividing width at primitive 16/32 (does not arise for the current
+            // widths — 16 and 32 take the fused fast paths above — but kept correct
+            // and expand-free via the trailing `match`). No `tmp`.
+            let mut i = 0usize;
+            while i < n_out {
+                let w0 = vld1q_u32(bp.add(i * 4).cast::<u32>());
+                let w1 = vld1q_u32(bp.add((i + 4) * 4).cast::<u32>());
+                let mut shift = p as i32 - bits as i32;
+                let mut base = i;
+                while shift >= 0 {
+                    let negv = vdupq_n_s32(-shift);
+                    vst1q_u32(dp.add(base), vandq_u32(vshlq_u32(w0, negv), maskv));
+                    vst1q_u32(dp.add(base + 4), vandq_u32(vshlq_u32(w1, negv), maskv));
+                    shift -= bits as i32;
+                    base += n_out;
+                }
+                i += 8;
+            }
+        } else {
+            let cmaskv = vdupq_n_u32(lane_mask(p, rem_int));
             let mut tmp = [0u32; BLOCK];
             let tp = tmp.as_mut_ptr();
             let mut i = 0usize;
             while i < n_out {
                 let w0 = vld1q_u32(bp.add(i * 4).cast::<u32>());
                 let w1 = vld1q_u32(bp.add((i + 4) * 4).cast::<u32>());
+                let mut shift = p as i32 - bits as i32;
+                let mut base = i;
+                while shift >= 0 {
+                    let negv = vdupq_n_s32(-shift);
+                    vst1q_u32(dp.add(base), vandq_u32(vshlq_u32(w0, negv), maskv));
+                    vst1q_u32(dp.add(base + 4), vandq_u32(vshlq_u32(w1, negv), maskv));
+                    shift -= bits as i32;
+                    base += n_out;
+                }
+                // Straddle leftover: the low bits the shift levels did not take.
                 vst1q_u32(tp.add(i), vandq_u32(w0, cmaskv));
                 vst1q_u32(tp.add(i + 4), vandq_u32(w1, cmaskv));
                 i += 8;
