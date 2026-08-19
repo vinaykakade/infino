@@ -28,7 +28,8 @@
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{
-    vandq_u32, vdupq_n_s32, vdupq_n_u32, vld1q_u32, vshlq_u32, vshrq_n_u32, vst1q_u32,
+    uint32x4x2_t, vandq_u32, vdupq_n_s32, vdupq_n_u32, vld1q_u32, vld3q_u32, vorrq_u32,
+    vshlq_n_u32, vshlq_u32, vshrq_n_u32, vst1q_u32, vst2q_u32,
 };
 #[cfg(target_arch = "aarch64")]
 use core::ptr::copy_nonoverlapping;
@@ -232,6 +233,79 @@ fn fill_leftover(bytes: &[u8], n_out: usize, cmask: u32, tmp: &mut [u32; BLOCK])
     }
 }
 
+/// SIMD stitch for the four non-dividing widths whose straddle period is exactly
+/// three words yielding one value (6/12/24) — a `vld3q` deinterleaves four
+/// periods, one shift-combine yields four contiguous values. Byte-identical to the
+/// scalar `stitch_{6,12,24}`; `S0`/`S1` are those kernels' constant shifts.
+///
+/// # Safety
+/// `neon`; reads `12 * iters <= n_out` words within `tmp`, writes `4 * iters`
+/// words into `dest[o..]` (`o + 4*iters <= 256`).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn stitch3_m1<const S0: i32, const S1: i32>(
+    tmp: &[u32],
+    dest: &mut [u32; BLOCK],
+    o: usize,
+    iters: usize,
+) {
+    let tp = tmp.as_ptr();
+    let dp = dest.as_mut_ptr().add(o);
+    let mut w = 0usize;
+    let mut d = 0usize;
+    for _ in 0..iters {
+        let r = vld3q_u32(tp.add(w));
+        let v = vorrq_u32(
+            vshlq_n_u32::<S0>(r.0),
+            vorrq_u32(vshlq_n_u32::<S1>(r.1), r.2),
+        );
+        vst1q_u32(dp.add(d), v);
+        w += 12;
+        d += 4;
+    }
+}
+
+/// SIMD stitch for width 3 (three-word period yielding two values). Byte-identical
+/// to the scalar `stitch_3`; a `vst2q` interleaves the two value streams.
+///
+/// # Safety
+/// `neon`; reads `24` words within `tmp[..24]`, writes `16` words into `dest[48..64]`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn stitch3_w3(tmp: &[u32], dest: &mut [u32; BLOCK]) {
+    let tp = tmp.as_ptr();
+    let dp = dest.as_mut_ptr().add(48);
+    let m = vdupq_n_u32(0x0101_0101);
+    let mut w = 0usize;
+    let mut d = 0usize;
+    for _ in 0..2 {
+        let r = vld3q_u32(tp.add(w));
+        let l0 = vorrq_u32(vshlq_n_u32::<1>(r.0), vandq_u32(vshrq_n_u32::<1>(r.1), m));
+        let l1 = vorrq_u32(vshlq_n_u32::<2>(vandq_u32(r.1, m)), r.2);
+        vst2q_u32(dp.add(d), uint32x4x2_t(l0, l1));
+        w += 12;
+        d += 8;
+    }
+}
+
+/// Dispatch the straddle stitch to a NEON kernel where the period fits `vld3q`
+/// (widths 3/6/12/24), else the scalar branchless kernel.
+///
+/// # Safety
+/// `neon`; the four specialized widths satisfy their kernels' bounds, and the
+/// scalar fallback is safe.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn stitch_dispatch_neon(tmp: &[u32], bits: usize, dest: &mut [u32; BLOCK]) {
+    match bits {
+        3 => stitch3_w3(tmp, dest),
+        6 => stitch3_m1::<4, 2>(tmp, dest, 48, 4),
+        12 => stitch3_m1::<8, 4>(tmp, dest, 96, 8),
+        24 => stitch3_m1::<16, 8>(tmp, dest, 192, 16),
+        _ => stitch_dispatch(tmp, bits, dest),
+    }
+}
+
 /// Scalar reference decoder — the correctness oracle for the SIMD paths, and the
 /// decoder on architectures without a hand-written kernel.
 fn unpack_scalar(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
@@ -346,7 +420,7 @@ unsafe fn unpack_neon(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
             vst1q_u32(tp.add(i + 4), vandq_u32(w1, cmaskv));
             i += 8;
         }
-        stitch_dispatch(&tmp, bits, dest);
+        stitch_dispatch_neon(&tmp, bits, dest);
     }
     match p {
         8 => expand8_neon(dest),
