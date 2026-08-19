@@ -38,6 +38,7 @@
 //! deferred.
 #![allow(dead_code)] // prototype: codec precedes its reader/builder integration
 
+use super::positions::{push_varint, read_varint};
 use bitpacking::{BitPacker, BitPacker8x};
 
 /// Docs per block — double the 128-doc
@@ -71,6 +72,20 @@ pub const ENCODING_PACKED: u8 = 0;
 /// `base_doc_id` aligned down to a 64-bit word. Chosen only when it does not
 /// grow the block (dense blocks).
 pub const ENCODING_BITSET: u8 = 1;
+/// Doc ids stored as LEB128 varint deltas — no padding. Used only for a
+/// **partial** block (`count < BLOCK_LEN`, i.e. a term's short tail block) when
+/// it is smaller than the padded-`PACKED` and `BITSET` alternatives. A full
+/// block never uses it, so the hot decode path stays on the SIMD kernels; the
+/// varint tail avoids paying for ~`BLOCK_LEN - count` padded deltas on the many
+/// rare terms whose whole posting list is one short block.
+pub const ENCODING_VINT: u8 = 2;
+
+/// LEB128 byte length of `v` (`varint_len(0) == 1`).
+#[inline]
+fn varint_len(v: u32) -> usize {
+    let bits = (u32::BITS - v.leading_zeros()).max(1);
+    (bits as usize).div_ceil(7)
+}
 
 /// Align a doc id down to the 64-bit word that contains it — the origin of a
 /// bitset block's presence bitmap.
@@ -137,42 +152,90 @@ pub fn encode_block(b: &Block) -> EncodedBlock {
     let deltas_size = packed_bytes(delta_bits);
     let tfs_size = packed_bytes(tf_bits);
 
-    // Prefer a presence bitset when it is no larger than the packed deltas
-    // (dense blocks — a common term's near-consecutive docs). The bitset origin
-    // is word-aligned so a union count can OR it in without a per-word shift.
+    // Doc-id encoding: pick the smallest of three options.
+    // - PACKED (BitPacker8x, SIMD-decoded): always available; a partial block is
+    //   padded to BLOCK_LEN.
+    // - BITSET (presence bits, word-aligned origin): always available; wins on
+    //   dense near-consecutive docs and lets a union OR it in without decoding.
+    // - VINT (LEB128 deltas, no padding): partial blocks only; wins on the short
+    //   tail block of a rare, widely-spread term where padded PACKED is mostly
+    //   waste. A full block never uses it, so the hot path stays on the kernels.
     let aligned_base = bitset_block_base(base);
     let bitset_words = ((last_doc_id - aligned_base) as usize) / 64 + 1;
     let bitset_size = bitset_words * 8;
-    let use_bitset = bitset_size <= deltas_size;
 
-    let doc_ids_size = if use_bitset { bitset_size } else { deltas_size };
+    let vint_size = if count < BLOCK_LEN {
+        let mut prev = base;
+        let mut s = 0usize;
+        for &d in &b.doc_ids {
+            s += varint_len(d - prev);
+            prev = d;
+        }
+        Some(s)
+    } else {
+        None
+    };
+
+    // PACKED is the default; BITSET wins on a tie (cheaper decode); VINT only
+    // when strictly smaller than both.
+    let mut encoding = ENCODING_PACKED;
+    let mut doc_ids_size = deltas_size;
+    if bitset_size <= doc_ids_size {
+        encoding = ENCODING_BITSET;
+        doc_ids_size = bitset_size;
+    }
+    if let Some(vs) = vint_size {
+        if vs < doc_ids_size {
+            encoding = ENCODING_VINT;
+            doc_ids_size = vs;
+        }
+    }
+
     let mut bytes = Vec::with_capacity(HEADER_SIZE + doc_ids_size + tfs_size);
 
-    bytes.push(if use_bitset { 0 } else { delta_bits });
-    bytes.push(tf_bits);
-    bytes.push(if use_bitset {
-        ENCODING_BITSET
+    // delta_bits is meaningful only for PACKED; 0 otherwise.
+    bytes.push(if encoding == ENCODING_PACKED {
+        delta_bits
     } else {
-        ENCODING_PACKED
+        0
     });
+    bytes.push(tf_bits);
+    bytes.push(encoding);
     bytes.push((count - 1) as u8);
-    bytes.extend_from_slice(&if use_bitset { aligned_base } else { base }.to_le_bytes());
-
-    if use_bitset {
-        let mut words = vec![0u64; bitset_words];
-        for &d in &b.doc_ids {
-            let bit = (d - aligned_base) as usize;
-            words[bit / 64] |= 1u64 << (bit % 64);
-        }
-        for w in words {
-            bytes.extend_from_slice(&w.to_le_bytes());
-        }
+    let stored_base = if encoding == ENCODING_BITSET {
+        aligned_base
     } else {
-        // Max compressed size is 32 bits * BLOCK_LEN / 8 == BLOCK_LEN * 4 bytes.
-        let mut packed = [0u8; BLOCK_LEN * 4];
-        let n = bp.compress_sorted(base, &docs, &mut packed, delta_bits);
-        debug_assert_eq!(n, deltas_size, "compressed delta size");
-        bytes.extend_from_slice(&packed[..n]);
+        base
+    };
+    bytes.extend_from_slice(&stored_base.to_le_bytes());
+
+    match encoding {
+        ENCODING_BITSET => {
+            let mut words = vec![0u64; bitset_words];
+            for &d in &b.doc_ids {
+                let bit = (d - aligned_base) as usize;
+                words[bit / 64] |= 1u64 << (bit % 64);
+            }
+            for w in words {
+                bytes.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        ENCODING_VINT => {
+            let start = bytes.len();
+            let mut prev = base;
+            for &d in &b.doc_ids {
+                push_varint(&mut bytes, d - prev);
+                prev = d;
+            }
+            debug_assert_eq!(bytes.len() - start, doc_ids_size, "vint doc-id size");
+        }
+        _ => {
+            // PACKED. Max compressed size is 32 bits * BLOCK_LEN / 8.
+            let mut packed = [0u8; BLOCK_LEN * 4];
+            let n = bp.compress_sorted(base, &docs, &mut packed, delta_bits);
+            debug_assert_eq!(n, deltas_size, "compressed delta size");
+            bytes.extend_from_slice(&packed[..n]);
+        }
     }
 
     let mut packed_tfs = [0u8; BLOCK_LEN * 4];
@@ -189,7 +252,8 @@ pub fn encode_block(b: &Block) -> EncodedBlock {
 
 /// Decode a block's doc ids into `dest` (must be `>= BLOCK_LEN`), skipping the tf
 /// half. Returns the real doc count. PACKED blocks fill all `BLOCK_LEN` slots
-/// (padding repeats the last doc id); BITSET blocks fill the first `count`.
+/// (padding repeats the last doc id); BITSET and VINT blocks fill the first
+/// `count`.
 ///
 /// # Panics
 /// - `dest.len() < BLOCK_LEN`, or `bytes` shorter than the header/body claims.
@@ -215,6 +279,19 @@ pub fn decode_block_doc_ids(bytes: &[u8], dest: &mut [u32]) -> usize {
             }
         }
         debug_assert_eq!(j, count, "bitset set-bit count must equal doc_count");
+        return count;
+    }
+
+    if encoding == ENCODING_VINT {
+        // Scalar LEB128 tail (a short partial block): read exactly `count`
+        // deltas and prefix-sum them onto `base`. delta[0] == 0 ⇒ dest[0] == base.
+        let mut at = HEADER_SIZE;
+        let mut acc = base;
+        for slot in dest.iter_mut().take(count) {
+            let delta = read_varint(bytes, &mut at).expect("block256: truncated vint doc-id run");
+            acc = acc.wrapping_add(delta);
+            *slot = acc;
+        }
         return count;
     }
 
@@ -259,6 +336,7 @@ pub fn decode_block(bytes: &[u8], dest_doc_ids: &mut [u32], dest_tfs: &mut [u32]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn roundtrip(doc_ids: Vec<u32>, tfs: Vec<u32>) {
         let count = doc_ids.len();
@@ -331,5 +409,75 @@ mod tests {
     #[test]
     fn base_zero_and_high_tf() {
         roundtrip(vec![0, 1, 5, 9], vec![1, 1000, 3, 1]);
+    }
+
+    #[test]
+    fn sparse_partial_block_forces_vint() {
+        // A rare term's whole posting list: a few docs spread across a large
+        // corpus. Padded PACKED would pay ~BLOCK_LEN wide deltas; the bitset
+        // spans millions of bits — vint deltas are far smaller, so VINT is
+        // chosen. This is the tail case that regressed index size before.
+        let doc_ids = vec![10, 5_000_000, 9_000_003, 12_400_101, 30_000_777];
+        let tfs = vec![1, 2, 1, 3, 1];
+        let enc = encode_block(&Block {
+            doc_ids: doc_ids.clone(),
+            tfs: tfs.clone(),
+        });
+        assert_eq!(enc.bytes[ENCODING_OFF], ENCODING_VINT);
+        roundtrip(doc_ids, tfs);
+    }
+
+    #[test]
+    fn full_block_never_vint() {
+        // Even a sparse *full* block stays on the SIMD PACKED path — VINT is a
+        // partial-block-only encoding.
+        let doc_ids: Vec<u32> = (0..BLOCK_LEN as u32).map(|i| i * 100_003).collect();
+        let tfs: Vec<u32> = (0..BLOCK_LEN as u32).map(|i| (i % 3) + 1).collect();
+        let enc = encode_block(&Block {
+            doc_ids: doc_ids.clone(),
+            tfs: tfs.clone(),
+        });
+        assert_ne!(enc.bytes[ENCODING_OFF], ENCODING_VINT);
+        roundtrip(doc_ids, tfs);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Round-trip any block: random counts and gap magnitudes drive the
+        /// encoder across all three doc-id encodings (PACKED/BITSET/VINT) and
+        /// every bit width, and decode must reproduce the input exactly.
+        #[test]
+        fn roundtrip_random(
+            base in 0u32..2_000_000,
+            gaps in prop::collection::vec(1u32..300_000, 1..=BLOCK_LEN),
+            tf_seed in prop::collection::vec(1u32..8_000, BLOCK_LEN),
+        ) {
+            let count = gaps.len();
+            let mut doc_ids = Vec::with_capacity(count);
+            let mut acc = base;
+            for (i, &g) in gaps.iter().enumerate() {
+                if i > 0 {
+                    acc = acc.saturating_add(g);
+                }
+                doc_ids.push(acc);
+            }
+            // saturating_add can create a duplicate only at the u32 ceiling;
+            // skip those rare non-strictly-ascending draws.
+            prop_assume!(doc_ids.windows(2).all(|w| w[0] < w[1]));
+            let tfs: Vec<u32> = tf_seed[..count].to_vec();
+
+            let enc = encode_block(&Block {
+                doc_ids: doc_ids.clone(),
+                tfs: tfs.clone(),
+            });
+            let mut d = [0u32; BLOCK_LEN];
+            let mut t = [0u32; BLOCK_LEN];
+            let n = decode_block(&enc.bytes, &mut d, &mut t);
+            prop_assert_eq!(n, count);
+            prop_assert_eq!(&d[..count], &doc_ids[..]);
+            prop_assert_eq!(&t[..count], &tfs[..]);
+            prop_assert_eq!(enc.last_doc_id, doc_ids[count - 1]);
+        }
     }
 }

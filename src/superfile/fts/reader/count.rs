@@ -406,7 +406,7 @@ mod tests {
 
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
-        block256::{ENCODING_BITSET, ENCODING_PACKED},
+        block256::{ENCODING_BITSET, ENCODING_PACKED, ENCODING_VINT},
         builder::FtsBuilder,
         tokenize::AsciiLowerTokenizer,
     };
@@ -668,24 +668,28 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
-        // Prove `mix` really has both encodings — else the test silently checks
-        // nothing about the transition.
+        // Prove `mix` really crosses an encoding boundary — else the test
+        // silently checks nothing about the transition. The count kernels branch
+        // on bitset (word-copy) vs non-bitset (decode: PACKED or the VINT tail),
+        // so the boundary that matters is bitset ↔ non-bitset.
         let cursors = r
             .build_term_cursors(0, &["mix"], None, true)
             .await
             .expect("build cursors");
         let mix = &cursors[0];
-        let (mut saw_bitset, mut saw_packed) = (false, false);
+        let (mut saw_bitset, mut saw_packed, mut saw_vint) = (false, false, false);
         for blk in mix.blocks.iter() {
             match mix.bytes.as_ref()[blk.block_byte_offset + mix.codec.encoding_off()] {
                 ENCODING_BITSET => saw_bitset = true,
                 ENCODING_PACKED => saw_packed = true,
+                ENCODING_VINT => saw_vint = true,
                 other => panic!("unexpected encoding byte {other}"),
             }
         }
         assert!(
-            saw_bitset && saw_packed,
-            "`mix` must carry both BITSET and PACKED blocks (bitset={saw_bitset}, packed={saw_packed})"
+            saw_bitset && (saw_packed || saw_vint),
+            "`mix` must cross the bitset↔non-bitset boundary \
+             (bitset={saw_bitset}, packed={saw_packed}, vint={saw_vint})"
         );
 
         // Every count kernel over the mixed term must agree with the flat-merge.
