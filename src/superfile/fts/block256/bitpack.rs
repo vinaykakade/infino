@@ -30,6 +30,8 @@
 use core::arch::aarch64::{
     vandq_u32, vdupq_n_s32, vdupq_n_u32, vld1q_u32, vshlq_u32, vshrq_n_u32, vst1q_u32,
 };
+#[cfg(target_arch = "aarch64")]
+use core::ptr::copy_nonoverlapping;
 
 /// Values per block — one 256-doc posting block's worth.
 pub(super) const BLOCK: usize = 256;
@@ -233,8 +235,8 @@ fn fill_leftover(bytes: &[u8], n_out: usize, cmask: u32, tmp: &mut [u32; BLOCK])
 /// Scalar reference decoder — the correctness oracle for the SIMD paths, and the
 /// decoder on architectures without a hand-written kernel.
 fn unpack_scalar(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
-    dest.fill(0);
     if bits == 0 {
+        dest.fill(0);
         return;
     }
     let bits = bits as usize;
@@ -286,9 +288,17 @@ fn unpack_scalar(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn unpack_neon(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
-    dest.fill(0);
     if bits == 0 {
+        dest.fill(0);
         return;
+    }
+    // Fused fast paths for widths equal to their primitive (no shift levels, no
+    // straddle): decode straight into the 256 expanded positions in one pass.
+    match bits {
+        8 => return expand8_from_bytes(bytes, dest),
+        16 => return expand16_from_bytes(bytes, dest),
+        32 => return copy_nonoverlapping(bytes.as_ptr(), dest.as_mut_ptr() as *mut u8, BLOCK * 4),
+        _ => {}
     }
     let bits = bits as usize;
     let p = primitive(bits);
@@ -389,6 +399,60 @@ unsafe fn expand16_neon(a: &mut [u32; BLOCK]) {
         vst1q_u32(p.add(i + 4), vandq_u32(vshrq_n_u32::<16>(l1), m));
         vst1q_u32(p.add(128 + i), vandq_u32(l0, m));
         vst1q_u32(p.add(128 + i + 4), vandq_u32(l1, m));
+        i += 8;
+    }
+}
+
+/// Fused width-8 decode: read each packed word from `bytes` and fan its four byte
+/// lanes straight to the 256 expanded slots — one pass, no intermediate copy.
+///
+/// # Safety
+/// Requires `neon`; each load reads 16 bytes within `bytes[..256]` (`i + 8 <= 64`
+/// ⇒ byte offset `< 256`), and stores stay within `dest[..256]`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn expand8_from_bytes(bytes: &[u8], dest: &mut [u32; BLOCK]) {
+    debug_assert!(bytes.len() >= 256);
+    let m = vdupq_n_u32(0xFF);
+    let bp = bytes.as_ptr();
+    let dp = dest.as_mut_ptr();
+    let mut i = 0usize;
+    while i < 64 {
+        let l0 = vld1q_u32(bp.add(i * 4).cast::<u32>());
+        let l1 = vld1q_u32(bp.add((i + 4) * 4).cast::<u32>());
+        vst1q_u32(dp.add(i), vandq_u32(vshrq_n_u32::<24>(l0), m));
+        vst1q_u32(dp.add(i + 4), vandq_u32(vshrq_n_u32::<24>(l1), m));
+        vst1q_u32(dp.add(64 + i), vandq_u32(vshrq_n_u32::<16>(l0), m));
+        vst1q_u32(dp.add(64 + i + 4), vandq_u32(vshrq_n_u32::<16>(l1), m));
+        vst1q_u32(dp.add(128 + i), vandq_u32(vshrq_n_u32::<8>(l0), m));
+        vst1q_u32(dp.add(128 + i + 4), vandq_u32(vshrq_n_u32::<8>(l1), m));
+        vst1q_u32(dp.add(192 + i), vandq_u32(l0, m));
+        vst1q_u32(dp.add(192 + i + 4), vandq_u32(l1, m));
+        i += 8;
+    }
+}
+
+/// Fused width-16 decode: read each packed word from `bytes` and fan its two
+/// 16-bit lanes straight to the 256 expanded slots — one pass.
+///
+/// # Safety
+/// Requires `neon`; each load reads 16 bytes within `bytes[..512]` (`i + 8 <= 128`
+/// ⇒ byte offset `< 512`), and stores stay within `dest[..256]`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn expand16_from_bytes(bytes: &[u8], dest: &mut [u32; BLOCK]) {
+    debug_assert!(bytes.len() >= 512);
+    let m = vdupq_n_u32(0xFFFF);
+    let bp = bytes.as_ptr();
+    let dp = dest.as_mut_ptr();
+    let mut i = 0usize;
+    while i < 128 {
+        let l0 = vld1q_u32(bp.add(i * 4).cast::<u32>());
+        let l1 = vld1q_u32(bp.add((i + 4) * 4).cast::<u32>());
+        vst1q_u32(dp.add(i), vandq_u32(vshrq_n_u32::<16>(l0), m));
+        vst1q_u32(dp.add(i + 4), vandq_u32(vshrq_n_u32::<16>(l1), m));
+        vst1q_u32(dp.add(128 + i), vandq_u32(l0, m));
+        vst1q_u32(dp.add(128 + i + 4), vandq_u32(l1, m));
         i += 8;
     }
 }
