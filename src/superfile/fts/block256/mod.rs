@@ -7,8 +7,8 @@
 //! halving the number of decode calls and skip-table entries per posting list
 //! and widening each decode. The doc-id deltas and term frequencies of a block
 //! are fixed-width bit-packed by the in-tree [`bitpack`] codec, whose 256-wide
-//! kernels decode with a SIMD unpack (NEON on `aarch64`) plus a scalar
-//! delta-integrate for the sorted doc ids, with a scalar fallback elsewhere.
+//! kernels decode with a SIMD unpack plus a SIMD delta-integrate for the sorted
+//! doc ids (NEON on `aarch64`), with a scalar fallback elsewhere.
 //!
 //! This lives beside the 128-doc codec in
 //! [`posting`](crate::superfile::fts::posting) rather than replacing it: the
@@ -306,20 +306,19 @@ pub fn decode_block_doc_ids(bytes: &[u8], dest: &mut [u32]) -> usize {
         return count;
     }
 
-    // PACKED: unpack the doc-id deltas, then prefix-sum them onto `base` (padded
-    // deltas are 0, so padded doc ids repeat the last real value).
+    // PACKED: unpack the doc-id deltas straight into `dest`, then integrate them
+    // in place (prefix-sum onto `base`). Padded deltas are 0, so padded doc ids
+    // repeat the last real value.
     let deltas_size = packed_bytes(delta_bits);
-    let mut deltas = [0u32; BLOCK_LEN];
+    let doc_dest: &mut [u32; BLOCK_LEN] = (&mut dest[..BLOCK_LEN])
+        .try_into()
+        .expect("decode: BLOCK_LEN doc-id slice");
     bitpack::unpack(
         &bytes[HEADER_SIZE..HEADER_SIZE + deltas_size],
         delta_bits,
-        &mut deltas,
+        doc_dest,
     );
-    let mut acc = base;
-    for (slot, &delta) in dest[..BLOCK_LEN].iter_mut().zip(deltas.iter()) {
-        acc = acc.wrapping_add(delta);
-        *slot = acc;
-    }
+    bitpack::integrate(doc_dest, base);
     count
 }
 

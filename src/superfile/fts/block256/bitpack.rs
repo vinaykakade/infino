@@ -31,8 +31,8 @@
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{
-    uint32x4x2_t, vandq_u32, vdupq_n_s32, vdupq_n_u32, vld1q_u32, vld3q_u32, vorrq_u32,
-    vshlq_n_u32, vshlq_u32, vshrq_n_u32, vst1q_u32, vst2q_u32,
+    uint32x4x2_t, vaddq_u32, vandq_u32, vdupq_n_s32, vdupq_n_u32, vextq_u32, vgetq_lane_u32,
+    vld1q_u32, vld3q_u32, vorrq_u32, vshlq_n_u32, vshlq_u32, vshrq_n_u32, vst1q_u32, vst2q_u32,
 };
 #[cfg(target_arch = "aarch64")]
 use core::ptr::copy_nonoverlapping;
@@ -216,6 +216,73 @@ pub(super) fn unpack(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
     }
     #[cfg(not(target_arch = "aarch64"))]
     unpack_scalar(bytes, bits, dest);
+}
+
+/// In-place inclusive prefix-sum of doc-id deltas, offset by `base`:
+/// `a[i] = base + sum(a[0..=i])`. With `a[0]` a zero delta (the block base is
+/// stored separately), `a[0]` becomes `base`. This is the delta-integrate step
+/// that turns unpacked deltas into ascending doc ids; keeping it out of [`unpack`]
+/// lets the same unpack serve tfs (no integrate) and doc ids (integrate) without a
+/// branch in the hot bit-extraction. NEON on aarch64, [`integrate_scalar`]
+/// elsewhere and as the proptest reference.
+#[inline]
+pub(super) fn integrate(a: &mut [u32; BLOCK], base: u32) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is baseline on aarch64; `integrate_neon` is the vectorized twin
+    // of `integrate_scalar`, proptested byte-identical.
+    unsafe {
+        integrate_neon(a, base);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    integrate_scalar(a, base);
+}
+
+/// Scalar reference prefix-sum — a serial 256-add chain. The correctness oracle
+/// for [`integrate_neon`] and the decoder on non-aarch64 targets.
+fn integrate_scalar(a: &mut [u32; BLOCK], base: u32) {
+    let mut acc = base;
+    for slot in a.iter_mut() {
+        acc = acc.wrapping_add(*slot);
+        *slot = acc;
+    }
+}
+
+/// NEON prefix-sum. Each 4-lane group gets its inclusive within-vector prefix via
+/// two `vext`-shift-and-adds, then the running `carry` (all values before this
+/// group, plus `base`) is splat-added. The loop-carried dependency is only the
+/// **scalar** `carry += group_total`, where `group_total` is the *pre-carry*
+/// prefix's top lane (independent of `carry`), so the serial chain is 64 one-cycle
+/// scalar adds — shorter than a vector-add carry chain (measured: a `vaddq` carry
+/// is ~2–3× the latency and lost across widths) and far shorter than the 256-long
+/// chain of [`integrate_scalar`]. The `vgetq_lane`/`vdupq_n` GPR round-trips are
+/// cheap on this core and pipeline off the critical path; the within-group prefix
+/// runs throughput-bound alongside.
+///
+/// # Safety
+/// Requires `neon` (baseline on aarch64). Every load/store touches `a[i..i+4]`
+/// with `i < 256` in steps of 4, so all accesses stay within `a[..256]`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn integrate_neon(a: &mut [u32; BLOCK], base: u32) {
+    // SAFETY: see the function-level bounds argument above.
+    unsafe {
+        let zero = vdupq_n_u32(0);
+        let p = a.as_mut_ptr();
+        let mut carry = base;
+        let mut i = 0usize;
+        while i < BLOCK {
+            let x = vld1q_u32(p.add(i));
+            // Inclusive within-vector prefix: [d0, d0+d1, d0+d1+d2, d0+d1+d2+d3].
+            let s1 = vaddq_u32(x, vextq_u32::<3>(zero, x));
+            let pfx = vaddq_u32(s1, vextq_u32::<2>(zero, s1));
+            // group_total is the top lane of the pre-carry prefix — independent of
+            // `carry`, so the carry chain stays a plain scalar add.
+            let group_total = vgetq_lane_u32::<3>(pfx);
+            vst1q_u32(p.add(i), vaddq_u32(pfx, vdupq_n_u32(carry)));
+            carry = carry.wrapping_add(group_total);
+            i += 4;
+        }
+    }
 }
 
 /// Read packed word `i` (little-endian) directly from the byte buffer.
@@ -634,6 +701,75 @@ mod bench {
             );
         }
     }
+
+    /// Sorted-decode A/B: our `unpack` + `integrate` (delta-decode + prefix-sum)
+    /// vs `BitPacker8x::decompress_sorted` (the fused SIMD unpack+integrate we
+    /// replaced). This is the doc-id decode path COUNT/ranked hammer — the metric
+    /// the delta-integrate work targets.
+    #[test]
+    #[ignore = "manual sorted-decode A/B: cargo test --release ...bitpack::bench::sorted -- --ignored --nocapture"]
+    fn sorted_decode_vs_bitpacker8x() {
+        let bp = BitPacker8x::new();
+        let iters = 300_000u32;
+        let base = 1_000_000u32;
+        println!(
+            "\nwidth   ours u+i(ns)   decompress_sorted(ns)   ratio (ours/bp; <1 = ours faster)"
+        );
+        for &bits in &[1u8, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24] {
+            let dmask = if bits == 32 {
+                u32::MAX
+            } else {
+                (1u32 << bits) - 1
+            };
+            // Ascending doc ids whose deltas fit in `bits` (delta[0] = 0).
+            let mut docs = [0u32; BLOCK];
+            let mut deltas = [0u32; BLOCK];
+            let mut acc = base;
+            for i in 0..BLOCK {
+                let d = if i == 0 {
+                    0
+                } else {
+                    ((i as u32).wrapping_mul(2_654_435_761) & dmask).max(1)
+                };
+                acc = acc.wrapping_add(d);
+                docs[i] = acc;
+                deltas[i] = d;
+            }
+            let mut mine = Vec::new();
+            pack(&deltas, bits, &mut mine);
+            let mut theirs = vec![0u8; BLOCK * 4];
+            let n = bp.compress_sorted(base, &docs, &mut theirs, bits);
+            theirs.truncate(n);
+
+            let mut dest = [0u32; BLOCK];
+            let time = |f: &mut dyn FnMut() -> u32| {
+                let mut sink = 0u32;
+                for _ in 0..iters / 8 {
+                    sink = sink.wrapping_add(f());
+                }
+                let t = Instant::now();
+                for _ in 0..iters {
+                    sink = sink.wrapping_add(f());
+                }
+                let ns = t.elapsed().as_nanos() as f64 / iters as f64;
+                black_box(sink);
+                ns
+            };
+            let mine_ns = time(&mut || {
+                unpack(black_box(&mine), bits, &mut dest);
+                integrate(&mut dest, base);
+                dest[0] ^ dest[100] ^ dest[200] ^ dest[255]
+            });
+            let bp_ns = time(&mut || {
+                bp.decompress_sorted(base, black_box(&theirs), &mut dest, bits);
+                dest[0] ^ dest[100] ^ dest[200] ^ dest[255]
+            });
+            println!(
+                "{bits:5}   {mine_ns:11.1}   {bp_ns:21.1}   {:.2}",
+                mine_ns / bp_ns
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -733,6 +869,25 @@ mod tests {
             let mut b = [0u32; BLOCK];
             unpack(&out, bits, &mut a);
             unpack_scalar(&out, bits, &mut b);
+            prop_assert_eq!(a, b);
+        }
+
+        /// The dispatched `integrate` (SIMD prefix-sum) is byte-identical to the
+        /// scalar reference for any deltas and base — the correctness gate for the
+        /// NEON delta-integrate. Full-range u32 deltas exercise wrapping too.
+        #[test]
+        fn integrate_matches_scalar(
+            base in any::<u32>(),
+            deltas in prop::collection::vec(any::<u32>(), BLOCK),
+        ) {
+            let mut a = [0u32; BLOCK];
+            let mut b = [0u32; BLOCK];
+            for (i, &d) in deltas.iter().enumerate() {
+                a[i] = d;
+                b[i] = d;
+            }
+            integrate(&mut a, base);
+            integrate_scalar(&mut b, base);
             prop_assert_eq!(a, b);
         }
     }
