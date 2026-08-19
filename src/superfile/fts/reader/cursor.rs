@@ -34,7 +34,7 @@ const BLOCK_LEN_MAX: usize = block256::BLOCK_LEN;
 
 /// Which posting-block codec a superfile uses, selected by its FTS version:
 /// `V1`–`V4` → 128-doc blocks (`posting` / `BitPacker4x`); `V5` → 256-doc blocks
-/// (`block256` / `BitPacker8x`). One reader binary handles both — the block size,
+/// (`block256`, the in-tree codec). One reader binary handles both — the block size,
 /// decode routine, and a couple of header-field offsets differ between the two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PostingCodec {

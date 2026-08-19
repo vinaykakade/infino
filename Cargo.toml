@@ -56,12 +56,6 @@ members = ["benches/utils"]
 # `infino-node/README.md`.
 exclude = ["infino-python", "infino-node"]
 
-# Fork of `bitpacking` adding a 256-wide NEON backend to BitPacker8x (the crate
-# ships AVX2 + scalar only). Same on-disk format; only a faster aarch64 decoder.
-# Used by the 256-doc posting block codec. Sibling checkout under the workspace.
-[patch.crates-io]
-bitpacking = { path = "../bitpacking" }
-
 [lib]
 path = "src/lib.rs"
 # Don't run the lib's `#[test]` harness under `cargo bench` (it would just

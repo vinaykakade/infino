@@ -6,9 +6,9 @@
 //! A self-contained block codec that doubles the block size to 256 docs —
 //! halving the number of decode calls and skip-table entries per posting list
 //! and widening each decode. The doc-id deltas and term frequencies of a block
-//! are bit-packed with [`BitPacker8x`], whose 256-wide kernels decode with a
-//! single SIMD unpack (plus a SIMD delta-integrate for the sorted doc ids):
-//! AVX2 on `x86_64`, NEON on `aarch64`, and a scalar fallback elsewhere.
+//! are fixed-width bit-packed by the in-tree [`bitpack`] codec, whose 256-wide
+//! kernels decode with a SIMD unpack (NEON on `aarch64`) plus a scalar
+//! delta-integrate for the sorted doc ids, with a scalar fallback elsewhere.
 //!
 //! This lives beside the 128-doc codec in
 //! [`posting`](crate::superfile::fts::posting) rather than replacing it: the
@@ -36,21 +36,24 @@
 //! regardless of the doc-id encoding — so a reader that only needs doc ids
 //! ([`decode_block_doc_ids`]) never touches it, and the tf decode can be
 //! deferred.
-#![allow(dead_code)] // prototype: codec precedes its reader/builder integration
 
 use super::positions::{push_varint, read_varint};
-use bitpacking::{BitPacker, BitPacker8x};
 
-// A hand-written fixed-width bit-packing codec to replace BitPacker8x on the
-// 256-doc PACKED path. Present but not yet wired in.
+// The hand-written fixed-width bit-packing codec backing the 256-doc PACKED path.
 mod bitpack;
 
 /// Docs per block — double the 128-doc
 /// [`posting::BLOCK_LEN`](crate::superfile::fts::posting::BLOCK_LEN).
-pub const BLOCK_LEN: usize = BitPacker8x::BLOCK_LEN;
+pub const BLOCK_LEN: usize = bitpack::BLOCK;
+
+/// Minimum bit width to represent `v` (`num_bits(0) == 0`).
+#[inline]
+fn num_bits(v: u32) -> u8 {
+    (u32::BITS - v.leading_zeros()) as u8
+}
 
 /// Bytes a bit-packed region of `bits`-wide values occupies over a full block:
-/// `bits * BLOCK_LEN / 8`. Equals [`BitPacker8x`]'s compressed block size.
+/// `bits * BLOCK_LEN / 8`.
 #[inline]
 fn packed_bytes(bits: u8) -> usize {
     bits as usize * BLOCK_LEN / 8
@@ -70,7 +73,7 @@ pub const COUNT_M1_OFF: usize = 3;
 /// Header byte offset of the base doc id (LE u32, 4 bytes).
 pub const BASE_OFF: usize = 4;
 
-/// Doc ids stored as PFOR deltas (bit-packed via [`BitPacker8x`]).
+/// Doc ids stored as fixed-width bit-packed deltas.
 pub const ENCODING_PACKED: u8 = 0;
 /// Doc ids stored as a presence bitset over `[base_doc_id, last_doc_id]`, with
 /// `base_doc_id` aligned down to a 64-bit word. Chosen only when it does not
@@ -139,26 +142,31 @@ pub fn encode_block(b: &Block) -> EncodedBlock {
     let last_doc_id = b.doc_ids[count - 1];
     let max_tf = b.tfs.iter().copied().max().unwrap_or(0);
 
-    let bp = BitPacker8x::new();
-
-    // Doc ids in a full BLOCK_LEN buffer, padding by repeating the last real
-    // value so the padded deltas are 0 and cost no extra bits. base ==
-    // doc_ids[0] is the sorted "initial", so delta[0] == 0.
-    let mut docs = [last_doc_id; BLOCK_LEN];
-    docs[..count].copy_from_slice(&b.doc_ids);
-    let delta_bits = bp.num_bits_sorted(base, &docs);
+    // Doc-id deltas in a full BLOCK_LEN buffer. `base == doc_ids[0]`, so
+    // `delta[0] == 0`; `delta[i] == doc_ids[i] - doc_ids[i-1]`. Padding slots
+    // (`count..`) stay 0, so they cost no bits.
+    let mut deltas = [0u32; BLOCK_LEN];
+    let mut prev = base;
+    let mut max_delta = 0u32;
+    for (slot, &d) in deltas.iter_mut().zip(b.doc_ids.iter()) {
+        let delta = d - prev;
+        *slot = delta;
+        max_delta = max_delta.max(delta);
+        prev = d;
+    }
+    let delta_bits = num_bits(max_delta);
 
     // Term frequencies in a full BLOCK_LEN buffer, padded with 0.
     let mut tfs = [0u32; BLOCK_LEN];
     tfs[..count].copy_from_slice(&b.tfs);
-    let tf_bits = bp.num_bits(&tfs);
+    let tf_bits = num_bits(max_tf);
 
     let deltas_size = packed_bytes(delta_bits);
     let tfs_size = packed_bytes(tf_bits);
 
     // Doc-id encoding: pick the smallest of three options.
-    // - PACKED (BitPacker8x, SIMD-decoded): always available; a partial block is
-    //   padded to BLOCK_LEN.
+    // - PACKED (fixed-width bit-packed, SIMD-decoded): always available; a
+    //   partial block is padded to BLOCK_LEN.
     // - BITSET (presence bits, word-aligned origin): always available; wins on
     //   dense near-consecutive docs and lets a union OR it in without decoding.
     // - VINT (LEB128 deltas, no padding): partial blocks only; wins on the short
@@ -188,11 +196,11 @@ pub fn encode_block(b: &Block) -> EncodedBlock {
         encoding = ENCODING_BITSET;
         doc_ids_size = bitset_size;
     }
-    if let Some(vs) = vint_size {
-        if vs < doc_ids_size {
-            encoding = ENCODING_VINT;
-            doc_ids_size = vs;
-        }
+    if let Some(vs) = vint_size
+        && vs < doc_ids_size
+    {
+        encoding = ENCODING_VINT;
+        doc_ids_size = vs;
     }
 
     let mut bytes = Vec::with_capacity(HEADER_SIZE + doc_ids_size + tfs_size);
@@ -234,18 +242,17 @@ pub fn encode_block(b: &Block) -> EncodedBlock {
             debug_assert_eq!(bytes.len() - start, doc_ids_size, "vint doc-id size");
         }
         _ => {
-            // PACKED. Max compressed size is 32 bits * BLOCK_LEN / 8.
-            let mut packed = [0u8; BLOCK_LEN * 4];
-            let n = bp.compress_sorted(base, &docs, &mut packed, delta_bits);
-            debug_assert_eq!(n, deltas_size, "compressed delta size");
-            bytes.extend_from_slice(&packed[..n]);
+            // PACKED: bit-pack the doc-id deltas.
+            let before = bytes.len();
+            bitpack::pack(&deltas, delta_bits, &mut bytes);
+            debug_assert_eq!(bytes.len() - before, deltas_size, "packed delta size");
         }
     }
 
-    let mut packed_tfs = [0u8; BLOCK_LEN * 4];
-    let ntf = bp.compress(&tfs, &mut packed_tfs, tf_bits);
-    debug_assert_eq!(ntf, tfs_size, "compressed tf size");
-    bytes.extend_from_slice(&packed_tfs[..ntf]);
+    // tfs bit-packed, trailing the doc-id region.
+    let before = bytes.len();
+    bitpack::pack(&tfs, tf_bits, &mut bytes);
+    debug_assert_eq!(bytes.len() - before, tfs_size, "packed tf size");
 
     EncodedBlock {
         bytes,
@@ -299,16 +306,20 @@ pub fn decode_block_doc_ids(bytes: &[u8], dest: &mut [u32]) -> usize {
         return count;
     }
 
-    // BitPacker8x decompress_sorted does the SIMD unpack *and* the SIMD
-    // delta-integrate, so `dest` holds doc ids directly (no scalar prefix-sum).
+    // PACKED: unpack the doc-id deltas, then prefix-sum them onto `base` (padded
+    // deltas are 0, so padded doc ids repeat the last real value).
     let deltas_size = packed_bytes(delta_bits);
-    let bp = BitPacker8x::new();
-    bp.decompress_sorted(
-        base,
+    let mut deltas = [0u32; BLOCK_LEN];
+    bitpack::unpack(
         &bytes[HEADER_SIZE..HEADER_SIZE + deltas_size],
-        &mut dest[..BLOCK_LEN],
         delta_bits,
+        &mut deltas,
     );
+    let mut acc = base;
+    for (slot, &delta) in dest[..BLOCK_LEN].iter_mut().zip(deltas.iter()) {
+        acc = acc.wrapping_add(delta);
+        *slot = acc;
+    }
     count
 }
 
@@ -326,8 +337,10 @@ pub fn decode_block_tfs(bytes: &[u8], dest: &mut [u32]) {
         "decode_tfs: bytes short"
     );
     let tfs_start = bytes.len() - tfs_size;
-    let bp = BitPacker8x::new();
-    bp.decompress(&bytes[tfs_start..], &mut dest[..BLOCK_LEN], tf_bits);
+    let tfs_dest: &mut [u32; BLOCK_LEN] = (&mut dest[..BLOCK_LEN])
+        .try_into()
+        .expect("decode_tfs: BLOCK_LEN slice");
+    bitpack::unpack(&bytes[tfs_start..], tf_bits, tfs_dest);
 }
 
 /// Decode both doc ids and tfs. Returns the doc count.
@@ -339,8 +352,9 @@ pub fn decode_block(bytes: &[u8], dest_doc_ids: &mut [u32], dest_tfs: &mut [u32]
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use proptest::prelude::*;
+
+    use super::*;
 
     fn roundtrip(doc_ids: Vec<u32>, tfs: Vec<u32>) {
         let count = doc_ids.len();
