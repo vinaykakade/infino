@@ -41,6 +41,10 @@
 use super::positions::{push_varint, read_varint};
 use bitpacking::{BitPacker, BitPacker8x};
 
+// A hand-written fixed-width bit-packing codec to replace BitPacker8x on the
+// 256-doc PACKED path. Present but not yet wired in.
+mod bitpack;
+
 /// Docs per block — double the 128-doc
 /// [`posting::BLOCK_LEN`](crate::superfile::fts::posting::BLOCK_LEN).
 pub const BLOCK_LEN: usize = BitPacker8x::BLOCK_LEN;
