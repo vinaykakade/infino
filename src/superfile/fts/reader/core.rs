@@ -1220,6 +1220,8 @@ impl FtsReader {
                             true,
                             self.has_position_subindex,
                             self.codec.subindex_entries_per_block(),
+                            self.codec.skip_entry_size(),
+                            self.codec.has_sub_block_bounds(),
                         )?;
                         positional.push((Some(term_meta), None));
                     }
@@ -1363,6 +1365,8 @@ impl FtsReader {
                             true,
                             false,
                             self.codec.subindex_entries_per_block(),
+                            self.codec.skip_entry_size(),
+                            self.codec.has_sub_block_bounds(),
                         )?;
                         let region = positions_region.as_ref().ok_or_else(|| {
                             FtsError::Read(ReadError::MalformedVersion(

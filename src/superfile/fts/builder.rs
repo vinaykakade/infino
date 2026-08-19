@@ -227,7 +227,13 @@ pub(crate) const TERM_META_SIZE: usize = 20;
 pub(crate) const TERM_META_POSITIONAL_SIZE: usize = 32;
 
 /// Skip-table entry size in bytes.
-pub(crate) const SKIP_ENTRY_SIZE: usize = 16;
+/// Skip-table entry size for the pre-V5 (128-doc) block codecs — read-only now
+/// (this builder emits V5), but the reader still parses old blobs at this size.
+pub(crate) const SKIP_ENTRY_SIZE_PRE_V5: usize = 16;
+/// Skip-table entry size for the current V5 (256-doc) block codec: the 16-byte
+/// pre-V5 entry plus the two sub-block bound fields (second-half max +
+/// first-half last-doc-id). See [`format::fts::skip_entry`].
+pub(crate) const SKIP_ENTRY_SIZE: usize = 24;
 
 /// Doc-lengths directory entry size in bytes (per column).
 ///
@@ -3360,14 +3366,19 @@ struct TermScratch {
     doc_ids: Vec<u32>,
     /// Per-block tf column, same lifecycle as `doc_ids`.
     tfs: Vec<u32>,
-    /// Per-block BM25 upper bound for the skip table — the maximum per-doc
-    /// contribution over the block's docs, scored with the same quantized
-    /// document length the reader uses (not the looser `score(max_tf,
-    /// min_dl)`, whose best-case tf and best-case dl need not co-occur in
-    /// one doc). Scoring against the quantized length keeps the bound a
-    /// true upper bound over query-time scores; a tighter bound lets the
-    /// reader's block-skip fire more often.
-    block_ub_per_block: Vec<f32>,
+    /// Per-block BM25 upper bound for the skip table, at 128-doc half
+    /// granularity: `(lo_max, hi_max, mid_last_doc_id)`. `lo_max`/`hi_max` are
+    /// the maximum per-doc contribution over the block's first / second 128-doc
+    /// half, and `mid_last_doc_id` is the last doc id of the first half (the
+    /// split point). Scored with the same quantized document length the reader
+    /// uses (not the looser `score(max_tf, min_dl)`, whose best-case tf and dl
+    /// need not co-occur in one doc), so each half bound is a true upper bound
+    /// over query-time scores. Storing the bound per 128-half keeps ranked
+    /// (Block-Max) pruning as tight as the 128-doc layout even though the block
+    /// decodes 256-wide. For a block of ≤ 128 docs the second half is empty:
+    /// `hi_max == lo_max` and `mid == last_doc_id`, so only the first half is
+    /// ever selected.
+    block_ub_per_block: Vec<(f32, f32, u32)>,
     /// Per-term list of encoded blocks held across the meta + skip-
     /// table + block-bytes emit stages.
     encoded_blocks: Vec<EncodedBlock>,
@@ -3654,16 +3665,29 @@ fn encode_and_emit_term<W: Write>(
             // against the exact length would leave the stored max below the
             // query-time score of that same doc and let the block-max skip
             // drop a qualifying document.
-            let block_ub = block_doc_ids
-                .iter()
-                .zip(block_tfs.iter())
-                .map(|(&d, &t)| {
-                    let reader_dl =
-                        bm25::dequantize_len(bm25::quantize_len(col_doc_lengths[d as usize]));
-                    bm25::score(idf_t, t, reader_dl, avgdl)
-                })
-                .fold(0.0f32, f32::max);
-            block_ub_per_block.push(block_ub);
+            // Bound each 128-doc half separately (see `block_ub_per_block`).
+            let half = BLOCK_LEN / 2;
+            let count = block_doc_ids.len();
+            let mut lo = 0.0f32;
+            let mut hi = 0.0f32;
+            for (i, (&d, &t)) in block_doc_ids.iter().zip(block_tfs.iter()).enumerate() {
+                let reader_dl =
+                    bm25::dequantize_len(bm25::quantize_len(col_doc_lengths[d as usize]));
+                let s = bm25::score(idf_t, t, reader_dl, avgdl);
+                if i < half {
+                    lo = lo.max(s);
+                } else {
+                    hi = hi.max(s);
+                }
+            }
+            let (hi, mid) = if count > half {
+                (hi, block_doc_ids[half - 1])
+            } else {
+                // ≤ 128 docs: second half empty. mid == last doc so the reader
+                // never selects `hi`; set hi == lo defensively.
+                (lo, block_doc_ids[count - 1])
+            };
+            block_ub_per_block.push((lo, hi, mid));
             let block = Block {
                 doc_ids: mem::take(&mut block_doc_ids),
                 tfs: mem::take(&mut block_tfs),
@@ -3687,6 +3711,8 @@ fn encode_and_emit_term<W: Write>(
         }
         let num_blocks = encoded_blocks.len() as u32;
         let metadata_offset = *postings_len;
+        // The builder writes the V5 (256-doc) format, whose skip entries carry
+        // the sub-block bound fields.
         let skip_table_size = encoded_blocks.len() * SKIP_ENTRY_SIZE;
         let blocks_total_size: usize = encoded_blocks.iter().map(|b| b.bytes.len()).sum();
         let term_meta_size = match term_positions {
@@ -3786,25 +3812,31 @@ fn encode_and_emit_term<W: Write>(
         // position sub-index, so their offsets start past all three.
         let mut block_offset: u32 = (term_meta_size + skip_table_size + subindex_size) as u32;
         let skip_write_start = profile.enabled.then(Instant::now);
-        for (i, blk) in encoded_blocks.iter().enumerate() {
-            let max_bm25 = block_ub_per_block[i];
-            // ceil(): the stored fixed-point value must stay a true
-            // UPPER bound after quantization — truncation would round
-            // it below the real block max and let BMW / floor skips
-            // drop blocks that still hold qualifying docs. (The reader
-            // additionally adds one step on decode to cover files
-            // written before this rounding fix.)
-            let max_bm25_x1000 = (max_bm25 * format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE)
+        // ceil(): the stored fixed-point value must stay a true UPPER bound
+        // after quantization — truncation would round it below the real block
+        // max and let BMW / floor skips drop blocks that still hold qualifying
+        // docs. (The reader additionally adds one step on decode to cover files
+        // written before this rounding fix.)
+        let quantize_bm25 = |v: f32| -> u32 {
+            (v * format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE)
                 .ceil()
                 .max(0.0)
-                .min(u32::MAX as f32) as u32;
+                .min(u32::MAX as f32) as u32
+        };
+        for (i, blk) in encoded_blocks.iter().enumerate() {
+            let (lo_max, hi_max, mid_last_doc_id) = block_ub_per_block[i];
             term_buf.extend_from_slice(&blk.last_doc_id.to_le_bytes());
             term_buf.extend_from_slice(&block_offset.to_le_bytes());
-            term_buf.extend_from_slice(&max_bm25_x1000.to_le_bytes());
+            // MAX_BM25_OFF holds the first-half bound (whole-block bound on
+            // V1–V4, which this builder no longer writes).
+            term_buf.extend_from_slice(&quantize_bm25(lo_max).to_le_bytes());
             // Positionless columns keep writing zero here —
             // byte-identical to the field's reserved era.
             let pos_block_off = pos_block_offsets.get(i).copied().unwrap_or(0);
             term_buf.extend_from_slice(&pos_block_off.to_le_bytes());
+            // V5 sub-block bound: second-half max + first-half last doc id.
+            term_buf.extend_from_slice(&quantize_bm25(hi_max).to_le_bytes());
+            term_buf.extend_from_slice(&mid_last_doc_id.to_le_bytes());
             block_offset += blk.bytes.len() as u32;
         }
         if let Some(start) = skip_write_start {

@@ -846,6 +846,8 @@ impl FtsReader {
             col_meta.positions,
             false,
             self.codec.subindex_entries_per_block(),
+            self.codec.skip_entry_size(),
+            self.codec.has_sub_block_bounds(),
         )?;
 
         let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
@@ -862,8 +864,13 @@ impl FtsReader {
 
         for i in 0..term_meta.num_blocks {
             // last_doc_id (first tuple slot) is unused here — it serves
-            // AND-merge seeks, which single-term never does.
-            let (_, block_offset_in_term, block_max_bm25) = term_meta.skip_entry(postings, i);
+            // AND-merge seeks, which single-term never does. The block decodes
+            // as one 256-doc unit, so the decode-skip test uses the whole-block
+            // bound (max of the two 128-half bounds); the sub-block bounds only
+            // help the multi-term WAND, which can re-pivot without decoding.
+            let (_, block_offset_in_term, block_max_lo, block_max_hi, _mid) =
+                term_meta.skip_entry(postings, i);
+            let block_max_bm25 = block_max_lo.max(block_max_hi);
 
             // Floor skip: nothing in this block can reach the caller's
             // floor — dead regardless of local heap state.

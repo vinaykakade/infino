@@ -227,6 +227,21 @@ pub mod fts {
         /// term's `positions_offset` (`u32` LE). Zero on positionless
         /// columns (formerly the reserved field).
         pub const POSITIONS_BLOCK_OFFSET_OFF: usize = 12;
+
+        // ── V5-only sub-block bound fields (256-doc blocks) ──
+        //
+        // A 256-doc block stores its BM25 upper bound at 128-doc
+        // half-granularity so ranked (Block-Max) pruning stays as tight as the
+        // 128-doc layout: `MAX_BM25_OFF` holds the *first* half's max, and these
+        // two fields add the second half's max and the first half's last doc id.
+        // V1–V4 (128-doc) blocks stop at 16 bytes; V5 blocks are 24.
+        //
+        /// `[16..20]` second 128-doc half's fixed-point block-max BM25 (`u32` LE).
+        /// V5 only.
+        pub const MAX_BM25_HI_OFF: usize = 16;
+        /// `[20..24]` last doc-id of the first 128-doc half (`u32` LE), the split
+        /// point for choosing which half's bound applies. V5 only.
+        pub const MID_LAST_DOC_ID_OFF: usize = 20;
     }
 }
 

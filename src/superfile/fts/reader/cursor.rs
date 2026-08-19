@@ -20,7 +20,9 @@ use crate::superfile::{
     },
     fts::{
         block256, bm25,
-        builder::{SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
+        builder::{
+            SKIP_ENTRY_SIZE, SKIP_ENTRY_SIZE_PRE_V5, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE,
+        },
         posting,
     },
 };
@@ -109,6 +111,23 @@ impl PostingCodec {
     pub(super) fn subindex_entries_per_block(self) -> usize {
         self.block_len() / POSITION_SUBINDEX_STRIDE
     }
+
+    /// Skip-table entry size. V5 (256-doc) entries carry two extra fields (the
+    /// second 128-half's block-max and the first half's last doc id) for
+    /// half-granular ranked pruning; pre-V5 (128-doc) entries do not.
+    #[inline]
+    pub(super) fn skip_entry_size(self) -> usize {
+        match self {
+            PostingCodec::Block128 => SKIP_ENTRY_SIZE_PRE_V5,
+            PostingCodec::Block256 => SKIP_ENTRY_SIZE,
+        }
+    }
+
+    /// Whether this codec's skip entries carry the V5 sub-block bound fields.
+    #[inline]
+    pub(super) fn has_sub_block_bounds(self) -> bool {
+        matches!(self, PostingCodec::Block256)
+    }
 }
 
 /// Parsed per-(column, term) metadata header from the postings
@@ -151,6 +170,10 @@ pub(super) struct TermMeta {
     /// 256-doc). Stored so the sub-index layout is read with the right stride
     /// regardless of the blob's block size.
     pub(super) subindex_entries_per_block: usize,
+    /// Skip-table entry size for this blob's codec (16 pre-V5, 24 for V5).
+    pub(super) skip_entry_size: usize,
+    /// Whether skip entries carry the V5 sub-block (128-half) bound fields.
+    pub(super) has_sub_block_bounds: bool,
 }
 
 impl TermMeta {
@@ -164,6 +187,8 @@ impl TermMeta {
         positional: bool,
         has_subindex: bool,
         entries_per_block: usize,
+        skip_entry_size: usize,
+        has_sub_block_bounds: bool,
     ) -> Result<Self, FtsError> {
         // Positional columns carry the extended 32-byte header (the
         // term's positions offset + length after `num_blocks`); the
@@ -215,7 +240,7 @@ impl TermMeta {
             )));
         }
         let skip_start = metadata_offset + term_meta_size;
-        let skip_end = skip_start + num_blocks * SKIP_ENTRY_SIZE;
+        let skip_end = skip_start + num_blocks * skip_entry_size;
         if skip_end > postings.len() {
             return Err(FtsError::Read(ReadError::MalformedVersion(
                 "skip table runs past postings region".into(),
@@ -246,6 +271,8 @@ impl TermMeta {
             positions_length,
             subindex_start,
             subindex_entries_per_block: entries_per_block,
+            skip_entry_size,
+            has_sub_block_bounds,
         })
     }
 
@@ -272,17 +299,18 @@ impl TermMeta {
         Some((checkpoint, runs_to_skip))
     }
 
-    /// Decode skip-table entry `i` into `(last_doc_id,
-    /// block_offset_in_term, block_max_bm25)`. `block_offset_in_term`
-    /// is relative to the term's `metadata_offset`; `block_max_bm25`
-    /// is recovered from the fixed-point `max_bm25_x1000` field. The
-    /// reserved field (entry bytes 12..16) is ignored. Per-entry on
-    /// purpose — the single-term BMW walk streams entries without
-    /// materializing a `Vec`.
+    /// Decode skip-table entry `i` into `(last_doc_id, block_offset_in_term,
+    /// block_max_lo, block_max_hi, mid_last_doc_id)`. `block_offset_in_term` is
+    /// relative to the term's `metadata_offset`. `block_max_lo`/`block_max_hi`
+    /// are the per-128-half BM25 upper bounds recovered from the fixed-point
+    /// fields; on pre-V5 blobs (no sub-block bounds) `block_max_hi == block_max_lo`
+    /// and `mid_last_doc_id == last_doc_id` (one whole-block bound, half never
+    /// selected). Per-entry on purpose — the single-term BMW walk streams entries
+    /// without materializing a `Vec`.
     #[inline]
-    pub(super) fn skip_entry(&self, postings: &[u8], i: usize) -> (u32, usize, f32) {
+    pub(super) fn skip_entry(&self, postings: &[u8], i: usize) -> (u32, usize, f32, f32, u32) {
         debug_assert!(i < self.num_blocks, "skip entry {i} >= {}", self.num_blocks);
-        let entry_off = self.skip_start + i * SKIP_ENTRY_SIZE;
+        let entry_off = self.skip_start + i * self.skip_entry_size;
         let last_doc_id = read_u32_le(
             &postings[entry_off + skip_entry::LAST_DOC_ID_OFF
                 ..entry_off + skip_entry::LAST_DOC_ID_OFF + U32_BYTES],
@@ -291,25 +319,38 @@ impl TermMeta {
             &postings[entry_off + skip_entry::BLOCK_OFFSET_OFF
                 ..entry_off + skip_entry::BLOCK_OFFSET_OFF + U32_BYTES],
         ) as usize;
-        let max_bm25_x1000 = read_u32_le(
-            &postings[entry_off + skip_entry::MAX_BM25_OFF
-                ..entry_off + skip_entry::MAX_BM25_OFF + U32_BYTES],
-        );
-        // Decode to a guaranteed upper bound on the block's BM25. The
-        // builder ceil()s on encode, but `x1000 as f32 / SCALE` can still
-        // round a hair below the true max (f32 division), and superfiles
+        // Decode a fixed-point field to a guaranteed upper bound on the block's
+        // BM25. The builder ceil()s on encode, but `x1000 as f32 / SCALE` can
+        // still round a hair below the true max (f32 division), and superfiles
         // written before the encode-side ceil truncated outright. Add one
         // fixed-point step before unscaling so the decoded bound is always
-        // >= the true block max. This matters for the cross-superfile
-        // floor: block-skip compares `block_max <= floor`, and a bound
-        // that dips below a score-tied block's true max would let a rising
-        // floor skip that block, dropping tied hits by completion order
-        // (nondeterministic top-k). The +1 step costs ~1/SCALE of pruning
-        // tightness — negligible — and keeps the top-k deterministic.
+        // >= the true block max. This matters for the cross-superfile floor:
+        // block-skip compares `block_max <= floor`, and a bound that dips below
+        // a score-tied block's true max would let a rising floor skip that
+        // block, dropping tied hits by completion order (nondeterministic
+        // top-k). The +1 step costs ~1/SCALE of pruning tightness — negligible.
+        let decode_bound = |off: usize| -> f32 {
+            let x1000 = read_u32_le(&postings[entry_off + off..entry_off + off + U32_BYTES]);
+            x1000.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE
+        };
+        let block_max_lo = decode_bound(skip_entry::MAX_BM25_OFF);
+        let (block_max_hi, mid_last_doc_id) = if self.has_sub_block_bounds {
+            (
+                decode_bound(skip_entry::MAX_BM25_HI_OFF),
+                read_u32_le(
+                    &postings[entry_off + skip_entry::MID_LAST_DOC_ID_OFF
+                        ..entry_off + skip_entry::MID_LAST_DOC_ID_OFF + U32_BYTES],
+                ),
+            )
+        } else {
+            (block_max_lo, last_doc_id)
+        };
         (
             last_doc_id,
             block_offset,
-            max_bm25_x1000.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE,
+            block_max_lo,
+            block_max_hi,
+            mid_last_doc_id,
         )
     }
 
@@ -319,7 +360,7 @@ impl TermMeta {
     #[inline]
     pub(super) fn positions_block_offset(&self, postings: &[u8], i: usize) -> u32 {
         debug_assert!(i < self.num_blocks, "skip entry {i} >= {}", self.num_blocks);
-        let entry_off = self.skip_start + i * SKIP_ENTRY_SIZE;
+        let entry_off = self.skip_start + i * self.skip_entry_size;
         read_u32_le(
             &postings[entry_off + skip_entry::POSITIONS_BLOCK_OFFSET_OFF
                 ..entry_off + skip_entry::POSITIONS_BLOCK_OFFSET_OFF + U32_BYTES],
@@ -333,7 +374,7 @@ impl TermMeta {
     #[inline]
     pub(super) fn block_end_in_term(&self, postings: &[u8], i: usize) -> usize {
         if i + 1 < self.num_blocks {
-            let next_off = self.skip_start + (i + 1) * SKIP_ENTRY_SIZE;
+            let next_off = self.skip_start + (i + 1) * self.skip_entry_size;
             read_u32_le(&postings[next_off + 4..next_off + 8]) as usize
         } else {
             self.postings_length
@@ -352,9 +393,24 @@ pub(super) struct BlockMeta {
     /// Absolute byte offset of the first byte AFTER this block. For
     /// the last block of a term it's `metadata_offset + postings_length`.
     pub(super) block_byte_end: usize,
-    /// Per-block BM25 upper bound, recovered from the skip table's
-    /// fixed-point `max_bm25_x1000` field.
-    pub(super) block_max_bm25: f32,
+    /// BM25 upper bound over this block's first 128-doc half (whole-block bound
+    /// on pre-V5 blobs). Recovered from the skip table's fixed-point field.
+    pub(super) block_max_bm25_lo: f32,
+    /// BM25 upper bound over this block's second 128-doc half. Equals
+    /// `block_max_bm25_lo` on pre-V5 blobs (no second half).
+    pub(super) block_max_bm25_hi: f32,
+    /// Last doc-id of the first 128-doc half — the split point for choosing
+    /// which half's bound applies. Equals `last_doc_id` on pre-V5 blobs, so the
+    /// second half is never selected.
+    pub(super) mid_last_doc_id: u32,
+}
+
+impl BlockMeta {
+    /// Whole-block BM25 upper bound (the max of the two half bounds).
+    #[inline(always)]
+    pub(super) fn block_max_bm25(&self) -> f32 {
+        self.block_max_bm25_lo.max(self.block_max_bm25_hi)
+    }
 }
 
 /// Per-query-term cursor used by [`FtsReader::run_max_score_bmm`]
@@ -411,6 +467,11 @@ pub(crate) struct TermCursor {
     /// `>= current_block`; synced up whenever `current_block` is
     /// advanced.
     pub(super) inspect_block: usize,
+    /// The doc most recently passed to `shallow_advance_block_to` — the target
+    /// the inspect-block pointer was advanced to. Chooses which 128-doc half's
+    /// bound the `inspect_block_*` methods report, so ranked pruning is
+    /// half-granular even though blocks decode 256-wide.
+    pub(super) inspect_target: u32,
     /// This term's own postings bytes — the metadata header (offset
     /// 0), skip table, and encoded blocks, fetched as a single
     /// contiguous range by [`FtsReader::fetch_term_postings`]. All
@@ -474,6 +535,8 @@ impl TermCursor {
             positional,
             false,
             codec.subindex_entries_per_block(),
+            codec.skip_entry_size(),
+            codec.has_sub_block_bounds(),
         )?;
         let local_idf = bm25::idf(n_docs, term_meta.df);
         let idf = global_idf.unwrap_or(local_idf);
@@ -500,19 +563,23 @@ impl TermCursor {
         let mut term_max_bm25: f32 = 0.0;
         let blocks: Arc<[BlockMeta]> = (0..term_meta.num_blocks)
             .map(|i| {
-                let (last_doc_id, block_offset_in_term, raw_block_max) =
+                let (last_doc_id, block_offset_in_term, raw_lo, raw_hi, mid_last_doc_id) =
                     term_meta.skip_entry(postings, i);
-                let block_max_bm25 = match idf_rescale {
-                    Some(ratio) => raw_block_max * ratio,
-                    None => raw_block_max,
+                let rescale = |v: f32| match idf_rescale {
+                    Some(ratio) => v * ratio,
+                    None => v,
                 };
-                term_max_bm25 = term_max_bm25.max(block_max_bm25);
+                let block_max_bm25_lo = rescale(raw_lo);
+                let block_max_bm25_hi = rescale(raw_hi);
+                term_max_bm25 = term_max_bm25.max(block_max_bm25_lo).max(block_max_bm25_hi);
 
                 BlockMeta {
                     last_doc_id,
                     block_byte_offset: metadata_offset + block_offset_in_term,
                     block_byte_end: metadata_offset + term_meta.block_end_in_term(postings, i),
-                    block_max_bm25,
+                    block_max_bm25_lo,
+                    block_max_bm25_hi,
+                    mid_last_doc_id,
                 }
             })
             .collect();
@@ -528,6 +595,7 @@ impl TermCursor {
             current_block: 0,
             pos: 0,
             inspect_block: 0,
+            inspect_target: 0,
             bytes: term_bytes,
             header_probed,
             count_only,
@@ -566,7 +634,11 @@ impl TermCursor {
             // never called against these offsets.
             block_byte_offset: 0,
             block_byte_end: 0,
-            block_max_bm25,
+            // One doc: no second half, and the whole-block bound is this doc's
+            // exact score. mid == doc_id so only the first half is ever chosen.
+            block_max_bm25_lo: block_max_bm25,
+            block_max_bm25_hi: block_max_bm25,
+            mid_last_doc_id: doc_id,
         }]);
 
         let mut block_doc_ids = vec![0u32; BLOCK_LEN_MAX];
@@ -585,6 +657,7 @@ impl TermCursor {
             current_block: 0,
             pos: 0,
             inspect_block: 0,
+            inspect_target: 0,
             bytes: Bytes::new(),
             header_probed: false,
             // Inline cursors carry their single posting pre-decoded and
@@ -720,7 +793,7 @@ impl TermCursor {
         if self.is_exhausted() {
             0.0
         } else {
-            self.blocks[self.current_block].block_max_bm25
+            self.blocks[self.current_block].block_max_bm25()
         }
     }
 
@@ -748,6 +821,9 @@ impl TermCursor {
     /// increasing `target` across WAND iterations gives amortized
     /// O(1) per call.
     pub(super) fn shallow_advance_block_to(&mut self, target: u32) {
+        // Remember the target so `inspect_block_*` report the bound for the
+        // 128-doc half that contains it, not the whole 256-doc block.
+        self.inspect_target = target;
         // Never let inspect_block fall behind current_block — once
         // the doc cursor has decoded past a block, that block's
         // metadata is no longer relevant.
@@ -791,7 +867,7 @@ impl TermCursor {
             if block_start > range_end {
                 break;
             }
-            let m = self.blocks[i].block_max_bm25;
+            let m = self.blocks[i].block_max_bm25();
             if m > max {
                 max = m;
             }
@@ -800,25 +876,40 @@ impl TermCursor {
         max
     }
 
-    /// Block-max-BM25 at the inspect-block pointer. Pair with
-    /// `shallow_advance_block_to(pivot_doc)` to bound the cursor's
-    /// contribution at pivot_doc.
+    /// Block-max-BM25 at the inspect-block pointer, for the 128-doc half that
+    /// contains the last-shallow-advanced target. Pair with
+    /// `shallow_advance_block_to(pivot_doc)` to bound the cursor's contribution
+    /// at pivot_doc. Reporting the relevant half (not the whole 256-doc block)
+    /// keeps ranked pruning as tight as the 128-doc layout. On pre-V5 blobs the
+    /// two halves are equal, so this is the whole-block bound.
     pub(super) fn inspect_block_max_bm25(&self) -> f32 {
         if self.inspect_block >= self.blocks.len() {
             0.0
         } else {
-            self.blocks[self.inspect_block].block_max_bm25
+            let b = &self.blocks[self.inspect_block];
+            if self.inspect_target <= b.mid_last_doc_id {
+                b.block_max_bm25_lo
+            } else {
+                b.block_max_bm25_hi
+            }
         }
     }
 
-    /// Last doc_id in the block at the inspect-block pointer. Used
-    /// for the BMW skip target — the smallest "next interesting doc"
-    /// across the prefix is one past the smallest such block-end.
+    /// Last doc_id of the inspect pointer's current half — the first half's
+    /// `mid_last_doc_id` when the target lands in it, else the block end. Used
+    /// as the BMW skip window end: bounding to the half (not the whole 256-doc
+    /// block) lets the walk re-pivot at the half boundary. On pre-V5 blobs mid
+    /// == last_doc_id, so this is the whole-block end.
     pub(super) fn inspect_block_last_doc_id(&self) -> u32 {
         if self.inspect_block >= self.blocks.len() {
             u32::MAX
         } else {
-            self.blocks[self.inspect_block].last_doc_id
+            let b = &self.blocks[self.inspect_block];
+            if self.inspect_target <= b.mid_last_doc_id {
+                b.mid_last_doc_id
+            } else {
+                b.last_doc_id
+            }
         }
     }
 
@@ -959,6 +1050,11 @@ mod codec_tests {
         // Sub-index entries per block scale with the block size.
         assert_eq!(PostingCodec::Block128.subindex_entries_per_block(), 8);
         assert_eq!(PostingCodec::Block256.subindex_entries_per_block(), 16);
+        // V5 skip entries carry the two 128-half sub-block bound fields (+8 bytes).
+        assert_eq!(PostingCodec::Block128.skip_entry_size(), 16);
+        assert_eq!(PostingCodec::Block256.skip_entry_size(), 24);
+        assert!(!PostingCodec::Block128.has_sub_block_bounds());
+        assert!(PostingCodec::Block256.has_sub_block_bounds());
     }
 }
 
