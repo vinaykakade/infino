@@ -1,38 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Fixed-width bit-packing for 256-value blocks with primitive-size lanes.
+//! Fixed-width bit-packing for 256-value blocks with a transposed lane layout.
 //!
-//! Backs the 256-doc [`block256`](super) PACKED path. The layout targets
-//! **decode op-count**: values
-//! are packed at the smallest *primitive* that fits the bit width — 8-bit lanes
-//! for width ≤ 8, 16-bit for ≤ 16, 32-bit above — so a narrow column (tf is
-//! usually 1–3 bits, dense doc-deltas 1–8) unpacks with a quarter / half the
-//! shift-mask rounds. Four values share one 32-bit word as byte lanes
-//! (`collapse8` / `expand8`), two as half lanes (`collapse16` / `expand16`); a
-//! lane-replicated mask keeps the lanes from bleeding into each other.
+//! Backs the 256-doc [`block256`](super) PACKED path. The 256 values are stored
+//! as **8 interleaved lane-streams**: value `i` lives in lane `i % 8`, at stream
+//! position `i / 8`. Each lane is an independent 32-value bit-stream packed at
+//! `bits` bits, and all 8 lanes share the same bit-alignment. That alignment is
+//! the whole point: a value that straddles two 32-bit packed words is decoded
+//! **inline** — right-shift the current word, OR in the low bits of the next word
+//! (left-shifted) — in one uniform loop, with no width-dependent branch and no
+//! separate reassembly pass. Decode is therefore flat across every bit width, and
+//! the 4-lane stores land the values already in order, so no de-interleave step
+//! is needed before the delta-integrate.
 //!
-//! [`pack`] (scalar, build-time) and [`unpack`] are exact inverses. Decode is a
-//! shift-level extraction + a per-width **branchless stitch** (only for widths
-//! that don't divide the primitive, whose values span two packed words) +
-//! `expand`. On `aarch64` the shift levels and `expand` run on NEON and the stitch
-//! kernels are generated straight-line const-shift code (see `bitpack_stitch.rs`);
-//! a scalar path mirrors them exactly as the reference. The on-disk bytes are
-//! this codec's own layout — a self-contained 256-block encoding.
+//! [`pack`] (scalar, build-time) and [`unpack`] are exact inverses. On `aarch64`
+//! [`unpack`] runs a NEON kernel (two `uint32x4_t` = 8 lanes per step); a scalar
+//! path mirrors it exactly as the reference. The on-disk bytes are this codec's
+//! own layout — a self-contained 256-block encoding.
 
-// Scalar reference helpers (`unpack_scalar`, `expand*`/`collapse*`) are unused on
-// targets that take the NEON path; they are the correctness oracle and the
-// fallback decoder, so keep them regardless of the current target.
+// `unpack_scalar` is the reference / non-aarch64 decoder and correctness oracle;
+// on aarch64 it is reached only from tests, so keep it regardless of target.
 #![allow(dead_code)]
-// The generated stitch kernels (`bitpack_stitch.rs`, `include!`d below) transcribe
-// a `<< 0` verbatim from the width formula and drive their straddle loops with an
-// explicit index counter; both read cleaner as generated than clippy-idiomatic.
-#![allow(clippy::identity_op, clippy::explicit_counter_loop)]
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{
-    uint32x4x2_t, vaddq_u32, vandq_u32, vdupq_n_s32, vdupq_n_u32, vextq_u32, vgetq_lane_u32,
-    vld1q_u32, vld3q_u32, vorrq_u32, vshlq_n_u32, vshlq_u32, vshrq_n_u32, vst1q_u32, vst2q_u32,
+    vaddq_u32, vandq_u32, vdupq_n_s32, vdupq_n_u32, vextq_u32, vgetq_lane_u32, vld1q_u32,
+    vorrq_u32, vshlq_u32, vst1q_u32,
 };
 #[cfg(target_arch = "aarch64")]
 use core::ptr::copy_nonoverlapping;
@@ -40,89 +34,17 @@ use core::ptr::copy_nonoverlapping;
 /// Values per block — one 256-doc posting block's worth.
 pub(super) const BLOCK: usize = 256;
 
-// Per-width branchless stitch kernels (generated). Reassemble the straddle
-// values that span two packed words; the whole cost at non-dividing widths.
-include!("bitpack_stitch.rs");
+/// Number of interleaved lane-streams. A value-register is 8 lanes wide; the block
+/// is `BLOCK / LANES = 32` value-registers, one per stream position.
+const LANES: usize = 8;
 
-/// `b`-bit low mask replicated into every 32-bit lane (`b` in `1..=32`).
+/// Value-registers per block (`BLOCK / LANES`).
+const REGS: usize = BLOCK / LANES;
+
+/// `b`-bit low mask (`b` in `1..=32`).
 #[inline]
 fn mask32(b: usize) -> u32 {
     if b >= 32 { u32::MAX } else { (1u32 << b) - 1 }
-}
-
-/// `b`-bit low mask replicated into each of the two 16-bit lanes (`b` in `1..=16`).
-#[inline]
-fn mask16(b: usize) -> u32 {
-    let m = (1u32 << b) - 1;
-    m | (m << 16)
-}
-
-/// `b`-bit low mask replicated into each of the four 8-bit lanes (`b` in `1..=8`).
-#[inline]
-fn mask8(b: usize) -> u32 {
-    let m = (1u32 << b) - 1;
-    let m = m | (m << 8);
-    m | (m << 16)
-}
-
-/// Lane-replicated `b`-bit mask for primitive `p` (8, 16, or 32).
-#[inline]
-fn lane_mask(p: usize, b: usize) -> u32 {
-    match p {
-        8 => mask8(b),
-        16 => mask16(b),
-        _ => mask32(b),
-    }
-}
-
-/// Pack four quarter-stride values into one 32-bit word's four byte lanes.
-#[inline]
-fn collapse8(a: &mut [u32; BLOCK]) {
-    for i in 0..64 {
-        a[i] = (a[i] << 24) | (a[64 + i] << 16) | (a[128 + i] << 8) | a[192 + i];
-    }
-}
-
-/// Inverse of [`collapse8`]: spread each word's four byte lanes back to 256 slots.
-#[inline]
-fn expand8(a: &mut [u32; BLOCK]) {
-    for i in 0..64 {
-        let l = a[i];
-        a[i] = (l >> 24) & 0xFF;
-        a[64 + i] = (l >> 16) & 0xFF;
-        a[128 + i] = (l >> 8) & 0xFF;
-        a[192 + i] = l & 0xFF;
-    }
-}
-
-/// Pack two half-stride values into one 32-bit word's two 16-bit lanes.
-#[inline]
-fn collapse16(a: &mut [u32; BLOCK]) {
-    for i in 0..128 {
-        a[i] = (a[i] << 16) | a[128 + i];
-    }
-}
-
-/// Inverse of [`collapse16`].
-#[inline]
-fn expand16(a: &mut [u32; BLOCK]) {
-    for i in 0..128 {
-        let l = a[i];
-        a[i] = (l >> 16) & 0xFFFF;
-        a[128 + i] = l & 0xFFFF;
-    }
-}
-
-/// Smallest primitive (8/16/32) that holds a `bits`-wide value.
-#[inline]
-fn primitive(bits: usize) -> usize {
-    if bits <= 8 {
-        8
-    } else if bits <= 16 {
-        16
-    } else {
-        32
-    }
 }
 
 /// Bytes a `bits`-wide 256-value block occupies: `bits * 32`.
@@ -133,77 +55,40 @@ pub(super) fn packed_len(bits: u8) -> usize {
 
 /// Append the packing of `vals` at `bits` bits to `out` (`bits * 32` bytes).
 /// `bits == 0` writes nothing. Every value must fit in `bits` bits.
+///
+/// Scalar and build-time only — off the hot path, so it favours clarity. Value
+/// register `vr` (its 8 lane values) is written at bit position `vr * bits` into
+/// each lane's stream, spilling the high bits into the next packed word when the
+/// value straddles a 32-bit boundary.
 pub(super) fn pack(vals: &[u32; BLOCK], bits: u8, out: &mut Vec<u8>) {
     if bits == 0 {
         return;
     }
     let bits = bits as usize;
     debug_assert!(bits <= 32);
-    let p = primitive(bits);
-
-    // Collapse into the primitive's lanes (identity for 32-bit).
-    let mut ints = *vals;
-    match p {
-        8 => collapse8(&mut ints),
-        16 => collapse16(&mut ints),
-        _ => {}
-    }
-
-    let num_ints = BLOCK * p / 32; // collapsed word count: 64 / 128 / 256
-    let n_out = bits * 8; // output words (= bits * 32 bytes)
-    let mut tmp_buf = [0u32; BLOCK]; // n_out <= 32*8 = 256; stack, no alloc
-    let tmp = &mut tmp_buf[..n_out];
-    let mut idx = 0usize;
-
-    // Shift levels: each output word accumulates several collapsed words at
-    // descending in-lane shifts. This is the part a SIMD pass vectorizes.
-    let mut shift = p as i32 - bits as i32;
-    for word in tmp.iter_mut() {
-        *word = ints[idx] << shift;
-        idx += 1;
-    }
-    shift -= bits as i32;
-    while shift >= 0 {
-        for word in tmp.iter_mut() {
-            *word |= ints[idx] << shift;
-            idx += 1;
-        }
-        shift -= bits as i32;
-    }
-
-    // Straddle tail: the collapsed words whose bits span two output words.
-    let rem_int = (shift + bits as i32) as usize; // leftover lane bits per output word
-    let mask_rem = lane_mask(p, rem_int.max(1));
-    let mut tmp_idx = 0usize;
-    let mut rem_val = bits;
-    while idx < num_ints {
-        if rem_val >= rem_int {
-            rem_val -= rem_int;
-            tmp[tmp_idx] |= (ints[idx] >> rem_val) & mask_rem;
-            tmp_idx += 1;
-            if rem_val == 0 {
-                idx += 1;
-                rem_val = bits;
+    let n_words = LANES * bits; // output u32 count (= bits * 32 bytes)
+    let mut w = [0u32; LANES * 32]; // max LANES*32; use w[..n_words]
+    for vr in 0..REGS {
+        let bit_pos = vr * bits;
+        let reg = bit_pos / 32;
+        let off = bit_pos % 32;
+        for l in 0..LANES {
+            let v = vals[vr * LANES + l];
+            w[reg * LANES + l] |= v << off;
+            if off + bits > 32 {
+                // Straddle: the high `off + bits - 32` bits go to the next word.
+                w[(reg + 1) * LANES + l] |= v >> (32 - off);
             }
-        } else {
-            let mask1 = lane_mask(p, rem_val);
-            let mask2 = lane_mask(p, rem_int - rem_val);
-            tmp[tmp_idx] |= (ints[idx] & mask1) << (rem_int - rem_val);
-            idx += 1;
-            rem_val += bits - rem_int;
-            tmp[tmp_idx] |= (ints[idx] >> rem_val) & mask2;
-            tmp_idx += 1;
         }
     }
-
-    out.reserve(n_out * 4);
-    for &w in tmp.iter() {
-        out.extend_from_slice(&w.to_le_bytes());
+    out.reserve(n_words * 4);
+    for &word in &w[..n_words] {
+        out.extend_from_slice(&word.to_le_bytes());
     }
 }
 
 /// Inverse of [`pack`]: decode `bits * 32` bytes into `dest[..256]`. `bits == 0`
-/// fills zeros. `bytes` must be at least `packed_len(bits)` long. Dispatches to a
+/// fills zeros. `bytes` must be at least [`packed_len`] long. Dispatches to a
 /// hand-vectorized decoder per architecture; [`unpack_scalar`] is the reference.
 #[inline]
 pub(super) fn unpack(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
@@ -216,6 +101,107 @@ pub(super) fn unpack(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
     }
     #[cfg(not(target_arch = "aarch64"))]
     unpack_scalar(bytes, bits, dest);
+}
+
+/// Read packed word `k` (little-endian) directly from the byte buffer.
+#[inline]
+fn read_word(bytes: &[u8], k: usize) -> u32 {
+    let o = k * 4;
+    u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
+}
+
+/// Scalar reference decoder — the correctness oracle for [`unpack_neon`] and the
+/// decoder on architectures without a hand-written kernel. Reads each value from
+/// its lane-stream position by the direct bit-address formula, independent of the
+/// NEON kernel's incremental word-advance, so the two cross-check.
+fn unpack_scalar(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
+    if bits == 0 {
+        dest.fill(0);
+        return;
+    }
+    let bits = bits as usize;
+    let mask = mask32(bits);
+    for vr in 0..REGS {
+        let bit_pos = vr * bits;
+        let reg = bit_pos / 32;
+        let off = bit_pos % 32;
+        for l in 0..LANES {
+            let mut v = read_word(bytes, reg * LANES + l) >> off;
+            if off + bits > 32 {
+                v |= read_word(bytes, (reg + 1) * LANES + l) << (32 - off);
+            }
+            dest[vr * LANES + l] = v & mask;
+        }
+    }
+}
+
+/// NEON decoder: 8 lanes (two `uint32x4_t`) per value-register, 32 registers per
+/// block. Each register is right-shifted to its in-word offset and masked; when
+/// it straddles into the next packed word, the next word is loaded and its low
+/// bits OR-ed in — the same uniform step at every width, so there is no
+/// width-dependent branch and no separate straddle pass. The 4-lane stores land
+/// the values in order.
+///
+/// # Safety
+/// Requires the `neon` target feature (baseline on `aarch64`). `bytes` must hold
+/// at least `packed_len(bits)` bytes (`= bits * 8` u32). Every load reads one
+/// value-register (8 u32) at word offset `reg * 8`, with `reg <= bits - 1`, so it
+/// stays within `bytes`; every store writes `dest[vr*8 .. vr*8+8]` with `vr < 32`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn unpack_neon(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
+    // SAFETY: see the function-level bounds argument above.
+    unsafe {
+        if bits == 0 {
+            dest.fill(0);
+            return;
+        }
+        let dp = dest.as_mut_ptr();
+        if bits == 32 {
+            // Each value-register is a full packed word — a straight copy.
+            copy_nonoverlapping(bytes.as_ptr(), dp as *mut u8, BLOCK * 4);
+            return;
+        }
+        let bits = bits as usize;
+        let ip = bytes.as_ptr().cast::<u32>();
+        let mask = vdupq_n_u32(mask32(bits));
+
+        // `reg` is the packed word currently in (wa, wb). Value-register 0 sits at
+        // offset 0, so it is just masked.
+        let mut reg = 0usize;
+        let mut wa = vld1q_u32(ip);
+        let mut wb = vld1q_u32(ip.add(4));
+        vst1q_u32(dp, vandq_u32(wa, mask));
+        vst1q_u32(dp.add(4), vandq_u32(wb, mask));
+
+        for vr in 1..REGS {
+            let inner_cursor = (vr * bits) % 32;
+            let inner_capacity = 32 - inner_cursor;
+            let (sa, sb) = if inner_cursor != 0 {
+                // Negative-count shift == per-lane logical right shift.
+                let neg = vdupq_n_s32(-(inner_cursor as i32));
+                (vshlq_u32(wa, neg), vshlq_u32(wb, neg))
+            } else {
+                (wa, wb)
+            };
+            let mut oa = vandq_u32(sa, mask);
+            let mut ob = vandq_u32(sb, mask);
+            // If this register is now fully consumed, advance to the next packed
+            // word; if the value straddled it, OR in the straddled high bits.
+            if inner_capacity <= bits && vr != REGS - 1 {
+                reg += 1;
+                wa = vld1q_u32(ip.add(reg * LANES));
+                wb = vld1q_u32(ip.add(reg * LANES + 4));
+                if inner_capacity < bits {
+                    let pos = vdupq_n_s32(inner_capacity as i32);
+                    oa = vorrq_u32(oa, vandq_u32(vshlq_u32(wa, pos), mask));
+                    ob = vorrq_u32(ob, vandq_u32(vshlq_u32(wb, pos), mask));
+                }
+            }
+            vst1q_u32(dp.add(vr * LANES), oa);
+            vst1q_u32(dp.add(vr * LANES + 4), ob);
+        }
+    }
 }
 
 /// In-place inclusive prefix-sum of doc-id deltas, offset by `base`:
@@ -285,411 +271,10 @@ unsafe fn integrate_neon(a: &mut [u32; BLOCK], base: u32) {
     }
 }
 
-/// Read packed word `i` (little-endian) directly from the byte buffer.
-#[inline]
-fn read_word(bytes: &[u8], i: usize) -> u32 {
-    let o = i * 4;
-    u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
-}
-
-/// Fill `tmp[..n_out]` with each packed word masked to its leftover (`cmask`)
-/// bits — the low straddle bits the shift levels did not take. This is the input
-/// the generated [`stitch_dispatch`] kernels read. Called only at non-dividing
-/// widths (dividing widths have no straddle tail).
-#[inline]
-fn fill_leftover(bytes: &[u8], n_out: usize, cmask: u32, tmp: &mut [u32; BLOCK]) {
-    for (i, t) in tmp[..n_out].iter_mut().enumerate() {
-        *t = read_word(bytes, i) & cmask;
-    }
-}
-
-/// SIMD stitch for the four non-dividing widths whose straddle period is exactly
-/// three words yielding one value (6/12/24) — a `vld3q` deinterleaves four
-/// periods, one shift-combine yields four contiguous values. Byte-identical to the
-/// scalar `stitch_{6,12,24}`; `S0`/`S1` are those kernels' constant shifts.
-///
-/// # Safety
-/// `neon`; reads `12 * iters <= n_out` words within `tmp`, writes `4 * iters`
-/// words into `dest[o..]` (`o + 4*iters <= 256`).
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn stitch3_m1<const S0: i32, const S1: i32>(
-    tmp: &[u32],
-    dest: &mut [u32; BLOCK],
-    o: usize,
-    iters: usize,
-) {
-    // SAFETY: `neon`. Caller passes (o, iters) matching the width so reads stay in
-    // `tmp[..iters*12]` and writes in `dest[o..o+iters*4] ⊆ dest[..256]`.
-    unsafe {
-        let tp = tmp.as_ptr();
-        let dp = dest.as_mut_ptr().add(o);
-        let mut w = 0usize;
-        let mut d = 0usize;
-        for _ in 0..iters {
-            let r = vld3q_u32(tp.add(w));
-            let v = vorrq_u32(
-                vshlq_n_u32::<S0>(r.0),
-                vorrq_u32(vshlq_n_u32::<S1>(r.1), r.2),
-            );
-            vst1q_u32(dp.add(d), v);
-            w += 12;
-            d += 4;
-        }
-    }
-}
-
-/// SIMD stitch for width 3 (three-word period yielding two values). Byte-identical
-/// to the scalar `stitch_3`; a `vst2q` interleaves the two value streams.
-///
-/// # Safety
-/// `neon`; reads `24` words within `tmp[..24]`, writes `16` words into `dest[48..64]`.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn stitch3_w3(tmp: &[u32], dest: &mut [u32; BLOCK]) {
-    // SAFETY: `neon`. Reads `tmp[..24]`, writes `dest[48..64] ⊆ dest[..256]`.
-    unsafe {
-        let tp = tmp.as_ptr();
-        let dp = dest.as_mut_ptr().add(48);
-        let m = vdupq_n_u32(0x0101_0101);
-        let mut w = 0usize;
-        let mut d = 0usize;
-        for _ in 0..2 {
-            let r = vld3q_u32(tp.add(w));
-            let l0 = vorrq_u32(vshlq_n_u32::<1>(r.0), vandq_u32(vshrq_n_u32::<1>(r.1), m));
-            let l1 = vorrq_u32(vshlq_n_u32::<2>(vandq_u32(r.1, m)), r.2);
-            vst2q_u32(dp.add(d), uint32x4x2_t(l0, l1));
-            w += 12;
-            d += 8;
-        }
-    }
-}
-
-/// Dispatch the straddle stitch to a NEON kernel where the period fits `vld3q`
-/// (widths 3/6/12/24), else the scalar branchless kernel.
-///
-/// # Safety
-/// `neon`; the four specialized widths satisfy their kernels' bounds, and the
-/// scalar fallback is safe.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn stitch_dispatch_neon(tmp: &[u32], bits: usize, dest: &mut [u32; BLOCK]) {
-    // SAFETY: `neon`. Each specialized width passes (o, iters) satisfying its
-    // kernel's bounds; the scalar fallback is safe.
-    unsafe {
-        match bits {
-            3 => stitch3_w3(tmp, dest),
-            6 => stitch3_m1::<4, 2>(tmp, dest, 48, 4),
-            12 => stitch3_m1::<8, 4>(tmp, dest, 96, 8),
-            24 => stitch3_m1::<16, 8>(tmp, dest, 192, 16),
-            _ => stitch_dispatch(tmp, bits, dest),
-        }
-    }
-}
-
-/// Scalar reference decoder — the correctness oracle for the SIMD paths, and the
-/// decoder on architectures without a hand-written kernel.
-fn unpack_scalar(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
-    if bits == 0 {
-        dest.fill(0);
-        return;
-    }
-    let bits = bits as usize;
-    let p = primitive(bits);
-    let num_ints = BLOCK * p / 32;
-    let n_out = bits * 8;
-    debug_assert!(bytes.len() >= n_out * 4);
-    let mask_full = lane_mask(p, bits);
-
-    // Shift levels: extract the cleanly-aligned values at each descending shift,
-    // reading packed words straight from `bytes` (no intermediate buffer).
-    let mut idx = 0usize;
-    let mut shift = p as i32 - bits as i32;
-    loop {
-        for i in 0..n_out {
-            dest[idx] = (read_word(bytes, i) >> shift) & mask_full;
-            idx += 1;
-        }
-        shift -= bits as i32;
-        if shift < 0 {
-            break;
-        }
-    }
-    // Non-dividing widths: reassemble the straddle values via the generated
-    // per-width kernel, reading each word's leftover (low `rem_int`) bits.
-    if idx < num_ints {
-        let cmask = lane_mask(p, (shift + bits as i32) as usize);
-        let mut tmp = [0u32; BLOCK];
-        fill_leftover(bytes, n_out, cmask, &mut tmp);
-        stitch_dispatch(&tmp, bits, dest);
-    }
-    match p {
-        8 => expand8(dest),
-        16 => expand16(dest),
-        _ => {}
-    }
-}
-
-/// NEON decoder: the shift-level extraction and `expand` run four lanes at a
-/// time; the straddle tail stays scalar. Byte-identical to [`unpack_scalar`]
-/// (proptested across all widths).
-///
-/// # Safety
-/// Requires the `neon` target feature (baseline on `aarch64`). Every load reads
-/// 16 bytes within `bytes[..n_out * 4]` (`i + 8 <= n_out`), and every store
-/// stays inside `dest[..256]`: the shift-level loop writes
-/// `num_levels * n_out <= num_ints <= 256` words in 8-lane steps, and `expand`'s
-/// indices are bounded by 64 / 128.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn unpack_neon(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
-    // SAFETY: `neon`. See the function-level bounds argument above; every load
-    // reads 16 bytes within `bytes[..n_out*4]` and every store stays in
-    // `dest[..256]`.
-    unsafe {
-        if bits == 0 {
-            dest.fill(0);
-            return;
-        }
-        // Fused fast paths for widths equal to their primitive (no shift levels, no
-        // straddle): decode straight into the 256 expanded positions in one pass.
-        match bits {
-            8 => return expand8_from_bytes(bytes, dest),
-            16 => return expand16_from_bytes(bytes, dest),
-            32 => {
-                return copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    dest.as_mut_ptr() as *mut u8,
-                    BLOCK * 4,
-                );
-            }
-            _ => {}
-        }
-        let bits = bits as usize;
-        let p = primitive(bits);
-        let n_out = bits * 8;
-        debug_assert!(bytes.len() >= n_out * 4);
-        let mask_full = lane_mask(p, bits);
-        // Shift levels and the leftover (straddle) bit count. `n_levels` full
-        // levels take `n_levels * bits` bits from the top of each packed word;
-        // `rem_int` is what remains for the straddle (0 ⇒ dividing width, no tail).
-        let n_levels = (p - bits) / bits + 1;
-        let rem_int = p - n_levels * bits;
-
-        // Word-outer, load-once: read each packed word a single time (two 4-lane
-        // registers) and emit all of its shift levels — and, for a non-dividing
-        // width, its straddle leftover — before advancing. `vshlq_u32` with a
-        // negative (uniform) count is a per-lane logical right shift. Output level
-        // `l` lands at `dest[l * n_out + i]`; `n_out` is a multiple of 8 so the
-        // 8-lane step is exact. This reads the packed input once instead of once
-        // per level (+ once for the leftover), the bulk of the decode's loads.
-        let maskv = vdupq_n_u32(mask_full);
-        let bp = bytes.as_ptr();
-        let dp = dest.as_mut_ptr();
-        if rem_int == 0 && p == 8 {
-            // Dividing primitive-8 widths (1/2/4 — the tf / dense-delta hot path).
-            // No straddle and no `tmp` (so the hot small widths never pay its
-            // zero-init), and the expand8 fan-out is fused into the level store:
-            // each collapsed word is complete when produced, so scatter its four
-            // byte lanes straight to slots k / 64+k / 128+k / 192+k instead of
-            // writing 64 collapsed words and re-reading them in a separate pass.
-            let lane = vdupq_n_u32(0xFF);
-            let mut i = 0usize;
-            while i < n_out {
-                let w0 = vld1q_u32(bp.add(i * 4).cast::<u32>());
-                let w1 = vld1q_u32(bp.add((i + 4) * 4).cast::<u32>());
-                let mut shift = p as i32 - bits as i32;
-                let mut base = i;
-                while shift >= 0 {
-                    let negv = vdupq_n_s32(-shift);
-                    let c0 = vandq_u32(vshlq_u32(w0, negv), maskv);
-                    let c1 = vandq_u32(vshlq_u32(w1, negv), maskv);
-                    vst1q_u32(dp.add(base), vandq_u32(vshrq_n_u32::<24>(c0), lane));
-                    vst1q_u32(dp.add(base + 64), vandq_u32(vshrq_n_u32::<16>(c0), lane));
-                    vst1q_u32(dp.add(base + 128), vandq_u32(vshrq_n_u32::<8>(c0), lane));
-                    vst1q_u32(dp.add(base + 192), vandq_u32(c0, lane));
-                    vst1q_u32(dp.add(base + 4), vandq_u32(vshrq_n_u32::<24>(c1), lane));
-                    vst1q_u32(dp.add(base + 68), vandq_u32(vshrq_n_u32::<16>(c1), lane));
-                    vst1q_u32(dp.add(base + 132), vandq_u32(vshrq_n_u32::<8>(c1), lane));
-                    vst1q_u32(dp.add(base + 196), vandq_u32(c1, lane));
-                    shift -= bits as i32;
-                    base += n_out;
-                }
-                i += 8;
-            }
-            return;
-        }
-        if rem_int == 0 {
-            // Dividing width at primitive 16/32 (does not arise for the current
-            // widths — 16 and 32 take the fused fast paths above — but kept correct
-            // and expand-free via the trailing `match`). No `tmp`.
-            let mut i = 0usize;
-            while i < n_out {
-                let w0 = vld1q_u32(bp.add(i * 4).cast::<u32>());
-                let w1 = vld1q_u32(bp.add((i + 4) * 4).cast::<u32>());
-                let mut shift = p as i32 - bits as i32;
-                let mut base = i;
-                while shift >= 0 {
-                    let negv = vdupq_n_s32(-shift);
-                    vst1q_u32(dp.add(base), vandq_u32(vshlq_u32(w0, negv), maskv));
-                    vst1q_u32(dp.add(base + 4), vandq_u32(vshlq_u32(w1, negv), maskv));
-                    shift -= bits as i32;
-                    base += n_out;
-                }
-                i += 8;
-            }
-        } else {
-            let cmaskv = vdupq_n_u32(lane_mask(p, rem_int));
-            let mut tmp = [0u32; BLOCK];
-            let tp = tmp.as_mut_ptr();
-            let mut i = 0usize;
-            while i < n_out {
-                let w0 = vld1q_u32(bp.add(i * 4).cast::<u32>());
-                let w1 = vld1q_u32(bp.add((i + 4) * 4).cast::<u32>());
-                let mut shift = p as i32 - bits as i32;
-                let mut base = i;
-                while shift >= 0 {
-                    let negv = vdupq_n_s32(-shift);
-                    vst1q_u32(dp.add(base), vandq_u32(vshlq_u32(w0, negv), maskv));
-                    vst1q_u32(dp.add(base + 4), vandq_u32(vshlq_u32(w1, negv), maskv));
-                    shift -= bits as i32;
-                    base += n_out;
-                }
-                // Straddle leftover: the low bits the shift levels did not take.
-                vst1q_u32(tp.add(i), vandq_u32(w0, cmaskv));
-                vst1q_u32(tp.add(i + 4), vandq_u32(w1, cmaskv));
-                i += 8;
-            }
-            stitch_dispatch_neon(&tmp, bits, dest);
-        }
-        match p {
-            8 => expand8_neon(dest),
-            16 => expand16_neon(dest),
-            _ => {}
-        }
-    }
-}
-
-/// NEON [`expand8`]. Each word's four byte lanes fan out to slots `i`, `64+i`,
-/// `128+i`, `192+i`; the low-slot store follows the load, and higher slots hold
-/// no live input, so the in-place fan-out is safe.
-///
-/// # Safety
-/// Requires `neon`; all loads/stores stay within `a[..256]` (`i < 64`).
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn expand8_neon(a: &mut [u32; BLOCK]) {
-    // SAFETY: `neon`; all loads/stores stay within `a[..256]` (`i < 64`).
-    unsafe {
-        let m = vdupq_n_u32(0xFF);
-        let p = a.as_mut_ptr();
-        let mut i = 0usize;
-        while i < 64 {
-            let l0 = vld1q_u32(p.add(i));
-            let l1 = vld1q_u32(p.add(i + 4));
-            vst1q_u32(p.add(i), vandq_u32(vshrq_n_u32::<24>(l0), m));
-            vst1q_u32(p.add(i + 4), vandq_u32(vshrq_n_u32::<24>(l1), m));
-            vst1q_u32(p.add(64 + i), vandq_u32(vshrq_n_u32::<16>(l0), m));
-            vst1q_u32(p.add(64 + i + 4), vandq_u32(vshrq_n_u32::<16>(l1), m));
-            vst1q_u32(p.add(128 + i), vandq_u32(vshrq_n_u32::<8>(l0), m));
-            vst1q_u32(p.add(128 + i + 4), vandq_u32(vshrq_n_u32::<8>(l1), m));
-            vst1q_u32(p.add(192 + i), vandq_u32(l0, m));
-            vst1q_u32(p.add(192 + i + 4), vandq_u32(l1, m));
-            i += 8;
-        }
-    }
-}
-
-/// NEON [`expand16`].
-///
-/// # Safety
-/// Requires `neon`; all loads/stores stay within `a[..256]` (`i < 128`).
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn expand16_neon(a: &mut [u32; BLOCK]) {
-    // SAFETY: `neon`; all loads/stores stay within `a[..256]` (`i < 128`).
-    unsafe {
-        let m = vdupq_n_u32(0xFFFF);
-        let p = a.as_mut_ptr();
-        let mut i = 0usize;
-        while i < 128 {
-            let l0 = vld1q_u32(p.add(i));
-            let l1 = vld1q_u32(p.add(i + 4));
-            vst1q_u32(p.add(i), vandq_u32(vshrq_n_u32::<16>(l0), m));
-            vst1q_u32(p.add(i + 4), vandq_u32(vshrq_n_u32::<16>(l1), m));
-            vst1q_u32(p.add(128 + i), vandq_u32(l0, m));
-            vst1q_u32(p.add(128 + i + 4), vandq_u32(l1, m));
-            i += 8;
-        }
-    }
-}
-
-/// Fused width-8 decode: read each packed word from `bytes` and fan its four byte
-/// lanes straight to the 256 expanded slots — one pass, no intermediate copy.
-///
-/// # Safety
-/// Requires `neon`; each load reads 16 bytes within `bytes[..256]` (`i + 8 <= 64`
-/// ⇒ byte offset `< 256`), and stores stay within `dest[..256]`.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn expand8_from_bytes(bytes: &[u8], dest: &mut [u32; BLOCK]) {
-    // SAFETY: `neon`; each load reads 16 bytes within `bytes[..256]` and stores
-    // stay within `dest[..256]` (`i < 64`).
-    unsafe {
-        debug_assert!(bytes.len() >= 256);
-        let m = vdupq_n_u32(0xFF);
-        let bp = bytes.as_ptr();
-        let dp = dest.as_mut_ptr();
-        let mut i = 0usize;
-        while i < 64 {
-            let l0 = vld1q_u32(bp.add(i * 4).cast::<u32>());
-            let l1 = vld1q_u32(bp.add((i + 4) * 4).cast::<u32>());
-            vst1q_u32(dp.add(i), vandq_u32(vshrq_n_u32::<24>(l0), m));
-            vst1q_u32(dp.add(i + 4), vandq_u32(vshrq_n_u32::<24>(l1), m));
-            vst1q_u32(dp.add(64 + i), vandq_u32(vshrq_n_u32::<16>(l0), m));
-            vst1q_u32(dp.add(64 + i + 4), vandq_u32(vshrq_n_u32::<16>(l1), m));
-            vst1q_u32(dp.add(128 + i), vandq_u32(vshrq_n_u32::<8>(l0), m));
-            vst1q_u32(dp.add(128 + i + 4), vandq_u32(vshrq_n_u32::<8>(l1), m));
-            vst1q_u32(dp.add(192 + i), vandq_u32(l0, m));
-            vst1q_u32(dp.add(192 + i + 4), vandq_u32(l1, m));
-            i += 8;
-        }
-    }
-}
-
-/// Fused width-16 decode: read each packed word from `bytes` and fan its two
-/// 16-bit lanes straight to the 256 expanded slots — one pass.
-///
-/// # Safety
-/// Requires `neon`; each load reads 16 bytes within `bytes[..512]` (`i + 8 <= 128`
-/// ⇒ byte offset `< 512`), and stores stay within `dest[..256]`.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn expand16_from_bytes(bytes: &[u8], dest: &mut [u32; BLOCK]) {
-    // SAFETY: `neon`; each load reads 16 bytes within `bytes[..512]` and stores
-    // stay within `dest[..256]` (`i < 128`).
-    unsafe {
-        debug_assert!(bytes.len() >= 512);
-        let m = vdupq_n_u32(0xFFFF);
-        let bp = bytes.as_ptr();
-        let dp = dest.as_mut_ptr();
-        let mut i = 0usize;
-        while i < 128 {
-            let l0 = vld1q_u32(bp.add(i * 4).cast::<u32>());
-            let l1 = vld1q_u32(bp.add((i + 4) * 4).cast::<u32>());
-            vst1q_u32(dp.add(i), vandq_u32(vshrq_n_u32::<16>(l0), m));
-            vst1q_u32(dp.add(i + 4), vandq_u32(vshrq_n_u32::<16>(l1), m));
-            vst1q_u32(dp.add(128 + i), vandq_u32(l0, m));
-            vst1q_u32(dp.add(128 + i + 4), vandq_u32(l1, m));
-            i += 8;
-        }
-    }
-}
-
 /// Decode-throughput A/B vs the crate's `BitPacker8x` (`--ignored --nocapture`,
-/// release). Isolates the bit-unpack primitive across widths: on `aarch64` the
-/// crate side is hand-NEON, so a competitive autovec `unpack` here says the
-/// scalar layout vectorizes well enough to need no hand intrinsics.
+/// release). Isolates the bit-unpack primitive across widths; on `aarch64` the
+/// crate side is hand-NEON when the fork patch is active, so the ratios read
+/// against a real SIMD decoder.
 #[cfg(test)]
 mod bench {
     use std::{hint::black_box, time::Instant};
@@ -752,9 +337,8 @@ mod bench {
     }
 
     /// Sorted-decode A/B: our `unpack` + `integrate` (delta-decode + prefix-sum)
-    /// vs `BitPacker8x::decompress_sorted` (the fused SIMD unpack+integrate we
-    /// replaced). This is the doc-id decode path COUNT/ranked hammer — the metric
-    /// the delta-integrate work targets.
+    /// vs `BitPacker8x::decompress_sorted` (fused SIMD unpack+integrate). This is
+    /// the doc-id decode path COUNT/ranked hammer — the metric the codec targets.
     #[test]
     #[ignore = "manual sorted-decode A/B: cargo test --release ...bitpack::bench::sorted -- --ignored --nocapture"]
     fn sorted_decode_vs_bitpacker8x() {
@@ -827,11 +411,12 @@ mod tests {
 
     use super::*;
 
-    /// Byte length matches `bits * 32`, and every primitive boundary is exercised.
+    /// Byte length matches `bits * 32` and an all-ones block round-trips at every
+    /// width (exercises the max value and the straddle at non-dividing widths).
     #[test]
-    fn packed_len_and_primitive_boundaries() {
+    fn packed_len_and_roundtrip_all_ones() {
         for bits in 1..=32usize {
-            let vals = [((1u64 << bits) - 1) as u32; BLOCK];
+            let vals = [mask32(bits); BLOCK];
             let mut out = Vec::new();
             pack(&vals, bits as u8, &mut out);
             assert_eq!(out.len(), packed_len(bits as u8), "bits={bits}");
@@ -839,11 +424,6 @@ mod tests {
             unpack(&out, bits as u8, &mut dec);
             assert_eq!(dec, vals, "all-ones round-trip, bits={bits}");
         }
-        // primitive() picks 8/16/32 at the boundaries.
-        assert_eq!(primitive(8), 8);
-        assert_eq!(primitive(9), 16);
-        assert_eq!(primitive(16), 16);
-        assert_eq!(primitive(17), 32);
     }
 
     #[test]
@@ -860,15 +440,13 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(2048))]
 
         /// Round-trip any block at any width: pack then unpack reproduces the
-        /// input exactly. `bits` spans 1..=32 (both primitive boundaries), and
-        /// values are masked to the width the caller guarantees.
+        /// input exactly. `bits` spans 1..=32, values masked to the width.
         #[test]
         fn roundtrip_all_widths(
             bits in 1u8..=32,
             raw in prop::array::uniform32(any::<u32>()),
         ) {
-            // Expand 32 random seeds into 256 values, masked to `bits`.
-            let mask = if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
+            let mask = mask32(bits as usize);
             let mut vals = [0u32; BLOCK];
             for (i, v) in vals.iter_mut().enumerate() {
                 *v = raw[i % 32].wrapping_mul(2_654_435_761).wrapping_add(i as u32) & mask;
@@ -881,14 +459,13 @@ mod tests {
             prop_assert_eq!(dec, vals);
         }
 
-        /// Same, but with genuinely random per-slot values (via a shuffle of the
-        /// seed array position) to avoid any structure the multiply-hash imposes.
+        /// Same, but with genuinely random per-slot values.
         #[test]
         fn roundtrip_random_dense(
             bits in 1u8..=32,
             vals_seed in prop::collection::vec(any::<u32>(), BLOCK),
         ) {
-            let mask = if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
+            let mask = mask32(bits as usize);
             let mut vals = [0u32; BLOCK];
             for (v, &s) in vals.iter_mut().zip(vals_seed.iter()) {
                 *v = s & mask;
@@ -901,13 +478,13 @@ mod tests {
         }
 
         /// The per-arch dispatched decoder is byte-identical to the scalar
-        /// reference at every width — the correctness gate for the SIMD kernels.
+        /// reference at every width — the correctness gate for the SIMD kernel.
         #[test]
         fn dispatched_matches_scalar(
             bits in 1u8..=32,
             vals_seed in prop::collection::vec(any::<u32>(), BLOCK),
         ) {
-            let mask = if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
+            let mask = mask32(bits as usize);
             let mut vals = [0u32; BLOCK];
             for (v, &s) in vals.iter_mut().zip(vals_seed.iter()) {
                 *v = s & mask;
