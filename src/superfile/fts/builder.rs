@@ -4860,12 +4860,83 @@ mod tests {
         assert_title_blobs_agree(spilled, title_json(true), inram, title_json(true), k).await;
     }
 
+    /// Backwards compatibility: a genuine V4 (128-doc-codec) index built by
+    /// pre-V5 code must decode identically under the current dual-codec reader,
+    /// which dispatches the block codec by version (V1–V4 → 128-doc, V5 → 256-doc).
+    /// The fixtures are real V4 blobs captured from the pre-V5 merge-base over
+    /// `positional_corpus()` (dense enough that a block takes the bitset encoding,
+    /// so the header is V4). Regenerate them from that merge-base if the corpus
+    /// changes; the assertion that they read identically to a fresh V5 build is the
+    /// gate. This supersedes the relabel-based test below.
+    /// Fixed-size corpus for the V4 fixture (independent of `BLOCK_LEN`, which is
+    /// 128 in the pre-V5 code that produced the fixture and 256 here). 800 docs:
+    /// multi-block at both widths, `common` dense enough for a bitset block (→ V4),
+    /// plus the medium/uniqueonce/dupdup shapes the queries exercise. Must match
+    /// the corpus used to regenerate the fixtures at the merge-base.
+    fn v4_compat_corpus() -> Vec<String> {
+        (0..800)
+            .map(|i| {
+                let mut t = String::from("common filler");
+                if i % 5 == 0 {
+                    t.push_str(" medium medium");
+                }
+                if i == 42 {
+                    t.push_str(" uniqueonce");
+                }
+                if i == 43 {
+                    t.push_str(" dupdup dupdup dupdup");
+                }
+                t
+            })
+            .collect()
+    }
+
     #[tokio::test]
-    #[ignore = "superseded by the step-6 dual-read gate. The reader now dispatches the \
-                block codec by version (done, step 4), but this test synthesizes a 'v1' \
-                blob by *relabeling* a real blob's version — and real blobs are now v5 \
-                (256-doc), so relabeling to v1 would decode 256-format bytes as 128. A \
-                genuine dual-read test needs a real 128-format blob producer (step 6)."]
+    async fn v4_fixtures_read_identically_to_v5() {
+        let docs = v4_compat_corpus();
+        let k = docs.len();
+        let v4_plain = bytes::Bytes::from_static(include_bytes!("testdata/v4_plain.blob"));
+        let v4_positional =
+            bytes::Bytes::from_static(include_bytes!("testdata/v4_positional.blob"));
+        let version_of =
+            |b: &bytes::Bytes| u32::from_le_bytes(b[8..12].try_into().expect("version bytes"));
+        assert_eq!(
+            version_of(&v4_plain),
+            format::fts::VERSION_V4,
+            "plain fixture must be V4"
+        );
+        assert_eq!(
+            version_of(&v4_positional),
+            format::fts::VERSION_V4,
+            "positional fixture must be V4"
+        );
+
+        // Current code builds the same corpus as V5 (256-doc codec).
+        let v5_plain = build_title_blob(&docs, false);
+        let v5_positional = build_title_blob(&docs, true);
+        assert_eq!(
+            version_of(&v5_plain),
+            format::fts::VERSION_V5,
+            "current build must be V5"
+        );
+
+        // The dual-codec reader must decode the V4 blobs identically to the V5 builds.
+        assert_title_blobs_agree(v4_plain, title_json(false), v5_plain, title_json(false), k).await;
+        assert_title_blobs_agree(
+            v4_positional,
+            title_json(true),
+            v5_positional,
+            title_json(true),
+            k,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "superseded by v4_fixtures_read_identically_to_v5 (a real 128-format \
+                blob fixture). This one synthesizes a 'v1' blob by *relabeling* a real \
+                blob's version, which no longer works: real blobs are v5 (256-doc), so \
+                relabeling to v1 would decode 256-format bytes as 128."]
     async fn new_code_reads_synthesized_v1_blob() {
         use crate::superfile::fts::reader::{BoolMode, FtsReader};
 
