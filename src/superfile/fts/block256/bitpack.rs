@@ -25,11 +25,17 @@
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{
-    vaddq_u32, vandq_u32, vdupq_n_s32, vdupq_n_u32, vextq_u32, vgetq_lane_u32, vld1q_u32,
-    vorrq_u32, vshlq_u32, vst1q_u32,
+    uint32x4_t, vaddq_u32, vandq_u32, vdupq_n_u32, vextq_u32, vgetq_lane_u32, vld1q_u32, vorrq_u32,
+    vshlq_n_u32, vshrq_n_u32, vst1q_u32,
 };
 #[cfg(target_arch = "aarch64")]
 use core::ptr::copy_nonoverlapping;
+
+// Const-unrolled per-width NEON unpack kernels (`unpack_w1..unpack_w31` +
+// `unpack_neon_unrolled` dispatch). Generated: every shift is a compile-time
+// constant, so there is no per-iteration shift-vector setup or branch.
+#[cfg(target_arch = "aarch64")]
+include!("bitpack_unpack_neon.rs");
 
 /// Values per block — one 256-doc posting block's worth.
 pub(super) const BLOCK: usize = 256;
@@ -162,45 +168,12 @@ unsafe fn unpack_neon(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
             copy_nonoverlapping(bytes.as_ptr(), dp as *mut u8, BLOCK * 4);
             return;
         }
-        let bits = bits as usize;
+        // Widths 1..=31 dispatch to a const-unrolled per-width kernel: every shift
+        // amount is a compile-time constant, so decode is straight-line with no
+        // per-value-register shift-vector setup or branch.
         let ip = bytes.as_ptr().cast::<u32>();
-        let mask = vdupq_n_u32(mask32(bits));
-
-        // `reg` is the packed word currently in (wa, wb). Value-register 0 sits at
-        // offset 0, so it is just masked.
-        let mut reg = 0usize;
-        let mut wa = vld1q_u32(ip);
-        let mut wb = vld1q_u32(ip.add(4));
-        vst1q_u32(dp, vandq_u32(wa, mask));
-        vst1q_u32(dp.add(4), vandq_u32(wb, mask));
-
-        for vr in 1..REGS {
-            let inner_cursor = (vr * bits) % 32;
-            let inner_capacity = 32 - inner_cursor;
-            let (sa, sb) = if inner_cursor != 0 {
-                // Negative-count shift == per-lane logical right shift.
-                let neg = vdupq_n_s32(-(inner_cursor as i32));
-                (vshlq_u32(wa, neg), vshlq_u32(wb, neg))
-            } else {
-                (wa, wb)
-            };
-            let mut oa = vandq_u32(sa, mask);
-            let mut ob = vandq_u32(sb, mask);
-            // If this register is now fully consumed, advance to the next packed
-            // word; if the value straddled it, OR in the straddled high bits.
-            if inner_capacity <= bits && vr != REGS - 1 {
-                reg += 1;
-                wa = vld1q_u32(ip.add(reg * LANES));
-                wb = vld1q_u32(ip.add(reg * LANES + 4));
-                if inner_capacity < bits {
-                    let pos = vdupq_n_s32(inner_capacity as i32);
-                    oa = vorrq_u32(oa, vandq_u32(vshlq_u32(wa, pos), mask));
-                    ob = vorrq_u32(ob, vandq_u32(vshlq_u32(wb, pos), mask));
-                }
-            }
-            vst1q_u32(dp.add(vr * LANES), oa);
-            vst1q_u32(dp.add(vr * LANES + 4), ob);
-        }
+        let mask = vdupq_n_u32(mask32(bits as usize));
+        unpack_neon_unrolled(ip, dp, bits, mask);
     }
 }
 
