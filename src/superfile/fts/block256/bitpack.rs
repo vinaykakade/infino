@@ -30,9 +30,10 @@ use core::arch::aarch64::{
 };
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
-    __m128i, __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128, _mm_set1_epi32,
-    _mm_shuffle_epi32, _mm_slli_si128, _mm_storeu_si128, _mm256_and_si256, _mm256_loadu_si256,
-    _mm256_or_si256, _mm256_set1_epi32, _mm256_slli_epi32, _mm256_srli_epi32, _mm256_storeu_si256,
+    __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_extract_epi32, _mm256_loadu_si256,
+    _mm256_or_si256, _mm256_permute2x128_si256, _mm256_set_epi32, _mm256_set1_epi32,
+    _mm256_shuffle_epi32, _mm256_slli_epi32, _mm256_slli_si256, _mm256_srli_epi32,
+    _mm256_storeu_si256,
 };
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use core::ptr::copy_nonoverlapping;
@@ -254,31 +255,42 @@ pub(super) fn integrate(a: &mut [u32; BLOCK], base: u32) {
     integrate_scalar(a, base);
 }
 
-/// SSE2 prefix-sum (`__m128i`, 4 lanes) — the x86 twin of [`integrate_neon`], same
-/// scalar-carry scheme: within-vector inclusive prefix via two byte-shift adds,
-/// then a scalar `carry += group_total` where `group_total` is the pre-carry
-/// prefix's top lane (independent of `carry`). Gated on `avx2` for one feature
-/// gate with [`unpack_avx2`]; only SSE2 ops are used.
+/// AVX2 prefix-sum (`__m256i`, 8 lanes) — the x86 twin of [`integrate_neon`],
+/// same scalar-carry scheme. `slli_si256` shifts each 128-bit half independently,
+/// so the inclusive prefix is built per half and then the low half's total is
+/// broadcast into the high half to span all 8 lanes. The loop-carried dependency
+/// is the scalar `carry += group_total`, where `group_total` is the pre-carry
+/// prefix's top lane (independent of `carry`), over 32 eight-lane groups.
 ///
 /// # Safety
-/// Requires `avx2` (checked by the caller). Reads/writes `a[..256]` in 4-lane
+/// Requires `avx2` (checked by the caller). Reads/writes `a[..256]` in 8-lane
 /// steps.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn integrate_avx2(a: &mut [u32; BLOCK], base: u32) {
     // SAFETY: see the function-level contract.
     unsafe {
-        let p = a.as_mut_ptr().cast::<__m128i>();
+        let p = a.as_mut_ptr().cast::<__m256i>();
+        // Adds the low-half total into lanes 4..8 only.
+        let hi_mask = _mm256_set_epi32(-1, -1, -1, -1, 0, 0, 0, 0);
         let mut carry = base;
-        for i in 0..BLOCK / 4 {
-            let x = _mm_loadu_si128(p.add(i));
-            // Inclusive within-vector prefix (`slli_si128` shifts by whole bytes):
-            // + [0,x0,x1,x2] then + [0,0,s0,s1].
-            let s1 = _mm_add_epi32(x, _mm_slli_si128::<4>(x));
-            let pfx = _mm_add_epi32(s1, _mm_slli_si128::<8>(s1));
-            // group_total = pre-carry prefix lane 3 (broadcast to lane 0, read out).
-            let group_total = _mm_cvtsi128_si32(_mm_shuffle_epi32::<0b11_11_11_11>(pfx)) as u32;
-            _mm_storeu_si128(p.add(i), _mm_add_epi32(pfx, _mm_set1_epi32(carry as i32)));
+        for i in 0..BLOCK / 8 {
+            let x = _mm256_loadu_si256(p.add(i));
+            // Inclusive prefix within each 128-bit half (`slli_si256` shifts each
+            // half by whole bytes): + [0,x0,x1,x2] then + [0,0,s0,s1], per half.
+            let x = _mm256_add_epi32(x, _mm256_slli_si256::<4>(x));
+            let x = _mm256_add_epi32(x, _mm256_slli_si256::<8>(x));
+            // Broadcast the low half's total (lane 3) into the high half and add,
+            // extending the prefix across all 8 lanes.
+            let lo = _mm256_permute2x128_si256::<0x00>(x, x);
+            let bcast = _mm256_shuffle_epi32::<0b11_11_11_11>(lo);
+            let pfx = _mm256_add_epi32(x, _mm256_and_si256(bcast, hi_mask));
+            // group_total = full 8-lane sum (lane 7), independent of `carry`.
+            let group_total = _mm256_extract_epi32::<7>(pfx) as u32;
+            _mm256_storeu_si256(
+                p.add(i),
+                _mm256_add_epi32(pfx, _mm256_set1_epi32(carry as i32)),
+            );
             carry = carry.wrapping_add(group_total);
         }
     }
