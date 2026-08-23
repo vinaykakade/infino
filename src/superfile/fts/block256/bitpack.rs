@@ -352,7 +352,7 @@ unsafe fn integrate_neon(a: &mut [u32; BLOCK], base: u32) {
 mod bench {
     use std::{hint::black_box, time::Instant};
 
-    use bitpacking::{BitPacker, BitPacker8x};
+    use bitpacking::{BitPacker, BitPacker4x, BitPacker8x};
 
     use super::*;
 
@@ -472,6 +472,83 @@ mod bench {
             });
             println!(
                 "{bits:5}   {mine_ns:11.1}   {bp_ns:21.1}   {:.2}",
+                mine_ns / bp_ns
+            );
+        }
+    }
+
+    /// Sorted-decode A/B vs the **128-doc** `BitPacker4x` (the actual V1–V4 doc-id
+    /// codec, whose `decompress_sorted` fuses the SIMD delta-integrate). A 256-doc
+    /// block is two `BitPacker4x` halves. This is the codec-level version of the
+    /// end-to-end 256-vs-128 comparison.
+    #[test]
+    #[ignore = "manual 256-vs-128 sorted A/B: cargo test --release ...bitpack::bench::sorted_decode_256_vs_bitpacker4x -- --ignored --nocapture"]
+    fn sorted_decode_256_vs_bitpacker4x() {
+        const HALF: usize = BLOCK / 2; // 128
+        let bp4 = BitPacker4x::new();
+        let iters = 300_000u32;
+        let base = 1_000_000u32;
+        println!(
+            "\nwidth   ours 256 u+i(ns)   2x BitPacker4x-128(ns)   ratio (ours/4x; <1 = ours faster)"
+        );
+        for &bits in &[1u8, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24] {
+            let dmask = if bits == 32 {
+                u32::MAX
+            } else {
+                (1u32 << bits) - 1
+            };
+            let mut docs = [0u32; BLOCK];
+            let mut deltas = [0u32; BLOCK];
+            let mut acc = base;
+            for i in 0..BLOCK {
+                let d = if i == 0 {
+                    0
+                } else {
+                    ((i as u32).wrapping_mul(2_654_435_761) & dmask).max(1)
+                };
+                acc = acc.wrapping_add(d);
+                docs[i] = acc;
+                deltas[i] = d;
+            }
+            // Ours: one 256-block.
+            let mut mine = Vec::new();
+            pack(&deltas, bits, &mut mine);
+            // Theirs: two 128-doc BitPacker4x halves; the second's `initial` is the
+            // last doc id of the first half.
+            let base1 = docs[HALF - 1];
+            let mut h0 = vec![0u8; HALF * 4];
+            let mut h1 = vec![0u8; HALF * 4];
+            let n0 = bp4.compress_sorted(base, &docs[..HALF], &mut h0, bits);
+            let n1 = bp4.compress_sorted(base1, &docs[HALF..], &mut h1, bits);
+            h0.truncate(n0);
+            h1.truncate(n1);
+
+            let mut dest = [0u32; BLOCK];
+            let time = |f: &mut dyn FnMut() -> u32| {
+                let mut sink = 0u32;
+                for _ in 0..iters / 8 {
+                    sink = sink.wrapping_add(f());
+                }
+                let t = Instant::now();
+                for _ in 0..iters {
+                    sink = sink.wrapping_add(f());
+                }
+                let ns = t.elapsed().as_nanos() as f64 / iters as f64;
+                black_box(sink);
+                ns
+            };
+            let mine_ns = time(&mut || {
+                unpack(black_box(&mine), bits, &mut dest);
+                integrate(&mut dest, base);
+                dest[0] ^ dest[100] ^ dest[200] ^ dest[255]
+            });
+            let bp_ns = time(&mut || {
+                bp4.decompress_sorted(base, black_box(&h0), &mut dest[..HALF], bits);
+                bp4.decompress_sorted(base1, black_box(&h1), &mut dest[HALF..], bits);
+                dest[0] ^ dest[100] ^ dest[200] ^ dest[255]
+            });
+            println!(
+                "{bits:5}   {mine_ns:15.1}   {bp_ns:22.1}   {:.2}",
                 mine_ns / bp_ns
             );
         }
