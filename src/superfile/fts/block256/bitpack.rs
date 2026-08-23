@@ -50,6 +50,12 @@ include!("bitpack_unpack_neon.rs");
 #[cfg(target_arch = "x86_64")]
 include!("bitpack_unpack_avx2.rs");
 
+// The same kernels with the delta-integrate fused in (`unpack_sorted_avx2_w1..w31`
+// + `unpack_sorted_avx2_unrolled`): each value-register is prefix-summed against a
+// running carry and stored as doc ids, so the integrate overlaps the decode.
+#[cfg(target_arch = "x86_64")]
+include!("bitpack_unpack_avx2_sorted.rs");
+
 /// Values per block — one 256-doc posting block's worth.
 pub(super) const BLOCK: usize = 256;
 
@@ -156,6 +162,75 @@ unsafe fn unpack_avx2(bytes: &[u8], bits: u8, dest: &mut [u32; BLOCK]) {
         let ip = bytes.as_ptr() as *const __m256i;
         let mask = _mm256_set1_epi32(mask32(bits as usize) as i32);
         unpack_avx2_unrolled(ip, dp as *mut __m256i, bits, mask);
+    }
+}
+
+/// Decode a block's doc-id deltas and integrate them onto `base` in one step:
+/// `dest[i] = base + sum(deltas[0..=i])`. On x86 a fused AVX2 kernel overlaps the
+/// delta-integrate with the decode (no separate prefix-sum pass); elsewhere it is
+/// [`unpack`] + [`integrate`] (the NEON separate integrate already wins there).
+#[inline]
+pub(super) fn unpack_sorted(bytes: &[u8], bits: u8, base: u32, dest: &mut [u32; BLOCK]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by the AVX2 detection.
+            unsafe { unpack_sorted_avx2(bytes, bits, base, dest) };
+            return;
+        }
+    }
+    unpack(bytes, bits, dest);
+    integrate(dest, base);
+}
+
+/// AVX2 fused decode+integrate: dispatch to the const-unrolled per-width sorted
+/// kernel. `bits == 0` ⇒ every doc id is `base`; `bits == 32` copies the deltas
+/// then integrates (no fused width-32 kernel).
+///
+/// # Safety
+/// Requires `avx2` (checked by the caller). `bytes` holds ≥ `packed_len(bits)`
+/// bytes; `dest` is `[u32; 256]`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_sorted_avx2(bytes: &[u8], bits: u8, base: u32, dest: &mut [u32; BLOCK]) {
+    // SAFETY: see the function-level contract; every load/store is in range.
+    unsafe {
+        if bits == 0 {
+            dest.fill(base);
+            return;
+        }
+        if bits == 32 {
+            copy_nonoverlapping(bytes.as_ptr(), dest.as_mut_ptr() as *mut u8, BLOCK * 4);
+            integrate_avx2(dest, base);
+            return;
+        }
+        let ip = bytes.as_ptr() as *const __m256i;
+        let dp = dest.as_mut_ptr() as *mut __m256i;
+        let mask = _mm256_set1_epi32(mask32(bits as usize) as i32);
+        let hi_mask = _mm256_set_epi32(-1, -1, -1, -1, 0, 0, 0, 0);
+        unpack_sorted_avx2_unrolled(ip, dp, bits, base, mask, hi_mask);
+    }
+}
+
+/// Prefix-sum the 8 deltas in `o`, add the running scalar `carry`, store the doc
+/// ids to `dp`, and return the new carry (`carry + block-so-far total`). The
+/// per-value-register step of the fused sorted kernels — the same prefix + scalar
+/// carry scheme as [`integrate_avx2`], applied to one value-register. `group_total`
+/// is the pre-carry prefix's top lane, independent of `carry`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn integrate_store_avx2(dp: *mut __m256i, o: __m256i, carry: u32, hi_mask: __m256i) -> u32 {
+    // SAFETY: `dp` addresses one value-register within dest[..256].
+    unsafe {
+        let t = _mm256_add_epi32(o, _mm256_slli_si256::<4>(o));
+        let t = _mm256_add_epi32(t, _mm256_slli_si256::<8>(t));
+        let lo = _mm256_permute2x128_si256::<0x00>(t, t);
+        let bcast = _mm256_shuffle_epi32::<0b11_11_11_11>(lo);
+        let pfx = _mm256_add_epi32(t, _mm256_and_si256(bcast, hi_mask));
+        let group_total = _mm256_extract_epi32::<7>(pfx) as u32;
+        _mm256_storeu_si256(dp, _mm256_add_epi32(pfx, _mm256_set1_epi32(carry as i32)));
+        carry.wrapping_add(group_total)
     }
 }
 
@@ -553,6 +628,82 @@ mod bench {
             );
         }
     }
+
+    /// Fused sorted-decode: our `unpack_sorted` (decode + integrate fused) vs the
+    /// separate `unpack` + `integrate`, and vs 2× `BitPacker4x`-128. Shows whether
+    /// fusing the integrate closes the ~5% gap to the fused 128 baseline.
+    #[test]
+    #[ignore = "manual fused A/B: cargo test --release ...bitpack::bench::fused_sorted -- --ignored --nocapture"]
+    fn fused_sorted_vs_separate_vs_128() {
+        const HALF: usize = BLOCK / 2;
+        let bp4 = BitPacker4x::new();
+        let iters = 300_000u32;
+        let base = 1_000_000u32;
+        println!("\nwidth   fused(ns)   separate(ns)   2x4x-128(ns)   fused/separate   fused/4x");
+        for &bits in &[1u8, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24] {
+            let dmask = if bits == 32 {
+                u32::MAX
+            } else {
+                (1u32 << bits) - 1
+            };
+            let mut docs = [0u32; BLOCK];
+            let mut deltas = [0u32; BLOCK];
+            let mut acc = base;
+            for i in 0..BLOCK {
+                let d = if i == 0 {
+                    0
+                } else {
+                    ((i as u32).wrapping_mul(2_654_435_761) & dmask).max(1)
+                };
+                acc = acc.wrapping_add(d);
+                docs[i] = acc;
+                deltas[i] = d;
+            }
+            let mut mine = Vec::new();
+            pack(&deltas, bits, &mut mine);
+            let base1 = docs[HALF - 1];
+            let mut h0 = vec![0u8; HALF * 4];
+            let mut h1 = vec![0u8; HALF * 4];
+            let n0 = bp4.compress_sorted(base, &docs[..HALF], &mut h0, bits);
+            let n1 = bp4.compress_sorted(base1, &docs[HALF..], &mut h1, bits);
+            h0.truncate(n0);
+            h1.truncate(n1);
+
+            let mut dest = [0u32; BLOCK];
+            let time = |f: &mut dyn FnMut() -> u32| {
+                let mut sink = 0u32;
+                for _ in 0..iters / 8 {
+                    sink = sink.wrapping_add(f());
+                }
+                let t = Instant::now();
+                for _ in 0..iters {
+                    sink = sink.wrapping_add(f());
+                }
+                let ns = t.elapsed().as_nanos() as f64 / iters as f64;
+                black_box(sink);
+                ns
+            };
+            let fused = time(&mut || {
+                unpack_sorted(black_box(&mine), bits, base, &mut dest);
+                dest[0] ^ dest[100] ^ dest[200] ^ dest[255]
+            });
+            let separate = time(&mut || {
+                unpack(black_box(&mine), bits, &mut dest);
+                integrate(&mut dest, base);
+                dest[0] ^ dest[100] ^ dest[200] ^ dest[255]
+            });
+            let bp = time(&mut || {
+                bp4.decompress_sorted(base, black_box(&h0), &mut dest[..HALF], bits);
+                bp4.decompress_sorted(base1, black_box(&h1), &mut dest[HALF..], bits);
+                dest[0] ^ dest[100] ^ dest[200] ^ dest[255]
+            });
+            println!(
+                "{bits:5}   {fused:9.1}   {separate:12.1}   {bp:12.1}   {:.2}   {:.2}",
+                fused / separate,
+                fused / bp
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -718,6 +869,30 @@ mod avx2_tests {
             }
             // SAFETY: built with `+avx2`; direct call bypasses runtime detection.
             unsafe { integrate_avx2(&mut a, base) };
+            integrate_scalar(&mut b, base);
+            prop_assert_eq!(a, b);
+        }
+
+        /// The fused AVX2 decode+integrate equals the separate unpack + integrate
+        /// (scalar reference) for any deltas, width, and base.
+        #[test]
+        fn avx2_unpack_sorted_matches_reference(
+            base in any::<u32>(),
+            bits in 1u8..=32,
+            deltas_seed in prop::collection::vec(any::<u32>(), BLOCK),
+        ) {
+            let mask = mask32(bits as usize);
+            let mut deltas = [0u32; BLOCK];
+            for (d, &s) in deltas.iter_mut().zip(deltas_seed.iter()) {
+                *d = s & mask;
+            }
+            let mut out = Vec::new();
+            pack(&deltas, bits, &mut out);
+            let mut a = [0u32; BLOCK];
+            let mut b = [0u32; BLOCK];
+            // SAFETY: built with `+avx2`; direct call bypasses runtime detection.
+            unsafe { unpack_sorted_avx2(&out, bits, base, &mut a) };
+            unpack_scalar(&out, bits, &mut b);
             integrate_scalar(&mut b, base);
             prop_assert_eq!(a, b);
         }

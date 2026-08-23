@@ -313,12 +313,14 @@ pub fn decode_block_doc_ids(bytes: &[u8], dest: &mut [u32]) -> usize {
     let doc_dest: &mut [u32; BLOCK_LEN] = (&mut dest[..BLOCK_LEN])
         .try_into()
         .expect("decode: BLOCK_LEN doc-id slice");
-    bitpack::unpack(
+    // Fused decode + delta-integrate: unpack the deltas and prefix-sum them onto
+    // `base` in one pass where a SIMD kernel supports it.
+    bitpack::unpack_sorted(
         &bytes[HEADER_SIZE..HEADER_SIZE + deltas_size],
         delta_bits,
+        base,
         doc_dest,
     );
-    bitpack::integrate(doc_dest, base);
     count
 }
 
