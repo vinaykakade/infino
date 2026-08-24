@@ -788,24 +788,46 @@ impl TermCursor {
         self.block_tfs[self.pos]
     }
 
+    /// The 128-doc half of the current block the position sits in, as
+    /// `(half BM25 upper bound, half's last doc id)`. Ranked block skips use
+    /// this so pruning re-pivots at 128 granularity even though blocks decode
+    /// 256-wide: the stored per-half bounds (`lo`/`hi`, split at
+    /// `mid_last_doc_id`) make the tighter bound safe. When the position has
+    /// run off the decoded block it falls back to the whole-block bound / end.
+    /// On pre-V5 blobs the two halves are equal, so this is the whole block.
+    #[inline(always)]
+    fn current_half_bound(&self) -> (f32, u32) {
+        let b = &self.blocks[self.current_block];
+        if self.pos >= self.block_n {
+            (b.block_max_bm25(), b.last_doc_id)
+        } else if self.block_doc_ids[self.pos] <= b.mid_last_doc_id {
+            (b.block_max_bm25_lo, b.mid_last_doc_id)
+        } else {
+            (b.block_max_bm25_hi, b.last_doc_id)
+        }
+    }
+
     #[inline(always)]
     pub(super) fn current_block_max_bm25(&self) -> f32 {
         if self.is_exhausted() {
             0.0
         } else {
-            self.blocks[self.current_block].block_max_bm25()
+            self.current_half_bound().0
         }
     }
 
-    /// Largest doc_id in the cursor's current block. Used by the BMW
-    /// skip step to compute the smallest "next interesting doc_id"
-    /// across the prefix.
+    /// Last doc_id of the current block's active 128-doc half — the split
+    /// point when the position is in the first half, else the block's last
+    /// doc. Paired with `current_block_max_bm25` as the block-skip window so
+    /// the BMW/MaxScore walk computes its "next interesting doc_id" at the
+    /// half boundary and re-pivots there. On pre-V5 blobs mid == last, so this
+    /// is the whole-block last doc.
     #[inline(always)]
     pub(super) fn current_block_last_doc_id(&self) -> u32 {
         if self.is_exhausted() {
             u32::MAX
         } else {
-            self.blocks[self.current_block].last_doc_id
+            self.current_half_bound().1
         }
     }
 
@@ -867,9 +889,17 @@ impl TermCursor {
             if block_start > range_end {
                 break;
             }
-            let m = self.blocks[i].block_max_bm25();
-            if m > max {
-                max = m;
+            // Include only the 128-doc half(s) the range actually overlaps:
+            // the first half spans [block_start, mid], the second (mid, last].
+            // For a single-doc range this selects exactly the half holding the
+            // doc, so the returned bound is 128-granular. On pre-V5 blobs
+            // mid == last, so only the (equal) first-half bound is ever taken.
+            let b = &self.blocks[i];
+            if range_start <= b.mid_last_doc_id {
+                max = max.max(b.block_max_bm25_lo);
+            }
+            if range_end > b.mid_last_doc_id {
+                max = max.max(b.block_max_bm25_hi);
             }
             i += 1;
         }
