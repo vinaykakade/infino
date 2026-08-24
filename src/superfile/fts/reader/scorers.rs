@@ -709,6 +709,13 @@ impl FtsReader {
             // updates its `pos` directly.
             let (leader_slice, others) = cursors.split_at_mut(1);
             let c0 = &mut leader_slice[0];
+            // The flat-merge reads `block_doc_ids` directly across the block,
+            // bypassing the guarded accessors, so a cursor left half-decoded by
+            // a preceding `skip_to` must be completed first.
+            c0.ensure_fully_decoded_keep_pos();
+            for o in others.iter_mut() {
+                o.ensure_fully_decoded_keep_pos();
+            }
             let lb_n = c0.block_n;
             let mut i = c0.pos;
             while i < lb_n {
@@ -847,6 +854,10 @@ impl FtsReader {
             // Flat sorted-merge within the overlap of the two decoded
             // blocks. Pre-load all locals; the borrow checker is
             // satisfied because c0/c1 are independently mutable refs.
+            // The merge reads `block_doc_ids` directly, so complete any block a
+            // preceding `skip_to` left half-decoded.
+            c0.ensure_fully_decoded_keep_pos();
+            c1.ensure_fully_decoded_keep_pos();
             let lb_n = c0.block_n;
             let rb_n = c1.block_n;
             let mut i = c0.pos;
@@ -1362,6 +1373,10 @@ impl FtsReader {
             // Sequential walk per cursor; `d - base` is in range because
             // every live cursor sits at `>= min_doc >= base`.
             for c in &mut cursors {
+                // The accumulate reads `block_doc_ids`/`block_tfs` directly
+                // (SIMD-x4), bypassing the guarded accessors, so complete any
+                // block a preceding `skip_to` left half-decoded.
+                c.ensure_fully_decoded_keep_pos();
                 while !c.is_exhausted() {
                     let d = c.current_doc_id();
                     if d >= window_end {

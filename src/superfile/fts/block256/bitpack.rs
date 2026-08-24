@@ -25,15 +25,15 @@
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{
-    uint32x4_t, vaddq_u32, vandq_u32, vdupq_n_u32, vextq_u32, vgetq_lane_u32, vld1q_u32, vorrq_u32,
-    vshlq_n_u32, vshrq_n_u32, vst1q_u32,
+    int32x4_t, uint32x4_t, vaddq_u32, vandq_u32, vdupq_n_s32, vdupq_n_u32, vextq_u32,
+    vgetq_lane_u32, vld1q_u32, vorrq_u32, vshlq_n_u32, vshlq_u32, vshrq_n_u32, vst1q_u32,
 };
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
-    __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_extract_epi32, _mm256_loadu_si256,
-    _mm256_or_si256, _mm256_permute2x128_si256, _mm256_set_epi32, _mm256_set1_epi32,
-    _mm256_shuffle_epi32, _mm256_slli_epi32, _mm256_slli_si256, _mm256_srli_epi32,
-    _mm256_storeu_si256,
+    __m128i, __m256i, _mm_cvtsi32_si128, _mm256_add_epi32, _mm256_and_si256, _mm256_extract_epi32,
+    _mm256_loadu_si256, _mm256_or_si256, _mm256_permute2x128_si256, _mm256_set_epi32,
+    _mm256_set1_epi32, _mm256_shuffle_epi32, _mm256_sll_epi32, _mm256_slli_epi32,
+    _mm256_slli_si256, _mm256_srl_epi32, _mm256_srli_epi32, _mm256_storeu_si256,
 };
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use core::ptr::copy_nonoverlapping;
@@ -379,6 +379,213 @@ fn integrate_scalar(a: &mut [u32; BLOCK], base: u32) {
         acc = acc.wrapping_add(*slot);
         *slot = acc;
     }
+}
+
+/// One 128-doc half of a 256-value block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Half {
+    /// Values `0..128` (value-registers `0..16`).
+    First,
+    /// Values `128..256` (value-registers `16..32`).
+    Second,
+}
+
+/// Value-registers per 128-doc half (`REGS / 2 == 16`).
+const HALF_REGS: usize = REGS / 2;
+
+/// Decode the `bits`-wide packed values of one 128-doc half into `out[..128]`,
+/// without integrating. `out` must be at least `BLOCK / 2` long. Scalar: reads
+/// each value by the same lane-stream bit-address formula as [`unpack_scalar`],
+/// but only over the half's 16 value-registers (`0..16` or `16..32`). Backs the
+/// sparse-seek fast path, which decodes just the half spanning a skip target
+/// instead of the whole 256-doc block.
+fn unpack_half_scalar(bytes: &[u8], bits: u8, half: Half, out: &mut [u32]) {
+    let n = BLOCK / 2;
+    if bits == 0 {
+        out[..n].fill(0);
+        return;
+    }
+    let bits = bits as usize;
+    let mask = mask32(bits);
+    let vr_start = match half {
+        Half::First => 0,
+        Half::Second => HALF_REGS,
+    };
+    for j in 0..HALF_REGS {
+        let vr = vr_start + j;
+        let bit_pos = vr * bits;
+        let reg = bit_pos / 32;
+        let off = bit_pos % 32;
+        for l in 0..LANES {
+            let mut v = read_word(bytes, reg * LANES + l) >> off;
+            if off + bits > 32 {
+                v |= read_word(bytes, (reg + 1) * LANES + l) << (32 - off);
+            }
+            out[j * LANES + l] = v & mask;
+        }
+    }
+}
+
+/// NEON decoder for one 128-doc half: the SIMD twin of [`unpack_half_scalar`]
+/// (proptested byte-identical). Decodes the half's 16 value-registers with a
+/// runtime right-shift (`vshlq_u32` by a negative count) and the same inline
+/// straddle-OR as the full kernel. Not const-unrolled — the sparse-seek probe
+/// calls it once per landed block, so per-call kernel-selection overhead would
+/// dominate any unroll win; the point is to halve the decode of a whole-block
+/// [`unpack`], at SIMD (not scalar) throughput.
+///
+/// # Safety
+/// `neon` is baseline on aarch64. `bytes` must hold `packed_len(bits)` bytes;
+/// `out` addresses `[..128]`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn unpack_half_neon(bytes: &[u8], bits: u8, half: Half, out: &mut [u32]) {
+    // SAFETY: see the function contract; every load/store stays in range because
+    // the straddle load is elided for the block's last value-register, exactly as
+    // the full kernel does.
+    unsafe {
+        let n = BLOCK / 2;
+        if bits == 0 {
+            out[..n].fill(0);
+            return;
+        }
+        let bits_u = bits as usize;
+        let mask = vdupq_n_u32(mask32(bits_u));
+        let ip = bytes.as_ptr().cast::<u32>();
+        let op = out.as_mut_ptr();
+        let vr_start = match half {
+            Half::First => 0,
+            Half::Second => HALF_REGS,
+        };
+        for j in 0..HALF_REGS {
+            let vr = vr_start + j;
+            let bit_pos = vr * bits_u;
+            let reg = bit_pos / 32;
+            let off = bit_pos % 32;
+            let wa = vld1q_u32(ip.add(reg * LANES));
+            let wb = vld1q_u32(ip.add(reg * LANES + 4));
+            let (mut oa, mut ob) = if off == 0 {
+                (vandq_u32(wa, mask), vandq_u32(wb, mask))
+            } else {
+                let r: int32x4_t = vdupq_n_s32(-(off as i32));
+                (
+                    vandq_u32(vshlq_u32(wa, r), mask),
+                    vandq_u32(vshlq_u32(wb, r), mask),
+                )
+            };
+            // Straddle into the next packed word — never for the block's final
+            // value-register, whose high bits are guaranteed to fit (same guard
+            // as the full kernel; the packing leaves no overrun there).
+            if off + bits_u > 32 && vr != REGS - 1 {
+                let wa2 = vld1q_u32(ip.add((reg + 1) * LANES));
+                let wb2 = vld1q_u32(ip.add((reg + 1) * LANES + 4));
+                let l: int32x4_t = vdupq_n_s32((32 - off) as i32);
+                oa = vorrq_u32(oa, vandq_u32(vshlq_u32(wa2, l), mask));
+                ob = vorrq_u32(ob, vandq_u32(vshlq_u32(wb2, l), mask));
+            }
+            vst1q_u32(op.add(j * LANES), oa);
+            vst1q_u32(op.add(j * LANES + 4), ob);
+        }
+    }
+}
+
+/// AVX2 decoder for one 128-doc half: the x86 twin of [`unpack_half_neon`]
+/// (proptested byte-identical). One `__m256i` is a full 8-lane value-register,
+/// so each of the half's 16 registers is one load, a runtime right-shift
+/// (`_mm256_srl_epi32` by a scalar count) + mask, and the inline straddle-OR
+/// from the next word. Not const-unrolled — the sparse fast path calls it once
+/// per landed block, so it just needs to halve a whole-block decode at SIMD
+/// (not scalar) throughput.
+///
+/// # Safety
+/// Requires `avx2` (checked by the caller). `bytes` holds `packed_len(bits)`
+/// bytes; `out` addresses `[..128]`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_half_avx2(bytes: &[u8], bits: u8, half: Half, out: &mut [u32]) {
+    // SAFETY: the straddle load is elided for the block's last value-register,
+    // exactly as the full kernel does, so every load/store stays in range.
+    unsafe {
+        let n = BLOCK / 2;
+        if bits == 0 {
+            out[..n].fill(0);
+            return;
+        }
+        let bits_u = bits as usize;
+        let mask = _mm256_set1_epi32(mask32(bits_u) as i32);
+        let ip = bytes.as_ptr() as *const __m256i;
+        let op = out.as_mut_ptr() as *mut __m256i;
+        let vr_start = match half {
+            Half::First => 0,
+            Half::Second => HALF_REGS,
+        };
+        for j in 0..HALF_REGS {
+            let vr = vr_start + j;
+            let bit_pos = vr * bits_u;
+            let reg = bit_pos / 32;
+            let off = bit_pos % 32;
+            let w = _mm256_loadu_si256(ip.add(reg));
+            let mut o = if off == 0 {
+                _mm256_and_si256(w, mask)
+            } else {
+                let r: __m128i = _mm_cvtsi32_si128(off as i32);
+                _mm256_and_si256(_mm256_srl_epi32(w, r), mask)
+            };
+            if off + bits_u > 32 && vr != REGS - 1 {
+                let w2 = _mm256_loadu_si256(ip.add(reg + 1));
+                let l: __m128i = _mm_cvtsi32_si128((32 - off) as i32);
+                o = _mm256_or_si256(o, _mm256_and_si256(_mm256_sll_epi32(w2, l), mask));
+            }
+            _mm256_storeu_si256(op.add(j), o);
+        }
+    }
+}
+
+/// Decode one 128-doc half of a block's packed values into `out[..128]` (no
+/// integrate). NEON on aarch64, AVX2 on x86 (runtime-detected), scalar
+/// elsewhere and as the proptest reference.
+#[inline]
+fn unpack_half(bytes: &[u8], bits: u8, half: Half, out: &mut [u32]) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is baseline on aarch64; byte-identical to the scalar path.
+    unsafe {
+        unpack_half_neon(bytes, bits, half, out);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by the AVX2 detection; proptested byte-identical.
+            unsafe { unpack_half_avx2(bytes, bits, half, out) }
+        } else {
+            unpack_half_scalar(bytes, bits, half, out);
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    unpack_half_scalar(bytes, bits, half, out);
+}
+
+/// Decode + integrate one 128-doc half of a block's doc-id deltas into
+/// `out[..128]`: `out[i] = seed + sum(delta[half_start..=half_start+i])`. For
+/// [`Half::First`] pass `seed = base` (the block base, `doc_ids[0]`); the leading
+/// delta is 0, so `out[0] == base`. For [`Half::Second`] pass `seed = mid` (the
+/// block's `mid_last_doc_id == doc_ids[127]`); the first second-half delta is
+/// `doc_ids[128] - doc_ids[127]`, so `out[0] == doc_ids[128]` and the run
+/// continues from there — no first-half pass needed. `out` must be at least
+/// `BLOCK / 2` long.
+pub(super) fn unpack_sorted_half(bytes: &[u8], bits: u8, half: Half, seed: u32, out: &mut [u32]) {
+    let n = BLOCK / 2;
+    unpack_half(bytes, bits, half, out);
+    let mut acc = seed;
+    for slot in out[..n].iter_mut() {
+        acc = acc.wrapping_add(*slot);
+        *slot = acc;
+    }
+}
+
+/// Decode one 128-doc half of a block's term frequencies into `out[..128]` (no
+/// integrate — tfs are stored plain). `out` must be at least `BLOCK / 2` long.
+pub(super) fn unpack_tfs_half(bytes: &[u8], bits: u8, half: Half, out: &mut [u32]) {
+    unpack_half(bytes, bits, half, out);
 }
 
 /// NEON prefix-sum. Each 4-lane group gets its inclusive within-vector prefix via
@@ -895,6 +1102,30 @@ mod avx2_tests {
             unpack_scalar(&out, bits, &mut b);
             integrate_scalar(&mut b, base);
             prop_assert_eq!(a, b);
+        }
+
+        /// AVX2 half-decode is byte-identical to the scalar half reference for
+        /// both 128-doc halves, at every width.
+        #[test]
+        fn avx2_unpack_half_matches_scalar(
+            bits in 1u8..=32,
+            vals_seed in prop::collection::vec(any::<u32>(), BLOCK),
+        ) {
+            let mask = mask32(bits as usize);
+            let mut vals = [0u32; BLOCK];
+            for (v, &s) in vals.iter_mut().zip(vals_seed.iter()) {
+                *v = s & mask;
+            }
+            let mut out = Vec::new();
+            pack(&vals, bits, &mut out);
+            for half in [Half::First, Half::Second] {
+                let mut a = [0u32; BLOCK / 2];
+                let mut b = [0u32; BLOCK / 2];
+                // SAFETY: built with `+avx2`; direct call bypasses runtime detection.
+                unsafe { unpack_half_avx2(&out, bits, half, &mut a) };
+                unpack_half_scalar(&out, bits, half, &mut b);
+                prop_assert_eq!(a, b);
+            }
         }
     }
 }

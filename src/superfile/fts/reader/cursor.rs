@@ -503,6 +503,15 @@ pub(crate) struct TermCursor {
     /// PACKED block it already holds while probing membership across a
     /// run of ascending target docs.
     pub(super) decoded_block: usize,
+    /// Which 128-doc halves of `decoded_block` are currently live in the
+    /// buffers. A `skip_to` that lands in one half of a 256-doc PACKED block
+    /// decodes only that half (`lo`/`hi`), halving the decode on a sparse seek;
+    /// a full decode sets both. Positioning methods keep the invariant "the
+    /// half `pos` points into is decoded", so the read-only `current_*`
+    /// accessors never touch a stale half. Always both-true for the 128-doc
+    /// codec and for bitset/vint blocks (which only ever decode whole).
+    pub(super) lo_valid: bool,
+    pub(super) hi_valid: bool,
     /// The posting-block codec this cursor's superfile uses (128-doc for
     /// `V1`–`V4`, 256-doc for `V5`). All block decode + bitset-header access
     /// routes through it.
@@ -600,6 +609,8 @@ impl TermCursor {
             header_probed,
             count_only,
             decoded_block: usize::MAX,
+            lo_valid: false,
+            hi_valid: false,
             codec,
         };
         if !cursor.blocks.is_empty() {
@@ -664,6 +675,10 @@ impl TermCursor {
             // never call `decode_current_block`, so the flag is inert.
             count_only: false,
             decoded_block: 0,
+            // A single pre-decoded posting: treat the block as fully live so the
+            // `current_*` accessors read `block_doc_ids[0]` without a decode.
+            lo_valid: true,
+            hi_valid: true,
             // Inert: an inline cursor never decodes a block.
             codec,
         }
@@ -683,6 +698,112 @@ impl TermCursor {
         };
         self.pos = 0;
         self.decoded_block = self.current_block;
+        self.lo_valid = true;
+        self.hi_valid = true;
+    }
+
+    /// Whether the current block can be decoded one 128-doc half at a time:
+    /// only the 256-doc codec supports it, and only for a PACKED block (bitset
+    /// and vint blocks are small or bit-testable, so they decode whole).
+    #[inline]
+    fn current_block_half_decodable(&self) -> bool {
+        if self.codec != PostingCodec::Block256 {
+            return false;
+        }
+        let b = &self.blocks[self.current_block];
+        let raw = &self.bytes[b.block_byte_offset..b.block_byte_end];
+        // Inline (df=1) cursors carry no postings bytes — their single posting is
+        // pre-decoded and never re-read; the empty range is not a real block.
+        raw.len() > block256::ENCODING_OFF
+            && raw[block256::ENCODING_OFF] == block256::ENCODING_PACKED
+    }
+
+    /// The 128-doc half of the current block that would contain `target`, split
+    /// at the stored `mid_last_doc_id` (`doc_ids[127]`). Because `mid` is the
+    /// first half's last doc, `target <= mid` guarantees the first doc `>=
+    /// target` lies in the first half, and `target > mid` in the second.
+    #[inline]
+    fn half_of_target(&self, target: u32) -> block256::Half {
+        if target <= self.blocks[self.current_block].mid_last_doc_id {
+            block256::Half::First
+        } else {
+            block256::Half::Second
+        }
+    }
+
+    /// Decode a single 128-doc half of the current (256-doc, PACKED) block into
+    /// the reused buffers at the half's natural offset, filling tfs too unless
+    /// `count_only`. When the buffers hold a different block, the other half is
+    /// invalidated first. Callers must have checked
+    /// [`Self::current_block_half_decodable`].
+    fn decode_half(&mut self, half: block256::Half) {
+        let b = self.blocks[self.current_block];
+        let raw = &self.bytes[b.block_byte_offset..b.block_byte_end];
+        let count = raw[block256::COUNT_M1_OFF] as usize + 1;
+        if self.decoded_block != self.current_block {
+            self.lo_valid = false;
+            self.hi_valid = false;
+            self.decoded_block = self.current_block;
+        }
+        self.block_n = count;
+        match half {
+            block256::Half::First => {
+                block256::decode_block_doc_ids_half(
+                    raw,
+                    block256::Half::First,
+                    b.mid_last_doc_id,
+                    &mut self.block_doc_ids,
+                );
+                if !self.count_only {
+                    block256::decode_block_tfs_half(
+                        raw,
+                        block256::Half::First,
+                        &mut self.block_tfs,
+                    );
+                }
+                self.lo_valid = true;
+            }
+            block256::Half::Second => {
+                block256::decode_block_doc_ids_half(
+                    raw,
+                    block256::Half::Second,
+                    b.mid_last_doc_id,
+                    &mut self.block_doc_ids,
+                );
+                if !self.count_only {
+                    block256::decode_block_tfs_half(
+                        raw,
+                        block256::Half::Second,
+                        &mut self.block_tfs,
+                    );
+                }
+                self.hi_valid = true;
+            }
+        }
+    }
+
+    /// Complete a partially-decoded block in place, preserving `pos`. Two bool
+    /// tests and no byte reads when both halves are already live — which is every
+    /// fully-decoded block (leaders, sequential iteration, the 128-doc codec,
+    /// bitset/vint), so it is free on the hot path. Only a cursor left
+    /// half-decoded by [`Self::probe_to`] and then iterated (a non-essential
+    /// promoted to essential) actually decodes the missing half.
+    #[inline]
+    pub(super) fn ensure_fully_decoded_keep_pos(&mut self) {
+        if self.lo_valid && self.hi_valid {
+            return;
+        }
+        if !self.lo_valid {
+            self.decode_half(block256::Half::First);
+        }
+        if !self.hi_valid {
+            // A block of <= HALF_LEN docs has no second half — nothing to decode.
+            if self.block_n > block256::HALF_LEN {
+                self.decode_half(block256::Half::Second);
+            } else {
+                self.hi_valid = true;
+            }
+        }
     }
 
     /// Membership probe: does this term contain `doc`? Advances the block
@@ -731,8 +852,10 @@ impl TermCursor {
             let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
             (word >> (bit % 64)) & 1 == 1
         } else {
-            // Borrow of `raw` ends above; the decode needs `&mut self`.
-            if self.decoded_block != self.current_block {
+            // Borrow of `raw` ends above; the decode needs `&mut self`. The
+            // binary search spans the whole block, so both halves must be live
+            // (a prior seek may have decoded only one).
+            if self.decoded_block != self.current_block || !self.lo_valid || !self.hi_valid {
                 self.decode_current_block();
             }
             self.block_doc_ids[..self.block_n]
@@ -751,7 +874,9 @@ impl TermCursor {
     /// pass a `doc` a preceding `contains(doc)` confirmed is present, arriving
     /// in ascending order, so the forward `pos` scan always lands on it.
     pub(super) fn materialize_at(&mut self, doc: u32) {
-        if self.decoded_block != self.current_block {
+        // The forward scan may span both halves, so ensure the whole block is
+        // decoded (a preceding seek may have left only one half live).
+        if self.decoded_block != self.current_block || !self.lo_valid || !self.hi_valid {
             self.decode_current_block();
         }
         while self.pos < self.block_n && self.block_doc_ids[self.pos] < doc {
@@ -953,6 +1078,8 @@ impl TermCursor {
         self.pos += 1;
         if self.pos >= self.block_n {
             self.advance_block();
+        } else {
+            self.ensure_fully_decoded_keep_pos();
         }
     }
 
@@ -967,6 +1094,8 @@ impl TermCursor {
         // The assertion above makes equality equivalent to `>=` here.
         if self.pos == self.block_n {
             self.advance_block();
+        } else {
+            self.ensure_fully_decoded_keep_pos();
         }
     }
 
@@ -1000,6 +1129,10 @@ impl TermCursor {
             // Just scan pos forward. The `current_doc_id() >= target`
             // guard from before is folded into this scan — if pos is
             // already at-or-past, the loop body doesn't execute.
+            // The within-block scan spans whichever half `target` lands in;
+            // complete the block if a prior probe left it half-decoded (free
+            // when it is already whole, the normal case for this path).
+            self.ensure_fully_decoded_keep_pos();
             let n = self.block_n;
             while self.pos < n && self.block_doc_ids[self.pos] < target {
                 self.pos += 1;
@@ -1031,7 +1164,25 @@ impl TermCursor {
         if self.is_exhausted() {
             return;
         }
-        self.decode_current_block();
+        // Decode only the 128-doc half that spans `target` on a 256-doc PACKED
+        // block. The ranked walk often prunes or skips past the other half
+        // (block-max is half-granular), so decoding it eagerly is the waste the
+        // AVX2 profile flagged in `decode_block_doc_ids`. The other half is
+        // decoded on demand if iteration reaches it (`ensure_fully_decoded_*`),
+        // and the direct-array kernels (flat-merge / windowed-union) force a full
+        // decode before their loops, so this is a pure fast path. `target <=
+        // last_doc_id` here (the block was chosen for that), so the scan lands
+        // inside the chosen half and never reads the other one.
+        if self.current_block_half_decodable() {
+            let half = self.half_of_target(target);
+            self.decode_half(half);
+            self.pos = match half {
+                block256::Half::First => 0,
+                block256::Half::Second => block256::HALF_LEN,
+            };
+        } else {
+            self.decode_current_block();
+        }
         while self.pos < self.block_n && self.block_doc_ids[self.pos] < target {
             self.pos += 1;
         }

@@ -351,6 +351,98 @@ pub fn decode_block(bytes: &[u8], dest_doc_ids: &mut [u32], dest_tfs: &mut [u32]
     count
 }
 
+pub use bitpack::Half;
+
+/// Number of docs in the first 128-doc half of a `count`-doc block. The second
+/// half holds `count - HALF_LEN` (0 when `count <= HALF_LEN`).
+pub const HALF_LEN: usize = BLOCK_LEN / 2;
+
+/// Decode the doc ids of a single 128-doc half of a **PACKED** block into
+/// `dest`, writing the half's docs at their natural block offset
+/// (`Half::First` → `dest[0..128]`, `Half::Second` → `dest[128..256]`) and
+/// returning the number of real docs in that half. This is the sparse-seek
+/// fast path: a `skip_to`/probe that lands in one half decodes only that half
+/// (128 values) rather than the whole 256-doc block.
+///
+/// `mid_last_doc_id` is the block's stored first-half last doc id
+/// (`doc_ids[127]`), the integrate seed for [`Half::Second`]; it is ignored for
+/// [`Half::First`] (which seeds from the block base). `dest.len()` must be
+/// `>= BLOCK_LEN`.
+///
+/// # Panics
+/// - the block is not `ENCODING_PACKED` (bitset/vint are decoded whole), or
+///   `Half::Second` is requested on a block of `<= HALF_LEN` docs (no second
+///   half), or `dest.len() < BLOCK_LEN`.
+pub fn decode_block_doc_ids_half(
+    bytes: &[u8],
+    half: Half,
+    mid_last_doc_id: u32,
+    dest: &mut [u32],
+) -> usize {
+    assert!(dest.len() >= BLOCK_LEN, "decode_half: dest < BLOCK_LEN");
+    assert!(bytes.len() >= HEADER_SIZE, "decode_half: bytes < header");
+    let delta_bits = bytes[DELTA_BITS_OFF];
+    let encoding = bytes[ENCODING_OFF];
+    let count = bytes[COUNT_M1_OFF] as usize + 1;
+    assert_eq!(
+        encoding, ENCODING_PACKED,
+        "decode_block_doc_ids_half: PACKED only (bitset/vint decode whole)"
+    );
+    let base = u32::from_le_bytes([bytes[BASE_OFF], bytes[5], bytes[6], bytes[7]]);
+    let deltas = &bytes[HEADER_SIZE..HEADER_SIZE + packed_bytes(delta_bits)];
+    match half {
+        Half::First => {
+            bitpack::unpack_sorted_half(
+                deltas,
+                delta_bits,
+                Half::First,
+                base,
+                &mut dest[..HALF_LEN],
+            );
+            count.min(HALF_LEN)
+        }
+        Half::Second => {
+            assert!(
+                count > HALF_LEN,
+                "decode_block_doc_ids_half: Second requested on a {count}-doc block"
+            );
+            bitpack::unpack_sorted_half(
+                deltas,
+                delta_bits,
+                Half::Second,
+                mid_last_doc_id,
+                &mut dest[HALF_LEN..BLOCK_LEN],
+            );
+            count - HALF_LEN
+        }
+    }
+}
+
+/// Decode the term frequencies of a single 128-doc half of a **PACKED** block
+/// into `dest` at the half's natural offset (`Half::First` → `dest[0..128]`,
+/// `Half::Second` → `dest[128..256]`). Pair with [`decode_block_doc_ids_half`]
+/// for the same half when the landed doc must be scored. `dest.len()` must be
+/// `>= BLOCK_LEN`.
+///
+/// # Panics
+/// - `dest.len() < BLOCK_LEN`, or the block is shorter than header + tfs.
+pub fn decode_block_tfs_half(bytes: &[u8], half: Half, dest: &mut [u32]) {
+    assert!(dest.len() >= BLOCK_LEN, "decode_tfs_half: dest < BLOCK_LEN");
+    let tf_bits = bytes[TF_BITS_OFF];
+    let tfs_size = packed_bytes(tf_bits);
+    assert!(
+        bytes.len() >= HEADER_SIZE + tfs_size,
+        "decode_tfs_half: bytes short"
+    );
+    let tfs = &bytes[bytes.len() - tfs_size..];
+    match half {
+        Half::First => bitpack::unpack_tfs_half(tfs, tf_bits, Half::First, &mut dest[..HALF_LEN]),
+        Half::Second => {
+            bitpack::unpack_tfs_half(tfs, tf_bits, Half::Second, &mut dest[HALF_LEN..BLOCK_LEN])
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -460,8 +552,94 @@ mod tests {
         roundtrip(doc_ids, tfs);
     }
 
+    /// The half-decode fast path must reproduce exactly the same doc ids and
+    /// tfs as the full-block decode, for both 128-doc halves. Forces a PACKED
+    /// block with wide gaps (so the encoder never picks BITSET/VINT) and more
+    /// than `HALF_LEN` docs (so the second half is non-empty), then compares
+    /// `decode_block_doc_ids_half` / `decode_block_tfs_half` against
+    /// `decode_block` over each half's range.
+    #[test]
+    fn half_decode_matches_full() {
+        for count in [HALF_LEN + 1, HALF_LEN + 7, 200, BLOCK_LEN - 1, BLOCK_LEN] {
+            // Wide, irregular gaps ⇒ PACKED (not BITSET); full block ⇒ not VINT.
+            let doc_ids: Vec<u32> = (0..count as u32).map(|i| 3 + i * 9_973 + (i % 5)).collect();
+            let tfs: Vec<u32> = (0..count as u32).map(|i| (i % 17) + 1).collect();
+            let enc = encode_block(&Block {
+                doc_ids: doc_ids.clone(),
+                tfs: tfs.clone(),
+            });
+            // The half path is PACKED-only; a dense draw that the encoder stores
+            // as a bitset isn't relevant here (the reader decodes those whole).
+            if enc.bytes[ENCODING_OFF] != ENCODING_PACKED {
+                continue;
+            }
+
+            let mut full_d = [0u32; BLOCK_LEN];
+            let mut full_t = [0u32; BLOCK_LEN];
+            decode_block(&enc.bytes, &mut full_d, &mut full_t);
+            let mid = doc_ids[HALF_LEN - 1];
+
+            let mut half_d = [0u32; BLOCK_LEN];
+            let mut half_t = [0u32; BLOCK_LEN];
+            let lo_n = decode_block_doc_ids_half(&enc.bytes, Half::First, mid, &mut half_d);
+            let hi_n = decode_block_doc_ids_half(&enc.bytes, Half::Second, mid, &mut half_d);
+            decode_block_tfs_half(&enc.bytes, Half::First, &mut half_t);
+            decode_block_tfs_half(&enc.bytes, Half::Second, &mut half_t);
+
+            assert_eq!(lo_n, HALF_LEN, "first-half count (count={count})");
+            assert_eq!(hi_n, count - HALF_LEN, "second-half count (count={count})");
+            assert_eq!(
+                &half_d[..count],
+                &full_d[..count],
+                "half doc ids != full (count={count})"
+            );
+            assert_eq!(
+                &half_t[..count],
+                &full_t[..count],
+                "half tfs != full (count={count})"
+            );
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Half-decode vs full-decode over random PACKED blocks with both halves
+        /// present: every bit width, gap magnitude, and tf spread must agree.
+        #[test]
+        fn half_decode_matches_full_random(
+            base in 0u32..2_000_000,
+            gaps in prop::collection::vec(1u32..300_000, (HALF_LEN + 1)..=BLOCK_LEN),
+            tf_seed in prop::collection::vec(1u32..8_000, BLOCK_LEN),
+        ) {
+            let count = gaps.len();
+            let mut doc_ids = Vec::with_capacity(count);
+            let mut acc = base;
+            for (i, &g) in gaps.iter().enumerate() {
+                if i > 0 { acc = acc.saturating_add(g); }
+                doc_ids.push(acc);
+            }
+            prop_assume!(doc_ids.windows(2).all(|w| w[0] < w[1]));
+            let tfs: Vec<u32> = tf_seed[..count].to_vec();
+            let enc = encode_block(&Block { doc_ids: doc_ids.clone(), tfs });
+            // The half path is PACKED-only; skip the rare draws that pick bitset.
+            prop_assume!(enc.bytes[ENCODING_OFF] == ENCODING_PACKED);
+
+            let mut full_d = [0u32; BLOCK_LEN];
+            let mut full_t = [0u32; BLOCK_LEN];
+            decode_block(&enc.bytes, &mut full_d, &mut full_t);
+            let mid = doc_ids[HALF_LEN - 1];
+
+            let mut half_d = [0u32; BLOCK_LEN];
+            let mut half_t = [0u32; BLOCK_LEN];
+            decode_block_doc_ids_half(&enc.bytes, Half::First, mid, &mut half_d);
+            decode_block_doc_ids_half(&enc.bytes, Half::Second, mid, &mut half_d);
+            decode_block_tfs_half(&enc.bytes, Half::First, &mut half_t);
+            decode_block_tfs_half(&enc.bytes, Half::Second, &mut half_t);
+
+            prop_assert_eq!(&half_d[..count], &full_d[..count]);
+            prop_assert_eq!(&half_t[..count], &full_t[..count]);
+        }
 
         /// Round-trip any block: random counts and gap magnitudes drive the
         /// encoder across all three doc-id encodings (PACKED/BITSET/VINT) and
