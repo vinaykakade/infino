@@ -22,6 +22,19 @@ use crate::superfile::{
     fts::{bm25, posting::BLOCK_LEN},
 };
 
+/// Misroute-census override (measurement branch only; not for merge). Reads
+/// `INFINO_FORCE_OR_ALGO` once: `Some(false)` = force MaxScore+BMM,
+/// `Some(true)` = force windowed union, `None` = use the router.
+fn or_algo_census_override() -> Option<bool> {
+    use std::sync::OnceLock;
+    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| match std::env::var("INFINO_FORCE_OR_ALGO").as_deref() {
+        Ok("bmm") => Some(false),
+        Ok("windowed") => Some(true),
+        _ => None,
+    })
+}
+
 /// Intersection cardinality by a rarest-driven membership walk: iterate the
 /// term with the fewest blocks and count docs the others all contain. Each
 /// membership probe is `TermCursor::contains`, which bit-tests a bitset
@@ -1608,6 +1621,20 @@ impl FtsReader {
         filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
+        // Misroute-census override (measurement branch only; not for merge):
+        // INFINO_FORCE_OR_ALGO=bmm|windowed forces the kernel, bypassing the
+        // router, so a census can time both kernels per query against the
+        // router's auto choice. Read once, cached.
+        match or_algo_census_override() {
+            Some(false) => {
+                return self.run_max_score_bmm(column_id, cursors, k, filter, floor_eff);
+            }
+            Some(true) => {
+                return self
+                    .run_windowed_union(column_id, cursors, k, filter, floor_eff, 0, u32::MAX);
+            }
+            None => {}
+        }
         // Route on upper-bound *spread*, not term count: when no single
         // term dominates, MaxScore's essential set never shrinks and it
         // degrades to scoring the whole union with per-doc f-way merge
