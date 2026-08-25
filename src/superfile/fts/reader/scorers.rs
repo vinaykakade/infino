@@ -1051,9 +1051,14 @@ impl FtsReader {
                     let mut tfs = [cursors[0].current_tf() as f32, 0.0, 0.0, 0.0];
                     let mut packed = 1;
                     let mut score: f32 = 0.0;
+                    super::cursor::IN_NONESS_LOOP.with(|f| f.set(true));
                     for cursor in cursors.iter_mut().skip(1) {
                         cursor.skip_to(candidate);
+                        super::cursor::NONESS_COMPLETIONS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if cursor.current_doc_id() == candidate {
+                            super::cursor::NONESS_PRESENT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             idfs[packed] = cursor.idf_x_k1p1;
                             tfs[packed] = cursor.current_tf() as f32;
                             packed += 1;
@@ -1065,6 +1070,7 @@ impl FtsReader {
                             }
                         }
                     }
+                    super::cursor::IN_NONESS_LOOP.with(|f| f.set(false));
                     if packed > 0 {
                         score += bm25::score_simd_x4(idfs, tfs, norm);
                     }
@@ -1216,13 +1222,18 @@ impl FtsReader {
                     }
 
                     if score + remaining_block_ub > threshold {
+                        super::cursor::IN_NONESS_LOOP.with(|f| f.set(true));
                         for cursor in cursors.iter_mut().skip(f_essential) {
                             let block_ub = cursor.inspect_block_max_bm25();
                             if score + remaining_block_ub <= threshold {
                                 break;
                             }
                             cursor.skip_to(candidate);
+                            super::cursor::NONESS_COMPLETIONS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if cursor.current_doc_id() == candidate {
+                                super::cursor::NONESS_PRESENT
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 score += bm25::score_with_dl_norm_k1(
                                     cursor.idf_x_k1p1,
                                     cursor.current_tf(),
@@ -1231,6 +1242,7 @@ impl FtsReader {
                             }
                             remaining_block_ub -= block_ub;
                         }
+                        super::cursor::IN_NONESS_LOOP.with(|f| f.set(false));
                     }
                 }
                 // (If essential score + remaining_block_ub already ≤ threshold,

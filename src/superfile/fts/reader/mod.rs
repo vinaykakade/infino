@@ -20,6 +20,8 @@ mod test_util;
 mod work;
 
 pub use core::*;
+// Non-essential block-decode amortization counters (measurement branch only; not for merge).
+pub use cursor::noness_amort_dump;
 
 pub use metadata::OpenOptions;
 pub use options::{Bm25SearchOptions, Bm25Stats, BoolMode};

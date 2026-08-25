@@ -28,6 +28,39 @@ use crate::superfile::{
     },
 };
 
+// ── Non-essential block-decode amortization counters (measurement branch only; not for merge) ──
+// Answers the make-or-break question: over the ranked-OR union bucket, how
+// many non-essential completions (`skip_to(candidate)` in the MaxScore
+// non-essential loop) share an already-decoded block vs force a fresh block
+// decode. `completions / decodes` is the amortization the within-block decode
+// cache ALREADY realizes; if it is high, a block-at-a-time restructure has no
+// incremental decode to save. `IN_NONESS` scopes the decode counter to the
+// non-essential loop so essential iteration decodes are excluded.
+pub static NONESS_COMPLETIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static NONESS_BLOCK_DECODES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static NONESS_PRESENT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    pub static IN_NONESS_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Print the accumulated non-essential block-decode amortization counters to stderr. Called once by the
+/// measurement driver after the query set finishes.
+pub fn noness_amort_dump() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = NONESS_COMPLETIONS.load(Relaxed);
+    let d = NONESS_BLOCK_DECODES.load(Relaxed);
+    let p = NONESS_PRESENT.load(Relaxed);
+    let per_decode = n as f64 / (d.max(1) as f64);
+    let hit_rate = 1.0 - (d as f64 / (n.max(1) as f64));
+    eprintln!(
+        "NONESS_AMORT noness_completions={n} noness_block_decodes={d} present_hits={p} \
+         completions_per_decode={per_decode:.3} within_block_cache_hit_rate={hit_rate:.4}"
+    );
+}
+
 /// Parsed per-(column, term) metadata header from the postings
 /// region. The byte layout is documented once, on the writer side —
 /// see [`TERM_META_SIZE`] in `builder.rs` — this struct is its
@@ -505,6 +538,11 @@ impl TermCursor {
         };
         self.pos = 0;
         self.decoded_block = self.current_block;
+        // Amortization probe: count only decodes triggered inside the non-essential
+        // completion loop (the flag is set solely there).
+        if IN_NONESS_LOOP.with(|f| f.get()) {
+            NONESS_BLOCK_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Membership probe: does this term contain `doc`? Advances the block
