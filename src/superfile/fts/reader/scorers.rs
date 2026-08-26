@@ -1557,20 +1557,25 @@ impl FtsReader {
             // Accumulate the essential terms' contributions into the window
             // (SIMD OR-sum; scalar tail). Identical to the windowed-union body,
             // restricted to essentials.
+            // Block-max skip fires only once the heap is full (threshold is a
+            // real k-th score); hoisted so the per-posting loop doesn't re-test.
+            let prune = heap.len() >= k;
             for c in cursors.iter_mut().take(f_essential) {
+                let mut checked_block = usize::MAX;
                 while !c.is_exhausted() {
                     let d = c.current_doc_id();
                     if d >= window_end {
                         break;
                     }
-                    // Block-max skip: once the heap is full (threshold is a
-                    // real k-th score), skip a whole block whose docs cannot
-                    // beat it even carrying every other term at its term-max —
-                    // the bound per-candidate MaxScore uses, applied to the
-                    // essential accumulate so the dense OR-sum still prunes at
-                    // small k. It never fires while the heap is filling, so a
-                    // doc that must be admitted is never dropped.
-                    if heap.len() >= k {
+                    // Block-max skip, checked once per block (not per posting):
+                    // skip a whole block whose docs cannot beat threshold even
+                    // carrying every other term at its term-max — the bound
+                    // per-candidate MaxScore uses, applied to the essential
+                    // accumulate so the dense OR-sum still prunes at small k.
+                    // Never fires while the heap is filling, so a doc that must
+                    // be admitted is never dropped.
+                    if prune && c.current_block != checked_block {
+                        checked_block = c.current_block;
                         let block_ub =
                             c.current_block_max_bm25() + (total_term_ub - c.term_max_bm25);
                         if block_ub <= threshold {
