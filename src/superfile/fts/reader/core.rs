@@ -295,6 +295,22 @@ pub(super) const OR_WINDOW: u32 = 4096;
 /// Number of 64-bit words in the window presence bitset.
 pub(super) const OR_WINDOW_WORDS: usize = (OR_WINDOW as usize).div_ceil(64);
 
+/// Upper bound on the windowed-maxscore window span, and the size its score /
+/// presence buffers are allocated at. `OR_WINDOW` is the *starting* span; when
+/// a query's essential terms are sparse the span grows toward this cap so a
+/// thinly-populated doc-id range is covered by a few wide windows instead of
+/// hundreds of near-empty ones (each of which pays a fixed per-window cost).
+/// A dense union keeps small windows (the block boundary bounds it below the
+/// cap), so this only widens the sparse case.
+pub(super) const MAX_OR_WINDOW: u32 = OR_WINDOW * 8;
+/// Number of 64-bit words in the presence bitset at the maximum span.
+pub(super) const MAX_OR_WINDOW_WORDS: usize = (MAX_OR_WINDOW as usize).div_ceil(64);
+/// Candidates a windowed-maxscore window aims to hold. The span adapts toward
+/// holding roughly this many: below half of it the span doubles (too sparse,
+/// amortize the setup over more docs); above twice it the span halves (dense
+/// enough that smaller windows give more frequent threshold updates).
+pub(super) const WMS_WINDOW_TARGET_CANDIDATES: usize = 128;
+
 /// Dominance threshold for the df-anchored union count. When one term's
 /// document frequency is at least this multiple of *all the other terms'
 /// dfs combined*, a disjunction count is cheaper computed as

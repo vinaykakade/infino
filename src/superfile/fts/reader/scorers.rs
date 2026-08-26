@@ -1622,8 +1622,10 @@ impl FtsReader {
             top_k_initial_capacity(k, u64::from(self.n_docs), Some((doc_id_start, doc_id_end)));
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let mut threshold: f32 = floor_eff.max(0.0);
-        let mut scores = vec![0.0f32; OR_WINDOW as usize];
-        let mut present = [0u64; OR_WINDOW_WORDS];
+        // Buffers are sized for the widest span the adaptive window can reach;
+        // a dense query touches only the first `OR_WINDOW` of them.
+        let mut scores = vec![0.0f32; MAX_OR_WINDOW as usize];
+        let mut present = [0u64; MAX_OR_WINDOW_WORDS];
         // Compacted per-window candidate list (doc + essential score), reused;
         // the drain fills it, the SIMD filter compacts it to survivors.
         let mut win_docs: Vec<u32> = Vec::with_capacity(OR_WINDOW as usize);
@@ -1631,6 +1633,11 @@ impl FtsReader {
         // Sum of every term's UB — the reference for the essential-side
         // block-max skip below.
         let total_term_ub = partial_max[0];
+        // Adaptive window span: starts at `OR_WINDOW`, grows toward
+        // `MAX_OR_WINDOW` when windows come back sparse and shrinks back when
+        // they come back dense (see the feedback at the end of the loop).
+        let adaptive = std::env::var("INFINO_WMS_ADAPTIVE").is_ok();
+        let mut cur_span = OR_WINDOW;
 
         loop {
             // Continuous partition: recompute the essential set from the live
@@ -1761,7 +1768,7 @@ impl FtsReader {
             // score-buffer width.
             let base = min_doc & !63;
             let window_end = block_bound
-                .min(base.saturating_add(OR_WINDOW))
+                .min(base.saturating_add(cur_span))
                 .min(doc_id_end);
 
             // Accumulate the essential terms' contributions into the window
@@ -1847,7 +1854,7 @@ impl FtsReader {
             let heap_full = heap.len() >= k;
             let words = ((window_end - base) as usize)
                 .div_ceil(64)
-                .min(OR_WINDOW_WORDS);
+                .min(MAX_OR_WINDOW_WORDS);
             win_docs.clear();
             win_scores.clear();
             for (word_idx, word) in present[..words].iter_mut().enumerate() {
@@ -1868,6 +1875,10 @@ impl FtsReader {
                     win_scores.push(score);
                 }
             }
+            // How densely this window's span was populated — drives the
+            // adaptive span below (measured before completion truncates the
+            // survivor list).
+            let window_candidates = win_docs.len();
 
             // Complete the non-essentials over the compacted survivors. Once
             // the heap is full, do it the reference way: strongest non-essential
@@ -1907,6 +1918,18 @@ impl FtsReader {
                     heap.pop();
                     heap.push(TopKEntry(score, doc));
                     threshold = heap.peek().expect("non-empty").0.max(threshold);
+                }
+            }
+
+            // Adapt the span for the next window from this one's population.
+            // Sparse windows (few candidates spread across the span) waste the
+            // fixed per-window setup, so widen; dense windows prefer to stay
+            // narrow for more frequent threshold updates, so shrink back.
+            if adaptive {
+                if window_candidates * 2 < WMS_WINDOW_TARGET_CANDIDATES {
+                    cur_span = cur_span.saturating_mul(2).min(MAX_OR_WINDOW);
+                } else if window_candidates > WMS_WINDOW_TARGET_CANDIDATES * 2 {
+                    cur_span = (cur_span / 2).max(OR_WINDOW);
                 }
             }
         }
