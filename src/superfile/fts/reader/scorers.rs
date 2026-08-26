@@ -57,6 +57,7 @@ pub fn wms_diag_dump() {
 /// Left-pack control table: for each 8-bit survivor mask, the lane indices that
 /// gather the set lanes to the front (for `permutevar8x32`). Unset trailing
 /// slots are don't-cares (the store advances only by `popcount(mask)`).
+#[cfg(target_arch = "x86_64")]
 const fn build_left_pack() -> [[u8; 8]; 256] {
     let mut t = [[0u8; 8]; 256];
     let mut m = 0usize;
@@ -74,6 +75,7 @@ const fn build_left_pack() -> [[u8; 8]; 256] {
     }
     t
 }
+#[cfg(target_arch = "x86_64")]
 static LEFT_PACK: [[u8; 8]; 256] = build_left_pack();
 
 /// Compact `(docs, scores)` in place to the entries with `score >= min_score`,
@@ -1699,7 +1701,6 @@ impl FtsReader {
                     }
                 }
                 let block_end = cursors[0].current_block_last_doc_id();
-                let non_ess_ub = partial_max[1];
                 let (ess, non_ess) = cursors.split_at_mut(1);
                 let c0 = &mut ess[0];
                 while !c0.is_exhausted()
@@ -1714,14 +1715,46 @@ impl FtsReader {
                         continue;
                     }
                     let norm = dl_norm_k1.get(candidate);
-                    let mut score =
+                    let essential_score =
                         bm25::score_with_dl_norm_k1(c0.idf_x_k1p1, c0.current_tf(), norm);
-                    if !non_ess.is_empty() && (heap.len() < k || score + non_ess_ub > threshold) {
-                        for c in non_ess.iter_mut() {
-                            if let Some(tf) = c.bitset_probe_tf(candidate) {
-                                score += bm25::score_with_dl_norm_k1(c.idf_x_k1p1, tf, norm);
+                    // Bound the non-essentials at `candidate` by each one's
+                    // block-max for the block that *contains* it (monotonic
+                    // `shallow_advance` hint — amortized O(1), no decode), not by
+                    // its global term-max. Far tighter for a common term, so the
+                    // skip below fires on many more docs, dropping the completion
+                    // probe + heap work — the dominant per-doc cost on a dense
+                    // leader query.
+                    let mut others_ub = 0.0f32;
+                    for c in non_ess.iter_mut() {
+                        c.shallow_advance_block_to(candidate);
+                        others_ub += c.inspect_block_max_bm25();
+                    }
+                    if essential_score + others_ub <= threshold {
+                        c0.next();
+                        continue;
+                    }
+                    // Complete: probe each non-essential and SIMD-pack the
+                    // matches (leader seeded as lane 0, so `score` is the full
+                    // BM25 sum).
+                    let mut idfs = [c0.idf_x_k1p1, 0.0, 0.0, 0.0];
+                    let mut tfs = [c0.current_tf() as f32, 0.0, 0.0, 0.0];
+                    let mut packed = 1;
+                    let mut score = 0.0f32;
+                    for c in non_ess.iter_mut() {
+                        if let Some(tf) = c.bitset_probe_tf(candidate) {
+                            idfs[packed] = c.idf_x_k1p1;
+                            tfs[packed] = tf as f32;
+                            packed += 1;
+                            if packed == 4 {
+                                score += bm25::score_simd_x4(idfs, tfs, norm);
+                                idfs = [0.0; 4];
+                                tfs = [0.0; 4];
+                                packed = 0;
                             }
                         }
+                    }
+                    if packed > 0 {
+                        score += bm25::score_simd_x4(idfs, tfs, norm);
                     }
                     let mut raised = false;
                     if heap.len() < k {
@@ -2777,6 +2810,96 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn windowed_maxscore_dense_common_leader_agrees_with_bmm() {
+        // Regression for the f==1 leader path. A dense, common leader term
+        // (present in most docs) with common non-essentials and small k is the
+        // shape where the threshold rises high, the essential set collapses to
+        // the single leader, and the per-candidate tight block-max bail plus the
+        // early "no doc can qualify" termination carry the query — the path a
+        // rare-leader corpus (the other tests) never stresses. Varying tf spreads
+        // scores so each block's block-max UB differs from the global term-max,
+        // so the tight bound actually prunes where the loose one would not. Must
+        // still return the identical top-k as per-candidate MaxScore+BMM.
+        const N_DOCS: u32 = OR_WINDOW * 2 + 313; // several blocks, > 1 window
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            // All four terms common (stopword-like); "not" is the rarest so it
+            // becomes the essential leader. tf on "to" varies 1..=3 by doc.
+            let mut text = String::new();
+            for _ in 0..(1 + i % 3) {
+                text.push_str("to ");
+            }
+            if i % 8 != 0 {
+                text.push_str("be ");
+            }
+            if i % 4 != 0 {
+                text.push_str("or ");
+            }
+            if i % 8 < 5 {
+                text.push_str("not ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let terms = ["to", "be", "or", "not"];
+        for k in [1usize, 5, 10, 50, 200] {
+            let bmm = r
+                .search_with_algo_for_bench("body", &terms, k, OrAlgo::Bmm)
+                .await
+                .expect("bmm");
+            let wms = r
+                .search_with_algo_for_bench("body", &terms, k, OrAlgo::WindowedMaxscore)
+                .await
+                .expect("wms");
+            assert_eq!(bmm.len(), wms.len(), "len k={k}");
+            for ((db, sb), (dw, sw)) in bmm.iter().zip(wms.iter()) {
+                assert_eq!(db, dw, "doc mismatch k={k}: bmm={db} wms={dw}");
+                assert!((sb - sw).abs() < 1e-4, "score mismatch k={k}: {sb} vs {sw}");
+            }
+        }
+    }
+
+    #[test]
+    fn filter_survivors_compacts_in_order() {
+        // The competitive filter keeps entries scoring >= min_score, preserves
+        // ascending order, keeps each doc paired with its score, and returns the
+        // survivor count. The 40-element input covers both the SIMD 8-lane body
+        // (on x86_64, via the runtime-dispatched AVX2 left-pack) and the scalar
+        // tail; on other targets it exercises the scalar fallback end to end.
+        let docs0: Vec<u32> = (0..40).collect();
+        let scores0: Vec<f32> = (0..40).map(|i| i as f32 * 0.1).collect();
+        let min_score = 1.25f32; // keeps i where 0.1*i >= 1.25, i.e. i >= 13
+        let mut docs = docs0.clone();
+        let mut scores = scores0.clone();
+        let n = filter_survivors(&mut docs, &mut scores, min_score);
+        let expect: Vec<u32> = docs0
+            .iter()
+            .copied()
+            .filter(|&i| scores0[i as usize] >= min_score)
+            .collect();
+        assert_eq!(n, expect.len(), "survivor count");
+        assert_eq!(&docs[..n], &expect[..], "docs compacted in order");
+        for (di, &d) in docs[..n].iter().enumerate() {
+            assert!(
+                (scores[di] - d as f32 * 0.1).abs() < 1e-6,
+                "score stayed paired with its doc"
+            );
+        }
+        // Empty-survivor and all-survivor edges.
+        let mut d2 = docs0.clone();
+        let mut s2 = scores0.clone();
+        assert_eq!(filter_survivors(&mut d2, &mut s2, f32::INFINITY), 0);
+        let mut d3 = docs0.clone();
+        let mut s3 = scores0.clone();
+        assert_eq!(filter_survivors(&mut d3, &mut s3, f32::NEG_INFINITY), 40);
+        assert_eq!(&d3[..], &docs0[..], "all-pass leaves order untouched");
     }
 
     #[tokio::test]
