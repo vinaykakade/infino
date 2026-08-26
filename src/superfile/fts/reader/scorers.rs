@@ -36,6 +36,24 @@ fn or_algo_census_override() -> Option<u8> {
     })
 }
 
+// Diagnostic (measurement branch only): windowed-maxscore f_essential histogram
+// and per-path doc counts, to see whether a query collapses to the leader path.
+pub static WMS_F_WINDOWS: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+pub static WMS_F1_DOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WMS_WIN_DOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Print the windowed-maxscore f_essential histogram to stderr.
+pub fn wms_diag_dump() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let h: Vec<u64> = WMS_F_WINDOWS.iter().map(|a| a.load(Relaxed)).collect();
+    eprintln!(
+        "WMS_DIAG f_windows(f=0..7+)={h:?} f1_docs={} windowed_docs={}",
+        WMS_F1_DOCS.load(Relaxed),
+        WMS_WIN_DOCS.load(Relaxed)
+    );
+}
+
 /// Left-pack control table: for each 8-bit survivor mask, the lane indices that
 /// gather the set lanes to the front (for `permutevar8x32`). Unset trailing
 /// slots are don't-cares (the store advances only by `popcount(mask)`).
@@ -1659,6 +1677,7 @@ impl FtsReader {
             } else {
                 recompute_f(&partial_max, threshold)
             };
+            WMS_F_WINDOWS[f_essential.min(7)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             // f==1 fast path: a single dominant essential. Process its blocks
             // per-candidate (block-skip + non-essential completion) with no
@@ -1687,6 +1706,7 @@ impl FtsReader {
                     && c0.current_doc_id() <= block_end
                     && c0.current_doc_id() < doc_id_end
                 {
+                    WMS_F1_DOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let candidate = c0.current_doc_id();
                     if let Some(f) = filter.as_deref_mut()
                         && !f.admits(candidate)
@@ -1858,6 +1878,7 @@ impl FtsReader {
                     win_scores.push(score);
                 }
             }
+            WMS_WIN_DOCS.fetch_add(win_docs.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
             // Complete the non-essentials over the compacted survivors. Once
             // the heap is full, do it the reference way: strongest non-essential

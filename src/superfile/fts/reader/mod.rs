@@ -23,4 +23,5 @@ pub use core::*;
 
 pub use metadata::OpenOptions;
 pub use options::{Bm25SearchOptions, Bm25Stats, BoolMode};
+pub use scorers::wms_diag_dump;
 pub use work::MatchWork;
