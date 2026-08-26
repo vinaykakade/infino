@@ -1706,7 +1706,6 @@ impl FtsReader {
                     && c0.current_doc_id() <= block_end
                     && c0.current_doc_id() < doc_id_end
                 {
-                    WMS_F1_DOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let candidate = c0.current_doc_id();
                     if let Some(f) = filter.as_deref_mut()
                         && !f.admits(candidate)
@@ -1724,21 +1723,26 @@ impl FtsReader {
                             }
                         }
                     }
+                    let mut raised = false;
                     if heap.len() < k {
                         heap.push(TopKEntry(score, candidate));
                         if heap.len() == k {
                             threshold = heap.peek().expect("non-empty").0.max(threshold);
+                            raised = true;
                         }
                     } else if score > threshold {
                         heap.pop();
                         heap.push(TopKEntry(score, candidate));
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
+                        raised = true;
                     }
                     c0.next();
-                    // Once the threshold rises past the single essential's own
-                    // UB, f drops to 0 (nothing more can qualify) — stop the
-                    // block scan and let the outer loop terminate.
-                    if recompute_f(&partial_max, threshold) != 1 {
+                    // Only when the threshold actually rose: if even this term
+                    // plus every other term at its max can't beat it, no further
+                    // doc can qualify at all. (Re-checking the partition per
+                    // candidate — an O(n) scan — was the f==1 path's dominant
+                    // cost on dense leader queries.)
+                    if raised && total_term_ub <= threshold {
                         break;
                     }
                 }
