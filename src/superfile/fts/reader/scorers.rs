@@ -1532,13 +1532,6 @@ impl FtsReader {
         // non-essential completion overhead.
         let force_all_ess = std::env::var("INFINO_WMS_ALL_ESS").is_ok();
 
-        // Adaptive window (power of two in [MIN_WINDOW, OR_WINDOW]): a dense
-        // window shrinks so the threshold updates — and block-skip prunes —
-        // after fewer docs (approaching MaxScore's per-doc cadence); a sparse
-        // one grows to amortize the per-window bookkeeping over more matches.
-        const MIN_WINDOW: u32 = 256;
-        let mut window_size: u32 = OR_WINDOW;
-
         loop {
             // Continuous partition: recompute the essential set from the live
             // threshold. `threshold` only rises, so `f_essential` only shrinks.
@@ -1623,8 +1616,8 @@ impl FtsReader {
             if min_doc == u32::MAX || min_doc >= doc_id_end {
                 break;
             }
-            let base = min_doc & !(window_size - 1);
-            let window_end = base.saturating_add(window_size).min(doc_id_end);
+            let base = min_doc & !(OR_WINDOW - 1);
+            let window_end = base.saturating_add(OR_WINDOW).min(doc_id_end);
 
             // Accumulate the essential terms' contributions into the window
             // (SIMD OR-sum; scalar tail). Identical to the windowed-union body,
@@ -1704,40 +1697,14 @@ impl FtsReader {
             // candidate, then offer to the heap. Split so the (already-walked)
             // essentials and the probed non-essentials borrow disjointly.
             let non_ess_ub = partial_max[f_essential];
-            let heap_full = heap.len() >= k;
-            // A doc survives only if its essential score can, plus the whole
-            // non-essential budget, beat threshold. Below this bar it cannot
-            // reach top-k (used for the SIMD word-reject and the per-doc gate).
-            let survive_bar = threshold - non_ess_ub;
             let (_, non_ess) = cursors.split_at_mut(f_essential);
-            let words_in_window = (window_size as usize).div_ceil(64);
-            let mut candidates: u32 = 0;
-            for word_idx in 0..words_in_window {
-                let word = present[word_idx];
-                present[word_idx] = 0;
-                if word == 0 {
-                    continue;
-                }
-                candidates += word.count_ones();
-                let base_local = word_idx << 6;
-                // SIMD word-reject: once the heap is full, skip a whole 64-doc
-                // word if its max essential score cannot clear the survive bar
-                // (the max-reduce over the contiguous score slots vectorizes).
-                if heap_full {
-                    let wmax = scores[base_local..base_local + 64]
-                        .iter()
-                        .copied()
-                        .fold(f32::MIN, f32::max);
-                    if wmax <= survive_bar {
-                        scores[base_local..base_local + 64].fill(0.0);
-                        continue;
-                    }
-                }
-                let mut bits = word;
+            for (word_idx, word) in present.iter_mut().enumerate() {
+                let mut bits = *word;
+                *word = 0;
                 while bits != 0 {
                     let b = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
-                    let local = base_local | b;
+                    let local = (word_idx << 6) | b;
                     let mut score = scores[local];
                     scores[local] = 0.0;
                     let doc = base + local as u32;
@@ -1748,8 +1715,10 @@ impl FtsReader {
                     }
                     // Complete the non-essentials only when the doc could still
                     // reach top-k: while the heap is filling (every doc enters),
-                    // or when its essential score clears the survive bar.
-                    if !non_ess.is_empty() && (!heap_full || score > survive_bar) {
+                    // or when even the non-essential term-max UB can lift it over
+                    // threshold. Otherwise its essential-only score is final and
+                    // the heap gate below rejects it.
+                    if !non_ess.is_empty() && (heap.len() < k || score + non_ess_ub > threshold) {
                         let norm = dl_norm_k1.get(doc);
                         for c in non_ess.iter_mut() {
                             if let Some(tf) = c.bitset_probe_tf(doc) {
@@ -1768,15 +1737,6 @@ impl FtsReader {
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                     }
                 }
-            }
-
-            // Adapt the window: a dense window (many matches) shrinks so the
-            // threshold and block-skip advance after fewer docs; a sparse one
-            // grows to amortize per-window bookkeeping.
-            if candidates * 2 >= window_size {
-                window_size = (window_size / 2).max(MIN_WINDOW);
-            } else if candidates * 8 < window_size {
-                window_size = (window_size * 2).min(OR_WINDOW);
             }
         }
 
