@@ -1531,10 +1531,9 @@ impl FtsReader {
         // accumulate/drain (should then match run_windowed_union) from the
         // non-essential completion overhead.
         let force_all_ess = std::env::var("INFINO_WMS_ALL_ESS").is_ok();
-        // Diagnostic: adaptive window shrink (isolate its overhead).
+        // Diagnostic: `adaptive` reverts to a fixed OR_WINDOW slab (old
+        // behaviour) for A/B vs the default block-max-aligned windows.
         let adaptive = std::env::var("INFINO_WMS_ADAPTIVE").is_ok();
-        const MIN_WINDOW: u32 = 256;
-        let mut window_size: u32 = OR_WINDOW;
 
         loop {
             // Continuous partition: recompute the essential set from the live
@@ -1610,19 +1609,34 @@ impl FtsReader {
                 continue;
             }
 
-            // Candidates come from the essential terms only.
+            // Candidates come from the essential terms only. In the same scan
+            // find the nearest essential *block* boundary — the window ends
+            // there so the threshold updates per-block and the essential set
+            // collapses to the f==1 leader path early (the dense-small-k
+            // mechanism from Lucene/IResearch). `current_block_last_doc_id`
+            // reads block metadata only, no decode.
             let mut min_doc = u32::MAX;
+            let mut block_bound = doc_id_end;
             for c in cursors.iter().take(f_essential) {
                 if !c.is_exhausted() {
                     min_doc = min_doc.min(c.current_doc_id());
+                    block_bound = block_bound.min(c.current_block_last_doc_id().saturating_add(1));
                 }
             }
             if min_doc == u32::MAX || min_doc >= doc_id_end {
                 break;
             }
-            let ws = if adaptive { window_size } else { OR_WINDOW };
-            let base = min_doc & !(ws - 1);
-            let window_end = base.saturating_add(ws).min(doc_id_end);
+            // 64-align the base for the presence bitmask; cap the span at the
+            // buffer size. `adaptive` widens to a fixed OR_WINDOW slab (the old
+            // behaviour) for A/B comparison.
+            let base = min_doc & !63;
+            let window_end = if adaptive {
+                base.saturating_add(OR_WINDOW).min(doc_id_end)
+            } else {
+                block_bound
+                    .min(base.saturating_add(OR_WINDOW))
+                    .min(doc_id_end)
+            };
 
             // Accumulate the essential terms' contributions into the window
             // (SIMD OR-sum; scalar tail). Identical to the windowed-union body,
@@ -1703,11 +1717,14 @@ impl FtsReader {
             // essentials and the probed non-essentials borrow disjointly.
             let non_ess_ub = partial_max[f_essential];
             let (_, non_ess) = cursors.split_at_mut(f_essential);
-            let mut candidates: u32 = 0;
-            for (word_idx, word) in present.iter_mut().enumerate() {
+            // Only the words the window actually spans carry presence bits;
+            // with block-aligned windows this is a handful, not all 64.
+            let words = ((window_end - base) as usize)
+                .div_ceil(64)
+                .min(OR_WINDOW_WORDS);
+            for (word_idx, word) in present[..words].iter_mut().enumerate() {
                 let mut bits = *word;
                 *word = 0;
-                candidates += bits.count_ones();
                 while bits != 0 {
                     let b = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
@@ -1743,15 +1760,6 @@ impl FtsReader {
                         heap.push(TopKEntry(score, doc));
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                     }
-                }
-            }
-
-            // Diagnostic adaptive window: dense shrinks, sparse grows.
-            if adaptive {
-                if candidates * 2 >= ws {
-                    window_size = (ws / 2).max(MIN_WINDOW);
-                } else if candidates * 8 < ws {
-                    window_size = (ws * 2).min(OR_WINDOW);
                 }
             }
         }
