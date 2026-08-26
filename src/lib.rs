@@ -188,6 +188,9 @@ pub use supertable::{
     Consistency, GcError, GcReport, MutationStats, OptimizeError, query::vector::VectorFilter,
 };
 
+// Windowed-maxscore tail diagnostic (measurement branch only; not for merge).
+pub use superfile::fts::reader::{wms_diag_dump, wms_diag_reset};
+
 /// Convenience builders for test fixtures. Visible to:
 ///   - Unit tests (via `cfg(test)` — always on for `cargo test`)
 ///   - Integration tests (via `cargo test --features test-helpers`,

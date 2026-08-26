@@ -22,6 +22,45 @@ use crate::superfile::{
     fts::{bm25, posting::BLOCK_LEN},
 };
 
+// ---- windowed-maxscore tail diagnostic (measurement branch only; not for merge) ----
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+pub static WMS_WINDOWS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8]; // by f_essential
+pub static WMS_F1_DOCS: AtomicU64 = AtomicU64::new(0); // candidates walked in f==1 leader path
+pub static WMS_WIN_DOCS: AtomicU64 = AtomicU64::new(0); // candidates drained in windowed path
+pub static WMS_ESS_POSTINGS: AtomicU64 = AtomicU64::new(0); // essential postings accumulated
+pub static WMS_ESS_BLOCKS_SKIPPED: AtomicU64 = AtomicU64::new(0); // essential blocks block-max-skipped
+pub static WMS_NONESS_PROBES: AtomicU64 = AtomicU64::new(0); // non-essential bitset probes (both paths)
+pub static WMS_INVOCATIONS: AtomicU64 = AtomicU64::new(0); // run_windowed_maxscore calls
+
+pub fn wms_diag_reset() {
+    for a in WMS_WINDOWS.iter() {
+        a.store(0, Relaxed);
+    }
+    for a in [
+        &WMS_F1_DOCS,
+        &WMS_WIN_DOCS,
+        &WMS_ESS_POSTINGS,
+        &WMS_ESS_BLOCKS_SKIPPED,
+        &WMS_NONESS_PROBES,
+        &WMS_INVOCATIONS,
+    ] {
+        a.store(0, Relaxed);
+    }
+}
+
+pub fn wms_diag_dump() {
+    let w: Vec<u64> = WMS_WINDOWS.iter().map(|a| a.load(Relaxed)).collect();
+    eprintln!(
+        "WMS_DIAG invs={} f_windows={w:?} f1_docs={} win_docs={} ess_postings={} ess_blocks_skipped={} noness_probes={}",
+        WMS_INVOCATIONS.load(Relaxed),
+        WMS_F1_DOCS.load(Relaxed),
+        WMS_WIN_DOCS.load(Relaxed),
+        WMS_ESS_POSTINGS.load(Relaxed),
+        WMS_ESS_BLOCKS_SKIPPED.load(Relaxed),
+        WMS_NONESS_PROBES.load(Relaxed),
+    );
+}
+
 /// Left-pack control table: for each 8-bit survivor mask, the lane indices that
 /// gather the set lanes to the front (for `permutevar8x32`). Unset trailing
 /// slots are don't-cares (the store advances only by `popcount(mask)`).
@@ -1632,10 +1671,12 @@ impl FtsReader {
         // block-max skip below.
         let total_term_ub = partial_max[0];
 
+        WMS_INVOCATIONS.fetch_add(1, Relaxed);
         loop {
             // Continuous partition: recompute the essential set from the live
             // threshold. `threshold` only rises, so `f_essential` only shrinks.
             let f_essential = recompute_f(&partial_max, threshold);
+            WMS_WINDOWS[f_essential.min(7)].fetch_add(1, Relaxed);
 
             // f==1 fast path: a single dominant essential. Process its blocks
             // per-candidate (block-skip + non-essential completion) with no
@@ -1664,6 +1705,7 @@ impl FtsReader {
                     && c0.current_doc_id() < doc_id_end
                 {
                     let candidate = c0.current_doc_id();
+                    WMS_F1_DOCS.fetch_add(1, Relaxed);
                     if let Some(f) = filter.as_deref_mut()
                         && !f.admits(candidate)
                     {
@@ -1697,6 +1739,7 @@ impl FtsReader {
                     let mut packed = 1;
                     let mut score = 0.0f32;
                     for c in non_ess.iter_mut() {
+                        WMS_NONESS_PROBES.fetch_add(1, Relaxed);
                         if let Some(tf) = c.bitset_probe_tf(candidate) {
                             idfs[packed] = c.idf_x_k1p1;
                             tfs[packed] = tf as f32;
@@ -1789,6 +1832,7 @@ impl FtsReader {
                         let block_ub =
                             c.current_block_max_bm25() + (total_term_ub - c.term_max_bm25);
                         if block_ub <= threshold {
+                            WMS_ESS_BLOCKS_SKIPPED.fetch_add(1, Relaxed);
                             let last = c.current_block_last_doc_id();
                             c.skip_to(last.saturating_add(1));
                             continue;
@@ -1868,6 +1912,7 @@ impl FtsReader {
                     win_scores.push(score);
                 }
             }
+            WMS_WIN_DOCS.fetch_add(win_docs.len() as u64, Relaxed);
 
             // Complete the non-essentials over the compacted survivors. Once
             // the heap is full, do it the reference way: strongest non-essential
