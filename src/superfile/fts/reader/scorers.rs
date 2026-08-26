@@ -22,6 +22,20 @@ use crate::superfile::{
     fts::{bm25, posting::BLOCK_LEN},
 };
 
+/// Census override (measurement branch only; not for merge). `INFINO_FORCE_OR_ALGO`
+/// forces the OR kernel past the router: `bmm` | `windowed` | `wms`
+/// (windowed-maxscore) | else the router. Read once.
+fn or_algo_census_override() -> Option<u8> {
+    use std::sync::OnceLock;
+    static OVERRIDE: OnceLock<Option<u8>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| match std::env::var("INFINO_FORCE_OR_ALGO").as_deref() {
+        Ok("bmm") => Some(0),
+        Ok("windowed") => Some(1),
+        Ok("wms") => Some(2),
+        _ => None,
+    })
+}
+
 /// Intersection cardinality by a rarest-driven membership walk: iterate the
 /// term with the fewest blocks and count docs the others all contain. Each
 /// membership probe is `TermCursor::contains`, which bit-tests a bitset
@@ -1795,6 +1809,19 @@ impl FtsReader {
         filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
+        // Census override (measurement branch only; not for merge).
+        match or_algo_census_override() {
+            Some(0) => return self.run_max_score_bmm(column_id, cursors, k, filter, floor_eff),
+            Some(1) => {
+                return self
+                    .run_windowed_union(column_id, cursors, k, filter, floor_eff, 0, u32::MAX);
+            }
+            Some(2) => {
+                return self
+                    .run_windowed_maxscore(column_id, cursors, k, filter, floor_eff, 0, u32::MAX);
+            }
+            _ => {}
+        }
         // Route on upper-bound *spread*, not term count: when no single
         // term dominates, MaxScore's essential set never shrinks and it
         // degrades to scoring the whole union with per-doc f-way merge
