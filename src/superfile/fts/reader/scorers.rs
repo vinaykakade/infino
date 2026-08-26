@@ -1541,6 +1541,71 @@ impl FtsReader {
                 recompute_f(&partial_max, threshold)
             };
 
+            // f==1 fast path: a single dominant essential. Process its blocks
+            // per-candidate (block-skip + non-essential completion) with no
+            // window buffer — the windowed accumulate/drain has no advantage
+            // when the candidate set is one term's postings, and this matches
+            // MaxScore's f==1 path on small-k dominant queries.
+            if f_essential == 1 {
+                if cursors[0].is_exhausted() || cursors[0].current_doc_id() >= doc_id_end {
+                    break;
+                }
+                // Skip the whole block if it cannot beat threshold.
+                if heap.len() >= k {
+                    let block_ub = cursors[0].current_block_max_bm25()
+                        + (total_term_ub - cursors[0].term_max_bm25);
+                    if block_ub <= threshold {
+                        let end = cursors[0].current_block_last_doc_id();
+                        cursors[0].skip_to(end.saturating_add(1));
+                        continue;
+                    }
+                }
+                let block_end = cursors[0].current_block_last_doc_id();
+                let non_ess_ub = partial_max[1];
+                let (ess, non_ess) = cursors.split_at_mut(1);
+                let c0 = &mut ess[0];
+                while !c0.is_exhausted()
+                    && c0.current_doc_id() <= block_end
+                    && c0.current_doc_id() < doc_id_end
+                {
+                    let candidate = c0.current_doc_id();
+                    if let Some(f) = filter.as_deref_mut()
+                        && !f.admits(candidate)
+                    {
+                        c0.next();
+                        continue;
+                    }
+                    let norm = dl_norm_k1.get(candidate);
+                    let mut score =
+                        bm25::score_with_dl_norm_k1(c0.idf_x_k1p1, c0.current_tf(), norm);
+                    if !non_ess.is_empty() && (heap.len() < k || score + non_ess_ub > threshold) {
+                        for c in non_ess.iter_mut() {
+                            if let Some(tf) = c.bitset_probe_tf(candidate) {
+                                score += bm25::score_with_dl_norm_k1(c.idf_x_k1p1, tf, norm);
+                            }
+                        }
+                    }
+                    if heap.len() < k {
+                        heap.push(TopKEntry(score, candidate));
+                        if heap.len() == k {
+                            threshold = heap.peek().expect("non-empty").0.max(threshold);
+                        }
+                    } else if score > threshold {
+                        heap.pop();
+                        heap.push(TopKEntry(score, candidate));
+                        threshold = heap.peek().expect("non-empty").0.max(threshold);
+                    }
+                    c0.next();
+                    // Once the threshold rises past the single essential's own
+                    // UB, f drops to 0 (nothing more can qualify) — stop the
+                    // block scan and let the outer loop terminate.
+                    if recompute_f(&partial_max, threshold) != 1 {
+                        break;
+                    }
+                }
+                continue;
+            }
+
             // Candidates come from the essential terms only.
             let mut min_doc = u32::MAX;
             for c in cursors.iter().take(f_essential) {
