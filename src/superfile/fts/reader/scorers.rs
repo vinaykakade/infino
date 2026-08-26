@@ -36,6 +36,88 @@ fn or_algo_census_override() -> Option<u8> {
     })
 }
 
+/// Left-pack control table: for each 8-bit survivor mask, the lane indices that
+/// gather the set lanes to the front (for `permutevar8x32`). Unset trailing
+/// slots are don't-cares (the store advances only by `popcount(mask)`).
+const fn build_left_pack() -> [[u8; 8]; 256] {
+    let mut t = [[0u8; 8]; 256];
+    let mut m = 0usize;
+    while m < 256 {
+        let mut out = 0usize;
+        let mut b = 0usize;
+        while b < 8 {
+            if (m >> b) & 1 == 1 {
+                t[m][out] = b as u8;
+                out += 1;
+            }
+            b += 1;
+        }
+        m += 1;
+    }
+    t
+}
+static LEFT_PACK: [[u8; 8]; 256] = build_left_pack();
+
+/// Compact `(docs, scores)` in place to the entries with `score >= min_score`,
+/// preserving order; returns the survivor count. The competitive filter from
+/// Lucene `VectorUtil.filterByScore` / IResearch `FilterCompetitiveHits`.
+fn filter_survivors(docs: &mut [u32], scores: &mut [f32], min_score: f32) -> usize {
+    debug_assert_eq!(docs.len(), scores.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 is present (checked above); all loads/stores are
+            // unaligned and bounded to `[0, n)`; the store window `[out, out+8)`
+            // never precedes an unread source (out <= i, data is register-held
+            // before the store), so the in-place left-pack cannot corrupt a
+            // not-yet-read lane.
+            return unsafe { filter_survivors_avx2(docs, scores, min_score) };
+        }
+    }
+    let mut out = 0usize;
+    for i in 0..docs.len() {
+        let keep = scores[i] >= min_score;
+        docs[out] = docs[i];
+        scores[out] = scores[i];
+        out += keep as usize;
+    }
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_survivors_avx2(docs: &mut [u32], scores: &mut [f32], min_score: f32) -> usize {
+    use std::arch::x86_64::*;
+    let n = docs.len();
+    let thr = _mm256_set1_ps(min_score);
+    let dptr = docs.as_mut_ptr();
+    let sptr = scores.as_mut_ptr();
+    let mut out = 0usize;
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let vs = _mm256_loadu_ps(sptr.add(i));
+        let vd = _mm256_loadu_si256(dptr.add(i) as *const __m256i);
+        let mask = _mm256_movemask_ps(_mm256_cmp_ps(vs, thr, _CMP_GE_OQ)) as usize;
+        let ctrl =
+            _mm256_cvtepu8_epi32(_mm_loadl_epi64(LEFT_PACK[mask].as_ptr() as *const __m128i));
+        _mm256_storeu_ps(sptr.add(out), _mm256_permutevar8x32_ps(vs, ctrl));
+        _mm256_storeu_si256(
+            dptr.add(out) as *mut __m256i,
+            _mm256_permutevar8x32_epi32(vd, ctrl),
+        );
+        out += (mask as u32).count_ones() as usize;
+        i += 8;
+    }
+    while i < n {
+        let keep = *sptr.add(i) >= min_score;
+        *dptr.add(out) = *dptr.add(i);
+        *sptr.add(out) = *sptr.add(i);
+        out += keep as usize;
+        i += 1;
+    }
+    out
+}
+
 /// Intersection cardinality by a rarest-driven membership walk: iterate the
 /// term with the fewest blocks and count docs the others all contain. Each
 /// membership probe is `TermCursor::contains`, which bit-tests a bitset
@@ -1524,6 +1606,10 @@ impl FtsReader {
         let mut threshold: f32 = floor_eff.max(0.0);
         let mut scores = vec![0.0f32; OR_WINDOW as usize];
         let mut present = [0u64; OR_WINDOW_WORDS];
+        // Compacted per-window candidate list (doc + essential score), reused;
+        // the drain fills it, the SIMD filter compacts it to survivors.
+        let mut win_docs: Vec<u32> = Vec::with_capacity(OR_WINDOW as usize);
+        let mut win_scores: Vec<f32> = Vec::with_capacity(OR_WINDOW as usize);
         // Sum of every term's UB — the reference for the essential-side
         // block-max skip below.
         let total_term_ub = partial_max[0];
@@ -1712,16 +1798,18 @@ impl FtsReader {
                 }
             }
 
-            // Drain ascending. Complete the non-essentials per surviving
-            // candidate, then offer to the heap. Split so the (already-walked)
-            // essentials and the probed non-essentials borrow disjointly.
+            // Drain the presence bitmask into a compacted, ascending
+            // `(doc, essential-score)` list (dropping negated docs), then run
+            // the reference pipeline: SIMD-filter to competitive survivors,
+            // complete the non-essentials over the survivors only, collect.
             let non_ess_ub = partial_max[f_essential];
             let (_, non_ess) = cursors.split_at_mut(f_essential);
-            // Only the words the window actually spans carry presence bits;
-            // with block-aligned windows this is a handful, not all 64.
+            let heap_full = heap.len() >= k;
             let words = ((window_end - base) as usize)
                 .div_ceil(64)
                 .min(OR_WINDOW_WORDS);
+            win_docs.clear();
+            win_scores.clear();
             for (word_idx, word) in present[..words].iter_mut().enumerate() {
                 let mut bits = *word;
                 *word = 0;
@@ -1729,37 +1817,50 @@ impl FtsReader {
                     let b = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
                     let local = (word_idx << 6) | b;
-                    let mut score = scores[local];
-                    scores[local] = 0.0;
                     let doc = base + local as u32;
+                    let score = std::mem::take(&mut scores[local]);
                     if let Some(f) = filter.as_deref_mut()
                         && !f.admits(doc)
                     {
                         continue;
                     }
-                    // Complete the non-essentials only when the doc could still
-                    // reach top-k: while the heap is filling (every doc enters),
-                    // or when even the non-essential term-max UB can lift it over
-                    // threshold. Otherwise its essential-only score is final and
-                    // the heap gate below rejects it.
-                    if !non_ess.is_empty() && (heap.len() < k || score + non_ess_ub > threshold) {
-                        let norm = dl_norm_k1.get(doc);
-                        for c in non_ess.iter_mut() {
-                            if let Some(tf) = c.bitset_probe_tf(doc) {
-                                score += bm25::score_with_dl_norm_k1(c.idf_x_k1p1, tf, norm);
-                            }
+                    win_docs.push(doc);
+                    win_scores.push(score);
+                }
+            }
+
+            // SIMD competitive filter: once the heap is full, keep only docs
+            // whose essential score can still reach threshold with the whole
+            // non-essential budget. (While filling, every doc must be admitted.)
+            if heap_full && !non_ess.is_empty() {
+                let survivors =
+                    filter_survivors(&mut win_docs, &mut win_scores, threshold - non_ess_ub);
+                win_docs.truncate(survivors);
+                win_scores.truncate(survivors);
+            }
+
+            // Complete the non-essentials over the (compacted, ascending)
+            // survivors, then collect. `win_docs` is ascending, so both the
+            // probes and the heap admission keep MaxScore's order.
+            for (idx, &doc) in win_docs.iter().enumerate() {
+                let mut score = win_scores[idx];
+                if !non_ess.is_empty() {
+                    let norm = dl_norm_k1.get(doc);
+                    for c in non_ess.iter_mut() {
+                        if let Some(tf) = c.bitset_probe_tf(doc) {
+                            score += bm25::score_with_dl_norm_k1(c.idf_x_k1p1, tf, norm);
                         }
                     }
-                    if heap.len() < k {
-                        heap.push(TopKEntry(score, doc));
-                        if heap.len() == k {
-                            threshold = heap.peek().expect("non-empty").0.max(threshold);
-                        }
-                    } else if score > threshold {
-                        heap.pop();
-                        heap.push(TopKEntry(score, doc));
+                }
+                if heap.len() < k {
+                    heap.push(TopKEntry(score, doc));
+                    if heap.len() == k {
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                     }
+                } else if score > threshold {
+                    heap.pop();
+                    heap.push(TopKEntry(score, doc));
+                    threshold = heap.peek().expect("non-empty").0.max(threshold);
                 }
             }
         }
