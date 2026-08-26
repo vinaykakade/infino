@@ -2449,6 +2449,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn windowed_maxscore_agrees_with_bmm_randomized() {
+        // Deterministic fuzz (xorshift): many corpora with varied per-term
+        // densities and random multi-term shapes across k. The continuous
+        // partition must produce the identical top-k as MaxScore+BMM in every
+        // case — this exercises regime combinations the fixed corpora miss.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let vocab = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        for trial in 0..12u32 {
+            // Sometimes span more than one OR_WINDOW (4096 docs).
+            let n_docs = 500 + (rng() % 5000) as u32;
+            // Per-term inclusion probability (out of 8) — varied densities.
+            let probs: Vec<u64> = (0..vocab.len()).map(|_| 1 + rng() % 8).collect();
+            let tok = Arc::new(AsciiLowerTokenizer);
+            let mut b = FtsBuilder::new(tok);
+            b.register_column("body".into(), false).expect("register");
+            for i in 0..n_docs {
+                let mut text = String::new();
+                for (t, term) in vocab.iter().enumerate() {
+                    if rng() % 8 < probs[t] {
+                        let tf = 1 + rng() % 3;
+                        for _ in 0..tf {
+                            text.push_str(term);
+                            text.push(' ');
+                        }
+                    }
+                }
+                if text.is_empty() {
+                    text.push('a');
+                }
+                b.add_doc(0, i, text.trim()).expect("add doc");
+            }
+            let blob = Bytes::from(b.finish().expect("finish"));
+            let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+            let r = FtsReader::open(blob, json).expect("open");
+            for _ in 0..4 {
+                let nt = 2 + (rng() % 4) as usize;
+                let mut terms: Vec<&str> = Vec::new();
+                for _ in 0..nt {
+                    let t = vocab[(rng() % vocab.len() as u64) as usize];
+                    if !terms.contains(&t) {
+                        terms.push(t);
+                    }
+                }
+                if terms.len() < 2 {
+                    continue;
+                }
+                for k in [1usize, 7, 100, 1000] {
+                    let bmm = r
+                        .search_with_algo_for_bench("body", &terms, k, OrAlgo::Bmm)
+                        .await
+                        .expect("bmm");
+                    let wms = r
+                        .search_with_algo_for_bench("body", &terms, k, OrAlgo::WindowedMaxscore)
+                        .await
+                        .expect("wms");
+                    assert_eq!(bmm.len(), wms.len(), "trial {trial} {terms:?} k={k} len");
+                    for ((db, sb), (dw, sw)) in bmm.iter().zip(wms.iter()) {
+                        assert_eq!(db, dw, "trial {trial} {terms:?} k={k} doc {db} vs {dw}");
+                        assert!(
+                            (sb - sw).abs() < 1e-4,
+                            "trial {trial} {terms:?} k={k} score {sb} vs {sw}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn wand_bmw_2term_no_floor_agrees_with_bmm() {
         // The small-k 2-term production path (`run_wand_bmw`) must return
         // the identical top-k as MaxScore+BMM on the same inputs, across k.
