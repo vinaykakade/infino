@@ -1527,11 +1527,19 @@ impl FtsReader {
         // Sum of every term's UB — the reference for the essential-side
         // block-max skip below.
         let total_term_ub = partial_max[0];
+        // Measurement-only: force every term essential to isolate the base
+        // accumulate/drain (should then match run_windowed_union) from the
+        // non-essential completion overhead.
+        let force_all_ess = std::env::var("INFINO_WMS_ALL_ESS").is_ok();
 
         loop {
             // Continuous partition: recompute the essential set from the live
             // threshold. `threshold` only rises, so `f_essential` only shrinks.
-            let f_essential = recompute_f(&partial_max, threshold);
+            let f_essential = if force_all_ess {
+                n
+            } else {
+                recompute_f(&partial_max, threshold)
+            };
 
             // Candidates come from the essential terms only.
             let mut min_doc = u32::MAX;
