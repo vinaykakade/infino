@@ -118,6 +118,36 @@ unsafe fn filter_survivors_avx2(docs: &mut [u32], scores: &mut [f32], min_score:
     out
 }
 
+/// Add one non-essential term's contribution to `scores[i]` for every survivor
+/// `docs[i]` the term contains, scoring matches in SIMD batches (the
+/// IResearch `ScoreCandidates` idea). `docs` must be ascending — `bitset_probe_tf`
+/// advances the cursor monotonically. Only touches matched survivors.
+fn score_noness_batched(c: &mut TermCursor, docs: &[u32], scores: &mut [f32], dl_norm: &NormTable) {
+    const L: usize = bm25::SCORE_SIMD_LANES;
+    let mut n = 0usize;
+    let mut bidx = [0usize; L];
+    let mut btf = [0u32; L];
+    let mut bnorm = [0f32; L];
+    for (i, &doc) in docs.iter().enumerate() {
+        if let Some(tf) = c.bitset_probe_tf(doc) {
+            bidx[n] = i;
+            btf[n] = tf;
+            bnorm[n] = dl_norm.get(doc);
+            n += 1;
+            if n == L {
+                let contrib = bm25::score_one_term_x4(c.idf_x_k1p1, btf, bnorm);
+                for l in 0..L {
+                    scores[bidx[l]] += contrib[l];
+                }
+                n = 0;
+            }
+        }
+    }
+    for l in 0..n {
+        scores[bidx[l]] += bm25::score_with_dl_norm_k1(c.idf_x_k1p1, btf[l], bnorm[l]);
+    }
+}
+
 /// Intersection cardinality by a rarest-driven membership walk: iterate the
 /// term with the fewest blocks and count docs the others all contain. Each
 /// membership probe is `TermCursor::contains`, which bit-tests a bitset
@@ -1829,29 +1859,35 @@ impl FtsReader {
                 }
             }
 
-            // SIMD competitive filter: once the heap is full, keep only docs
-            // whose essential score can still reach threshold with the whole
-            // non-essential budget. (While filling, every doc must be admitted.)
+            // Complete the non-essentials over the compacted survivors. Once
+            // the heap is full, do it the reference way: strongest non-essential
+            // first, re-filtering the survivor list (progressively tighter
+            // budget) before each and batch-scoring matches — so weaker terms
+            // touch a shrinking survivor set. While filling, every doc must be
+            // admitted, so score all non-essentials over every candidate.
+            let _ = non_ess_ub;
             if heap_full && !non_ess.is_empty() {
-                let survivors =
-                    filter_survivors(&mut win_docs, &mut win_scores, threshold - non_ess_ub);
-                win_docs.truncate(survivors);
-                win_scores.truncate(survivors);
+                let nn = non_ess.len();
+                for jj in 0..nn {
+                    // Max score still obtainable from non-essentials jj..nn.
+                    let bar = threshold - partial_max[f_essential + jj];
+                    let sv = filter_survivors(&mut win_docs, &mut win_scores, bar);
+                    win_docs.truncate(sv);
+                    win_scores.truncate(sv);
+                    if win_docs.is_empty() {
+                        break;
+                    }
+                    score_noness_batched(&mut non_ess[jj], &win_docs, &mut win_scores, dl_norm_k1);
+                }
+            } else {
+                for c in non_ess.iter_mut() {
+                    score_noness_batched(c, &win_docs, &mut win_scores, dl_norm_k1);
+                }
             }
 
-            // Complete the non-essentials over the (compacted, ascending)
-            // survivors, then collect. `win_docs` is ascending, so both the
-            // probes and the heap admission keep MaxScore's order.
+            // Collect the fully-scored candidates (ascending doc order).
             for (idx, &doc) in win_docs.iter().enumerate() {
-                let mut score = win_scores[idx];
-                if !non_ess.is_empty() {
-                    let norm = dl_norm_k1.get(doc);
-                    for c in non_ess.iter_mut() {
-                        if let Some(tf) = c.bitset_probe_tf(doc) {
-                            score += bm25::score_with_dl_norm_k1(c.idf_x_k1p1, tf, norm);
-                        }
-                    }
-                }
+                let score = win_scores[idx];
                 if heap.len() < k {
                     heap.push(TopKEntry(score, doc));
                     if heap.len() == k {
