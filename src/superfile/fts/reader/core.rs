@@ -279,6 +279,11 @@ pub enum OrAlgo {
     /// merge; wins when no term dominates and the union is large (the
     /// MaxScore-can't-prune case).
     Windowed,
+    /// Windowed MaxScore: the windowed OR-sum with a per-window
+    /// essential/non-essential split recomputed from the live threshold,
+    /// so one kernel covers both the dense (all-essential OR-sum) and
+    /// selective (pruned) regimes without an a-priori route.
+    WindowedMaxscore,
 }
 
 /// Doc-id window for the windowed union scorer. Power of two so the
