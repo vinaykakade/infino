@@ -1524,6 +1524,9 @@ impl FtsReader {
         let mut threshold: f32 = floor_eff.max(0.0);
         let mut scores = vec![0.0f32; OR_WINDOW as usize];
         let mut present = [0u64; OR_WINDOW_WORDS];
+        // Sum of every term's UB — the reference for the essential-side
+        // block-max skip below.
+        let total_term_ub = partial_max[0];
 
         loop {
             // Continuous partition: recompute the essential set from the live
@@ -1551,6 +1554,22 @@ impl FtsReader {
                     let d = c.current_doc_id();
                     if d >= window_end {
                         break;
+                    }
+                    // Block-max skip: once the heap is full (threshold is a
+                    // real k-th score), skip a whole block whose docs cannot
+                    // beat it even carrying every other term at its term-max —
+                    // the bound per-candidate MaxScore uses, applied to the
+                    // essential accumulate so the dense OR-sum still prunes at
+                    // small k. It never fires while the heap is filling, so a
+                    // doc that must be admitted is never dropped.
+                    if heap.len() >= k {
+                        let block_ub =
+                            c.current_block_max_bm25() + (total_term_ub - c.term_max_bm25);
+                        if block_ub <= threshold {
+                            let last = c.current_block_last_doc_id();
+                            c.skip_to(last.saturating_add(1));
+                            continue;
+                        }
                     }
                     let pos = c.pos;
                     if pos + bm25::SCORE_SIMD_LANES <= c.block_n {
@@ -1813,12 +1832,26 @@ impl FtsReader {
         match or_algo_census_override() {
             Some(0) => return self.run_max_score_bmm(column_id, cursors, k, filter, floor_eff),
             Some(1) => {
-                return self
-                    .run_windowed_union(column_id, cursors, k, filter, floor_eff, 0, u32::MAX);
+                return self.run_windowed_union(
+                    column_id,
+                    cursors,
+                    k,
+                    filter,
+                    floor_eff,
+                    0,
+                    u32::MAX,
+                );
             }
             Some(2) => {
-                return self
-                    .run_windowed_maxscore(column_id, cursors, k, filter, floor_eff, 0, u32::MAX);
+                return self.run_windowed_maxscore(
+                    column_id,
+                    cursors,
+                    k,
+                    filter,
+                    floor_eff,
+                    0,
+                    u32::MAX,
+                );
             }
             _ => {}
         }
