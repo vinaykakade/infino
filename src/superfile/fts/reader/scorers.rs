@@ -22,38 +22,6 @@ use crate::superfile::{
     fts::{bm25, posting::BLOCK_LEN},
 };
 
-/// Census override (measurement branch only; not for merge). `INFINO_FORCE_OR_ALGO`
-/// forces the OR kernel past the router: `bmm` | `windowed` | `wms`
-/// (windowed-maxscore) | else the router. Read once.
-fn or_algo_census_override() -> Option<u8> {
-    use std::sync::OnceLock;
-    static OVERRIDE: OnceLock<Option<u8>> = OnceLock::new();
-    *OVERRIDE.get_or_init(|| match std::env::var("INFINO_FORCE_OR_ALGO").as_deref() {
-        Ok("bmm") => Some(0),
-        Ok("windowed") => Some(1),
-        Ok("wms") => Some(2),
-        _ => None,
-    })
-}
-
-// Diagnostic (measurement branch only): windowed-maxscore f_essential histogram
-// and per-path doc counts, to see whether a query collapses to the leader path.
-pub static WMS_F_WINDOWS: [std::sync::atomic::AtomicU64; 8] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
-pub static WMS_F1_DOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static WMS_WIN_DOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Print the windowed-maxscore f_essential histogram to stderr.
-pub fn wms_diag_dump() {
-    use std::sync::atomic::Ordering::Relaxed;
-    let h: Vec<u64> = WMS_F_WINDOWS.iter().map(|a| a.load(Relaxed)).collect();
-    eprintln!(
-        "WMS_DIAG f_windows(f=0..7+)={h:?} f1_docs={} windowed_docs={}",
-        WMS_F1_DOCS.load(Relaxed),
-        WMS_WIN_DOCS.load(Relaxed)
-    );
-}
-
 /// Left-pack control table: for each 8-bit survivor mask, the lane indices that
 /// gather the set lanes to the front (for `permutevar8x32`). Unset trailing
 /// slots are don't-cares (the store advances only by `popcount(mask)`).
@@ -1663,23 +1631,11 @@ impl FtsReader {
         // Sum of every term's UB — the reference for the essential-side
         // block-max skip below.
         let total_term_ub = partial_max[0];
-        // Measurement-only: force every term essential to isolate the base
-        // accumulate/drain (should then match run_windowed_union) from the
-        // non-essential completion overhead.
-        let force_all_ess = std::env::var("INFINO_WMS_ALL_ESS").is_ok();
-        // Diagnostic: `adaptive` reverts to a fixed OR_WINDOW slab (old
-        // behaviour) for A/B vs the default block-max-aligned windows.
-        let adaptive = std::env::var("INFINO_WMS_ADAPTIVE").is_ok();
 
         loop {
             // Continuous partition: recompute the essential set from the live
             // threshold. `threshold` only rises, so `f_essential` only shrinks.
-            let f_essential = if force_all_ess {
-                n
-            } else {
-                recompute_f(&partial_max, threshold)
-            };
-            WMS_F_WINDOWS[f_essential.min(7)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let f_essential = recompute_f(&partial_max, threshold);
 
             // f==1 fast path: a single dominant essential. Process its blocks
             // per-candidate (block-skip + non-essential completion) with no
@@ -1799,17 +1755,14 @@ impl FtsReader {
             if min_doc == u32::MAX || min_doc >= doc_id_end {
                 break;
             }
-            // 64-align the base for the presence bitmask; cap the span at the
-            // buffer size. `adaptive` widens to a fixed OR_WINDOW slab (the old
-            // behaviour) for A/B comparison.
+            // 64-align the base for the presence bitmask, then end the window at
+            // the nearest essential block boundary (so the threshold updates
+            // per-block and the essential set can collapse early), capped at the
+            // score-buffer width.
             let base = min_doc & !63;
-            let window_end = if adaptive {
-                base.saturating_add(OR_WINDOW).min(doc_id_end)
-            } else {
-                block_bound
-                    .min(base.saturating_add(OR_WINDOW))
-                    .min(doc_id_end)
-            };
+            let window_end = block_bound
+                .min(base.saturating_add(OR_WINDOW))
+                .min(doc_id_end);
 
             // Accumulate the essential terms' contributions into the window
             // (SIMD OR-sum; scalar tail). Identical to the windowed-union body,
@@ -1915,7 +1868,6 @@ impl FtsReader {
                     win_scores.push(score);
                 }
             }
-            WMS_WIN_DOCS.fetch_add(win_docs.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
             // Complete the non-essentials over the compacted survivors. Once
             // the heap is full, do it the reference way: strongest non-essential
@@ -2125,58 +2077,25 @@ impl FtsReader {
         filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        // Census override (measurement branch only; not for merge).
-        match or_algo_census_override() {
-            Some(0) => return self.run_max_score_bmm(column_id, cursors, k, filter, floor_eff),
-            Some(1) => {
-                return self.run_windowed_union(
-                    column_id,
-                    cursors,
-                    k,
-                    filter,
-                    floor_eff,
-                    0,
-                    u32::MAX,
-                );
-            }
-            Some(2) => {
-                return self.run_windowed_maxscore(
-                    column_id,
-                    cursors,
-                    k,
-                    filter,
-                    floor_eff,
-                    0,
-                    u32::MAX,
-                );
-            }
-            _ => {}
-        }
-        // Route on upper-bound *spread*, not term count: when no single
-        // term dominates, MaxScore's essential set never shrinks and it
-        // degrades to scoring the whole union with per-doc f-way merge
-        // overhead — the windowed union scorer is dramatically faster
-        // there. A dominant-term query stays on MaxScore, which prunes
-        // hard (its block-skip / f→1 fast path); windowing would lose by
-        // scoring every windowed doc.
-        // A 2-term OR of one rare + one common term is a worst case for
-        // MaxScore: it scores the common term's long posting list end to
-        // end. WAND+BMW pivots on the rare (short) term and skips most of
-        // the common term's list — a large win. For two comparable-length
-        // common terms there is no short anchor to skip on, so WAND's
-        // per-iteration cursor re-sort just adds overhead and MaxScore
-        // wins; those fall through. Route 2-term ORs to WAND only when
-        // (a) one list is much shorter than the other (df ratio,
-        // `two_term_has_rare_anchor`); (b) k is small — at large k the
-        // top-k threshold is too low for WAND to prune; (c) no negation —
-        // `run_wand_bmw` applies no exclude filter; and (d) no
-        // cross-segment floor (`floor_eff` unset) — seeding WAND's
-        // threshold from a floor mis-prunes, so a live floor stays on
-        // MaxScore.
-        // A 2-term rare+common OR goes to WAND+BMW (it pivots on the rare
-        // term); otherwise MaxScore by default, and the windowed scan only
-        // where pruning is dead — see `route_or_to_windowed`. WAND takes no
-        // filter or floor, so a negated / floored query skips it.
+        // A 2-term OR of one rare + one common term is a worst case for a
+        // union scan: it walks the common term's long posting list end to end.
+        // WAND+BMW pivots on the rare (short) term and skips most of the common
+        // term's list — a large win. For two comparable-length common terms
+        // there is no short anchor to skip on, so WAND's per-iteration cursor
+        // re-sort is pure overhead; those fall through. Route a 2-term OR to
+        // WAND only when (a) one list is much shorter than the other (df ratio,
+        // `two_term_has_rare_anchor`); (b) k is small — at large k the top-k
+        // threshold is too low for WAND to prune; (c) no negation —
+        // `run_wand_bmw` applies no exclude filter; and (d) no cross-segment
+        // floor — seeding WAND's threshold from a floor mis-prunes.
+        //
+        // Everything else runs the one windowed MaxScore union kernel. Its
+        // essential/non-essential partition is continuous in the running k-th
+        // threshold: when a term dominates it degenerates to a per-candidate
+        // leader scan (block-max pruning, the dominant-term fast path); when no
+        // term dominates it stays a windowed SIMD OR-sum across the essential
+        // block. One kernel therefore covers both the sparse-selective and the
+        // uniform-common regimes with no cross-over routing to tune.
         let no_floor = floor_eff == f32::NEG_INFINITY;
         if cursors.len() == 2
             && k <= WAND_BMW_2TERM_MAX_K
@@ -2185,10 +2104,8 @@ impl FtsReader {
             && two_term_has_rare_anchor(&cursors)
         {
             self.run_wand_bmw(column_id, cursors, k)
-        } else if route_or_to_windowed(&cursors, k) {
-            self.run_windowed_union(column_id, cursors, k, filter, floor_eff, 0, u32::MAX)
         } else {
-            self.run_max_score_bmm(column_id, cursors, k, filter, floor_eff)
+            self.run_windowed_maxscore(column_id, cursors, k, filter, floor_eff, 0, u32::MAX)
         }
     }
 
@@ -2539,35 +2456,12 @@ mod tests {
         let blob = Bytes::from(b.finish().expect("finish"));
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
-        let col = r.resolve_column_id("body").expect("col");
-        let uniform_terms: &[&str] = &["zeta", "eta", "theta"];
-        let uniform_cursors = r
-            .build_term_cursors(col, uniform_terms, None, false)
-            .await
-            .expect("uniform cursors");
-        // Phase 1 routing is k-gated: the common-heavy (equal-upper-bound)
-        // shape stays on the pruning MaxScore path at small/mid k, and only
-        // falls to the windowed scan at deep k (past the pruning cutoff),
-        // where MaxScore can no longer prune it.
-        for k in [1usize, 5, 16, OR_WINDOWED_UNIFORM_MAX_PRUNING_K] {
-            assert!(
-                !route_or_to_windowed(&uniform_cursors, k),
-                "common-heavy OR at k={k} (<= cutoff) should route to MaxScore"
-            );
-        }
-        for k in [OR_WINDOWED_UNIFORM_MAX_PRUNING_K + 1, 1000] {
-            assert!(
-                route_or_to_windowed(&uniform_cursors, k),
-                "common-heavy OR at deep k={k} should route to the windowed scan"
-            );
-        }
-
         let shapes: &[&[&str]] = &[
             &["alpha", "beta"],
             &["alpha", "beta", "gamma"],
             &["beta", "gamma", "delta"], // no single dominator
             &["alpha", "beta", "gamma", "delta", "epsilon"],
-            uniform_terms,
+            &["zeta", "eta", "theta"], // uniform-common (no dominator)
         ];
         for terms in shapes {
             for k in [1usize, 5, 50, 1000] {
@@ -2866,6 +2760,80 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn windowed_maxscore_ranged_agrees_with_bmm_range() {
+        // The ranged fan-out entry now runs this same kernel over a doc-id
+        // sub-window. Driven over explicit sub-ranges (including a
+        // window-boundary-crossing slice), it must match per-candidate
+        // MaxScore+BMM restricted to the identical window — a sliced query
+        // returns exactly the docs in its slice, scored identically.
+        const N_DOCS: u32 = OR_WINDOW * 2 + 777;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("alpha ");
+            if i % 2 == 0 {
+                text.push_str("beta ");
+            }
+            if i % 3 == 0 {
+                text.push_str("gamma ");
+            }
+            if i % 6 == 0 {
+                text.push_str("delta ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let col = r.resolve_column_id("body").expect("col");
+        let terms: &[&str] = &["alpha", "beta", "gamma", "delta"];
+        let ranges: &[(u32, u32)] = &[
+            (0, N_DOCS),
+            (1000, OR_WINDOW + 2000), // crosses a window boundary
+            (OR_WINDOW, OR_WINDOW + 300),
+        ];
+        for &(lo, hi) in ranges {
+            for k in [1usize, 10, 100] {
+                let wms = r
+                    .run_windowed_maxscore(
+                        col,
+                        r.build_term_cursors(col, terms, None, false)
+                            .await
+                            .expect("cursors"),
+                        k,
+                        None,
+                        f32::NEG_INFINITY,
+                        lo,
+                        hi,
+                    )
+                    .expect("wms ranged");
+                let bmm = r
+                    .run_max_score_bmm_range(
+                        col,
+                        r.build_term_cursors(col, terms, None, false)
+                            .await
+                            .expect("cursors"),
+                        k,
+                        lo,
+                        hi,
+                        None,
+                        f32::NEG_INFINITY,
+                    )
+                    .expect("bmm ranged");
+                assert_eq!(wms.len(), bmm.len(), "len [{lo},{hi}) k={k}");
+                for ((dw, sw), (db, sb)) in wms.iter().zip(bmm.iter()) {
+                    assert_eq!(dw, db, "doc [{lo},{hi}) k={k}: wms={dw} bmm={db}");
+                    assert!(
+                        (sw - sb).abs() < 1e-4,
+                        "score [{lo},{hi}) k={k}: {sw} vs {sb}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn filter_survivors_compacts_in_order() {
         // The competitive filter keeps entries scoring >= min_score, preserves
@@ -2997,64 +2965,6 @@ mod tests {
         assert!(
             !two_term_has_rare_anchor(&uniform),
             "two common terms should not anchor"
-        );
-    }
-
-    #[test]
-    fn deep_k_dominant_union_reroutes_only_when_list_is_long() {
-        // The deep-k reroute to the windowed scorer fires only when
-        // pruning is dead (k reaches the rarer terms' combined df) AND the
-        // dominant list is long enough to amortize the window setup.
-        const LONG: u64 = 3_000_000; // dominant common term
-        const RARE: u64 = 500; // rare second term
-        let total = LONG + RARE;
-
-        // Deep k (>= rest_df) over a long dominant list: reroute.
-        assert!(
-            or_reroute_by_df(LONG, total, 2, 1000),
-            "deep k over a long dominant list should reroute to windowed"
-        );
-        // Shallow k (< rest_df): the rare term still fills the heap, pruning
-        // is alive, stay on MaxScore.
-        assert!(
-            !or_reroute_by_df(LONG, total, 2, 100),
-            "k below the rare term's df keeps pruning alive → MaxScore"
-        );
-        // Exact boundary k == rest_df: the heap needs one doc beyond the
-        // rare term's list, so pruning is already dead → reroute (the test
-        // is `>=`, so the boundary counts).
-        assert!(
-            or_reroute_by_df(LONG, total, 2, RARE as usize),
-            "k exactly at rest_df should reroute"
-        );
-        // One below the boundary (k == rest_df - 1): rare term still fills
-        // the heap, stay on MaxScore.
-        assert!(
-            !or_reroute_by_df(LONG, total, 2, RARE as usize - 1),
-            "k just below rest_df keeps pruning alive → MaxScore"
-        );
-        // Long list but only one term: not an OR.
-        assert!(
-            !or_reroute_by_df(LONG, LONG, 1, 1000),
-            "single term is not a union"
-        );
-        // Small union (dominant list below the floor): too little work to
-        // amortize the window; stay on MaxScore even at deep k. This is the
-        // case that regressed before the floor was added.
-        let small = OR_WINDOWED_MIN_DOMINANT_DF - 1;
-        assert!(
-            !or_reroute_by_df(small, small + RARE, 2, 1_000_000),
-            "a union below the dominant-df floor must not reroute"
-        );
-        // Exactly at the floor with deep k: reroute.
-        assert!(
-            or_reroute_by_df(
-                OR_WINDOWED_MIN_DOMINANT_DF,
-                OR_WINDOWED_MIN_DOMINANT_DF + RARE,
-                2,
-                1000
-            ),
-            "at the dominant-df floor a deep-k union reroutes"
         );
     }
 
