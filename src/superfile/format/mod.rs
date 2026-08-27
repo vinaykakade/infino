@@ -100,6 +100,21 @@ pub mod fts {
     /// write and read must agree on the scale.
     pub const BLOCK_MAX_BM25_FIXED_POINT_SCALE: f32 = 1000.0;
 
+    /// Number of consecutive posting blocks summarised by one entry of
+    /// a term's coarse block-max table. The table sits at the tail of a
+    /// PFOR term's postings region: `ceil(num_blocks / this)` fixed-point
+    /// `u32`s, each the max of its span's per-block `max_bm25_x1000`.
+    ///
+    /// It gives the ranked single-term walk a second, coarser skip level:
+    /// when the running k-th-best score already dominates a whole span's
+    /// upper bound, the walk jumps the span in one comparison instead of
+    /// touching each block's skip entry. On a very long, heavily-skipped
+    /// posting list (a common term at small k) the per-block skip scan is
+    /// itself the dominant cost; the coarse level removes ~31/32 of it.
+    /// The span is a coarse-max of already-`ceil`-quantised block bounds,
+    /// so it stays a true upper bound and the top-k is unchanged.
+    pub const COARSE_BLOCK_MAX_SPAN: usize = 32;
+
     /// Total FTS blob header size in bytes for [`VERSION_V1_LEGACY`] (no
     /// positions). The FST directory begins immediately after this
     /// fixed-size header.

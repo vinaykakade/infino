@@ -3700,8 +3700,17 @@ fn encode_and_emit_term<W: Write>(
             Some(_) => num_blocks as usize * entries_per_block * format::fts::U32_BYTES,
             None => 0,
         };
-        let postings_length =
-            (term_meta_size + skip_table_size + subindex_size + blocks_total_size) as u64;
+        // Coarse block-max table at the tail of the term region: one
+        // fixed-point u32 per `COARSE_BLOCK_MAX_SPAN` blocks (the span's
+        // max block-max), giving the ranked walk a second skip level.
+        // Appended last so no existing block offset moves.
+        let num_coarse = (num_blocks as usize).div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN);
+        let coarse_table_size = num_coarse * format::fts::U32_BYTES;
+        let postings_length = (term_meta_size
+            + skip_table_size
+            + subindex_size
+            + blocks_total_size
+            + coarse_table_size) as u64;
 
         // Walk the runs once, recording where each 128-doc block's first
         // run starts (the skip table's per-block offset) and, every
@@ -3782,6 +3791,13 @@ fn encode_and_emit_term<W: Write>(
         // Blocks follow the meta, the skip table, and the (V3-only)
         // position sub-index, so their offsets start past all three.
         let mut block_offset: u32 = (term_meta_size + skip_table_size + subindex_size) as u32;
+        // Coarse span-maxes, filled alongside the per-block skip entries
+        // and appended after the blocks below. Each entry is the max of
+        // its span's `max_bm25_x1000`, so it is a true upper bound over
+        // the span (a max of already-`ceil`-quantised block bounds).
+        let mut coarse_maxes: Vec<u32> = Vec::with_capacity(num_coarse);
+        let mut span_max: u32 = 0;
+        let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
         let skip_write_start = profile.enabled.then(Instant::now);
         for (i, blk) in encoded_blocks.iter().enumerate() {
             let max_bm25 = block_ub_per_block[i];
@@ -3803,7 +3819,14 @@ fn encode_and_emit_term<W: Write>(
             let pos_block_off = pos_block_offsets.get(i).copied().unwrap_or(0);
             term_buf.extend_from_slice(&pos_block_off.to_le_bytes());
             block_offset += blk.bytes.len() as u32;
+
+            span_max = span_max.max(max_bm25_x1000);
+            if (i + 1).is_multiple_of(coarse_span) || i + 1 == encoded_blocks.len() {
+                coarse_maxes.push(span_max);
+                span_max = 0;
+            }
         }
+        debug_assert_eq!(coarse_maxes.len(), num_coarse);
         if let Some(start) = skip_write_start {
             profile.encode_skip_write += start.elapsed();
         }
@@ -3817,6 +3840,10 @@ fn encode_and_emit_term<W: Write>(
         let block_write_start = profile.enabled.then(Instant::now);
         for blk in encoded_blocks.iter() {
             term_buf.extend_from_slice(&blk.bytes);
+        }
+        // Coarse block-max table: the term region's tail.
+        for &cm in &coarse_maxes {
+            term_buf.extend_from_slice(&cm.to_le_bytes());
         }
         debug_assert_eq!(term_buf.len(), postings_length as usize);
         write_counted(postings_writer, postings_crc_acc, postings_len, term_buf)?;

@@ -8,6 +8,8 @@
 //! Its own `impl FtsReader` block, split from the reader `core`.
 
 use std::collections::BinaryHeap;
+use std::env;
+use std::sync::OnceLock;
 
 use rustc_hash::FxHashMap;
 
@@ -30,6 +32,7 @@ use crate::{
     superfile::{
         ReadError,
         error::FtsError,
+        format,
         fts::{
             bm25,
             dict::{DictReader, make_key},
@@ -38,6 +41,21 @@ use crate::{
         },
     },
 };
+
+/// Benchmark kill-switch for the coarse block-max skip level. Default
+/// on; `INFINO_FTS_COARSE_SKIP=0` falls back to the flat per-block walk
+/// so an A/B can measure the coarse level from one binary and one index
+/// (the unused coarse table at the tail costs nothing when off). Read
+/// once. Prototype-only — the shipped path would not gate on an env var.
+fn coarse_skip_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            env::var("INFINO_FTS_COARSE_SKIP").as_deref(),
+            Ok("0") | Ok("false") | Ok("FALSE")
+        )
+    })
+}
 
 impl FtsReader {
     /// Ranked search over heterogeneous atoms — the walk every
@@ -845,7 +863,38 @@ impl FtsReader {
         let mut buf_d = vec![0u32; BLOCK_LEN];
         let mut buf_t = vec![0u32; BLOCK_LEN];
 
-        for i in 0..term_meta.num_blocks {
+        // Two skip levels. The coarse table bounds a whole span of
+        // `COARSE_BLOCK_MAX_SPAN` blocks with a single entry, so a span
+        // the running k-th-best already dominates is jumped in one
+        // comparison instead of one skip-entry read per block. On a long,
+        // heavily-skipped list (a common term at small k) that per-block
+        // scan is the dominant cost; the coarse level removes ~31/32 of
+        // it. Inside a span that might qualify, the walk falls back to
+        // the per-block bar — identical decisions, identical top-k.
+        let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
+        let coarse_enabled = coarse_skip_enabled();
+        let mut i = 0usize;
+        while i < term_meta.num_blocks {
+            if coarse_enabled && i.is_multiple_of(coarse_span) {
+                let coarse_max = term_meta.coarse_entry(postings, i / coarse_span);
+                let span_end = (i + coarse_span).min(term_meta.num_blocks);
+                // Floor skip, span-wide: nothing in the span reaches the
+                // caller's floor.
+                if coarse_max <= floor_eff {
+                    i = span_end;
+                    continue;
+                }
+                // BMW skip, span-wide: heap full AND no block in the span
+                // can beat the kth-best.
+                if heap.len() >= k
+                    && let Some(TopKEntry(min_score, _)) = heap.peek()
+                    && coarse_max <= *min_score
+                {
+                    i = span_end;
+                    continue;
+                }
+            }
+
             // last_doc_id (first tuple slot) is unused here — it serves
             // AND-merge seeks, which single-term never does.
             let (_, block_offset_in_term, block_max_bm25) = term_meta.skip_entry(postings, i);
@@ -853,6 +902,7 @@ impl FtsReader {
             // Floor skip: nothing in this block can reach the caller's
             // floor — dead regardless of local heap state.
             if block_max_bm25 <= floor_eff {
+                i += 1;
                 continue;
             }
             // BMW skip: heap full AND this block can't beat the kth-best.
@@ -860,6 +910,7 @@ impl FtsReader {
                 && let Some(TopKEntry(min_score, _)) = heap.peek()
                 && block_max_bm25 <= *min_score
             {
+                i += 1;
                 continue;
             }
 
@@ -896,6 +947,7 @@ impl FtsReader {
                     heap.push(TopKEntry(score, doc_id));
                 }
             }
+            i += 1;
         }
 
         Ok((
