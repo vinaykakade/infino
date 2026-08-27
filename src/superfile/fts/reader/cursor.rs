@@ -669,6 +669,104 @@ impl TermCursor {
         Some(self.block_tfs[rank as usize])
     }
 
+    /// No-expansion tf read for a run of **ascending** `docs`, invoking
+    /// `hit(i, tf)` for each present doc (by its index `i` in `docs`). Batched
+    /// form of [`Self::bitset_probe_tf`]: within one bitset block it parses the
+    /// header once and advances a **running rank** word-by-word (each presence
+    /// word popcounted once), instead of re-parsing the header and re-scanning
+    /// the presence prefix from word 0 on every probe — the per-probe cost that
+    /// dominates the ranked-OR non-essential completion on wide, dense blocks.
+    /// PACKED blocks and the inline (df=1) cursor have no rank shortcut, so
+    /// those docs fall back to `bitset_probe_tf` per doc. Advances
+    /// `current_block` like `bitset_probe_tf`; a cursor driven this way must not
+    /// also be iterated. Bit-for-bit identical tf to `bitset_probe_tf`.
+    pub(super) fn probe_tf_run(&mut self, docs: &[u32], mut hit: impl FnMut(usize, u32)) {
+        // Per-block incremental-rank state, valid while `state_block ==
+        // current_block` and `is_bitset`.
+        let mut state_block = usize::MAX;
+        let mut is_bitset = false;
+        let mut base = 0u32;
+        let mut block_start = 0usize;
+        let mut presence_end = 0usize; // absolute offset in self.bytes where presence ends
+        let mut acc_rank = 0u32; // popcount of presence words [0, scan_word)
+        let mut scan_word = 0usize;
+
+        for (i, &doc) in docs.iter().enumerate() {
+            while self.current_block < self.blocks.len()
+                && self.blocks[self.current_block].last_doc_id < doc
+            {
+                self.current_block += 1;
+            }
+            if self.current_block >= self.blocks.len() {
+                return;
+            }
+            if state_block != self.current_block {
+                state_block = self.current_block;
+                acc_rank = 0;
+                scan_word = 0;
+                let block = self.blocks[self.current_block];
+                block_start = block.block_byte_offset;
+                let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+                is_bitset = !self.bytes.is_empty()
+                    && raw[posting::ENCODING_OFF] == posting::ENCODING_BITSET;
+                if is_bitset {
+                    base = read_u32_le(&raw[4..8]);
+                    let tf_bits = raw[2] as usize;
+                    let tfs_size = BLOCK_LEN * tf_bits / 8;
+                    presence_end = block.block_byte_offset + (raw.len() - tfs_size);
+                }
+            }
+            if !is_bitset {
+                // PACKED / inline: no rank shortcut. Fall back per doc, then
+                // invalidate the cached state (bitset_probe_tf may re-advance).
+                if let Some(tf) = self.bitset_probe_tf(doc) {
+                    hit(i, tf);
+                }
+                state_block = usize::MAX;
+                continue;
+            }
+            if doc < base {
+                continue; // absent: doc falls in a gap before this block
+            }
+            let bit = (doc - base) as usize;
+            let word_idx = bit / 64;
+            let word_at = block_start + posting::HEADER_SIZE + word_idx * 8;
+            if word_at + 8 > presence_end {
+                continue; // past this block's presence bits ⇒ absent
+            }
+            // Advance the running rank to `word_idx` (each word popcounted once
+            // across the run), then bit-test and rank within the target word.
+            let presence_base = block_start + posting::HEADER_SIZE;
+            let rank = {
+                let bytes = &self.bytes;
+                while scan_word < word_idx {
+                    let at = presence_base + scan_word * 8;
+                    let w = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
+                    acc_rank += w.count_ones();
+                    scan_word += 1;
+                }
+                let word =
+                    u64::from_le_bytes(bytes[word_at..word_at + 8].try_into().expect("8 bytes"));
+                if (word >> (bit % 64)) & 1 == 0 {
+                    continue; // doc not present in this block
+                }
+                let below = if bit.is_multiple_of(64) {
+                    0u64
+                } else {
+                    (1u64 << (bit % 64)) - 1
+                };
+                acc_rank + (word & below).count_ones()
+            };
+            if self.tf_decoded_block != self.current_block {
+                let block = self.blocks[self.current_block];
+                let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+                posting::decode_block_tfs(raw, &mut self.block_tfs);
+                self.tf_decoded_block = self.current_block;
+            }
+            hit(i, self.block_tfs[rank as usize]);
+        }
+    }
+
     pub(super) fn is_exhausted(&self) -> bool {
         self.current_block >= self.blocks.len()
     }

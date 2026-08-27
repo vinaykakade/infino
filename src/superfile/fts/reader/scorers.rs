@@ -130,27 +130,29 @@ unsafe fn filter_survivors_avx2(docs: &mut [u32], scores: &mut [f32], min_score:
 /// monotonically. Only touches matched survivors.
 fn score_noness_batched(c: &mut TermCursor, docs: &[u32], scores: &mut [f32], dl_norm: &NormTable) {
     const L: usize = bm25::SCORE_SIMD_LANES;
+    let idf_x_k1p1 = c.idf_x_k1p1;
     let mut n = 0usize;
     let mut bidx = [0usize; L];
     let mut btf = [0u32; L];
     let mut bnorm = [0f32; L];
-    for (i, &doc) in docs.iter().enumerate() {
-        if let Some(tf) = c.bitset_probe_tf(doc) {
-            bidx[n] = i;
-            btf[n] = tf;
-            bnorm[n] = dl_norm.get(doc);
-            n += 1;
-            if n == L {
-                let contrib = bm25::score_one_term_x4(c.idf_x_k1p1, btf, bnorm);
-                for l in 0..L {
-                    scores[bidx[l]] += contrib[l];
-                }
-                n = 0;
+    // `probe_tf_run` walks the ascending survivors once, amortizing the
+    // popcount-rank across each bitset block; matched docs are collected into
+    // SIMD-width groups and scored together.
+    c.probe_tf_run(docs, |i, tf| {
+        bidx[n] = i;
+        btf[n] = tf;
+        bnorm[n] = dl_norm.get(docs[i]);
+        n += 1;
+        if n == L {
+            let contrib = bm25::score_one_term_x4(idf_x_k1p1, btf, bnorm);
+            for l in 0..L {
+                scores[bidx[l]] += contrib[l];
             }
+            n = 0;
         }
-    }
+    });
     for l in 0..n {
-        scores[bidx[l]] += bm25::score_with_dl_norm_k1(c.idf_x_k1p1, btf[l], bnorm[l]);
+        scores[bidx[l]] += bm25::score_with_dl_norm_k1(idf_x_k1p1, btf[l], bnorm[l]);
     }
 }
 
@@ -2320,6 +2322,96 @@ mod tests {
             cursor.bitset_probe_tf(165),
             Some(2),
             "tf at doc 165 (bit 165, presence word 2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_tf_run_matches_per_doc_bitset_probe() {
+        // `probe_tf_run` is the batched form of `bitset_probe_tf`: it amortizes
+        // the popcount-rank across an ascending run (each presence word
+        // popcounted once) instead of re-scanning the presence prefix per doc.
+        // It must return bit-identical tf. Plant `common` at doc 0 then densely
+        // over a wide range spanning multiple blocks — the leading gap widens
+        // the deltas so the blocks take the bitset encoding, and the range
+        // pushes the presence bitset across several 64-bit words — then compare
+        // the two paths over *every* doc id (present, absent, word boundaries,
+        // block boundaries, and ids past the last block).
+        const N: u32 = 460;
+        // `common` carried here: doc 0, then dense over this range. Bits up to
+        // 430 ⇒ ~7 presence words; >128 postings ⇒ more than one block.
+        const DENSE_LO: u32 = 200;
+        const DENSE_HI: u32 = 430;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false)
+            .expect("register column");
+        for id in 0..N {
+            let carries = id == 0 || (DENSE_LO..=DENSE_HI).contains(&id);
+            let text = if carries {
+                // A genuine per-doc tf spread so a wrong rank lands on a wrong tf.
+                match id % 3 {
+                    0 => "common common common",
+                    1 => "common",
+                    _ => "common common",
+                }
+            } else {
+                "filler" // exists but does not carry `common`
+            };
+            b.add_doc(0, id, text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        // Premise guard: multiple blocks, at least one bitset-encoded.
+        {
+            let cs = r
+                .build_term_cursors(0, &["common"], None, false)
+                .await
+                .expect("cursor");
+            let c = &cs[0];
+            assert!(
+                c.blocks.len() >= 2,
+                "term must span multiple blocks (got {})",
+                c.blocks.len()
+            );
+            let any_bitset = c
+                .blocks
+                .iter()
+                .any(|blk| c.bytes[blk.block_byte_offset + ENCODING_OFF] == ENCODING_BITSET);
+            assert!(any_bitset, "at least one block must be bitset-encoded");
+        }
+
+        let docs: Vec<u32> = (0..N).collect();
+        // Per-doc reference.
+        let mut per_doc: Vec<Option<u32>> = Vec::with_capacity(N as usize);
+        {
+            let mut cs = r
+                .build_term_cursors(0, &["common"], None, false)
+                .await
+                .expect("cursor");
+            let c = &mut cs[0];
+            for &d in &docs {
+                per_doc.push(c.bitset_probe_tf(d));
+            }
+        }
+        // Batched.
+        let mut batched: Vec<Option<u32>> = vec![None; N as usize];
+        {
+            let mut cs = r
+                .build_term_cursors(0, &["common"], None, false)
+                .await
+                .expect("cursor");
+            let c = &mut cs[0];
+            c.probe_tf_run(&docs, |i, tf| batched[i] = Some(tf));
+        }
+        assert_eq!(
+            batched, per_doc,
+            "probe_tf_run must match per-doc bitset_probe_tf on every doc"
+        );
+        assert!(
+            per_doc.iter().any(|t| t.is_some()),
+            "test planted no matches — corpus is not exercising the probe"
         );
     }
 
