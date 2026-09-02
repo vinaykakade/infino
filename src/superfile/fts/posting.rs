@@ -150,7 +150,16 @@ pub fn encode_block(b: &Block) -> EncodedBlock {
 
     let bp = BitPacker4x::new();
     let delta_bits = bp.num_bits_sorted(base_doc_id, &padded_doc_ids);
-    let tf_bits = bp.num_bits(&padded_tfs);
+    // All-ones tf (every real doc has tf 1 — common for content terms) is
+    // stored as a 0-byte tf sub-block: `tf_bits == 0` is the sentinel (a real
+    // block always needs `tf_bits >= 1`), and the decoder fills tf 1 without
+    // reading any bytes. Otherwise pack at the block's needed width.
+    let all_ones_tf = b.tfs.iter().all(|&t| t == 1);
+    let tf_bits = if all_ones_tf {
+        0
+    } else {
+        bp.num_bits(&padded_tfs)
+    };
 
     let deltas_size = BLOCK_LEN * delta_bits as usize / 8;
     let tfs_size = BLOCK_LEN * tf_bits as usize / 8;
@@ -207,14 +216,17 @@ pub fn encode_block(b: &Block) -> EncodedBlock {
         );
     }
 
-    // Packed tfs — identical in both encodings, in doc order.
-    let tfs_start = bytes.len();
-    bytes.resize(tfs_start + tfs_size, 0);
-    bp.compress(
-        &padded_tfs,
-        &mut bytes[tfs_start..tfs_start + tfs_size],
-        tf_bits,
-    );
+    // Packed tfs — identical in both doc-id encodings, in doc order. Omitted
+    // entirely for an all-ones tf block (`tf_bits == 0`, `tfs_size == 0`).
+    if tf_bits != 0 {
+        let tfs_start = bytes.len();
+        bytes.resize(tfs_start + tfs_size, 0);
+        bp.compress(
+            &padded_tfs,
+            &mut bytes[tfs_start..tfs_start + tfs_size],
+            tf_bits,
+        );
+    }
 
     EncodedBlock {
         bytes,
@@ -248,6 +260,11 @@ pub fn decode_block(bytes: &[u8], dest_doc_ids: &mut [u32], dest_tfs: &mut [u32]
     );
     let tf_bits = bytes[2];
     assert!(tf_bits <= 32, "decode_block: tf_bits {tf_bits} > 32");
+    // All-ones tf sentinel (V6): no tf bytes; every doc's tf is 1.
+    if tf_bits == 0 {
+        dest_tfs[..BLOCK_LEN].fill(1);
+        return count;
+    }
     let tfs_size = BLOCK_LEN * tf_bits as usize / 8;
     assert!(
         bytes.len() >= HEADER_SIZE + tfs_size,
@@ -278,6 +295,11 @@ pub fn decode_block_tfs(bytes: &[u8], dest_tfs: &mut [u32]) {
     );
     let tf_bits = bytes[2];
     assert!(tf_bits <= 32, "decode_block_tfs: tf_bits {tf_bits} > 32");
+    // All-ones tf sentinel (V6): no tf bytes; every doc's tf is 1.
+    if tf_bits == 0 {
+        dest_tfs[..BLOCK_LEN].fill(1);
+        return;
+    }
     let tfs_size = BLOCK_LEN * tf_bits as usize / 8;
     assert!(
         bytes.len() >= HEADER_SIZE + tfs_size,

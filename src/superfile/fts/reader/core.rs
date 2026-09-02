@@ -522,6 +522,7 @@ impl FtsReader {
             && version != format::fts::VERSION_V3
             && version != format::fts::VERSION_V4
             && version != format::fts::VERSION_V5
+            && version != format::fts::VERSION_V6
         {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
@@ -536,7 +537,8 @@ impl FtsReader {
             v if v == format::fts::VERSION_V2
                 || v == format::fts::VERSION_V3
                 || v == format::fts::VERSION_V4
-                || v == format::fts::VERSION_V5 =>
+                || v == format::fts::VERSION_V5
+                || v == format::fts::VERSION_V6 =>
             {
                 format::fts::HEADER_SIZE_V2
             }
@@ -627,6 +629,7 @@ impl FtsReader {
             v if v == format::fts::VERSION_V3 => true,
             v if v == format::fts::VERSION_V4 => true,
             v if v == format::fts::VERSION_V5 => true,
+            v if v == format::fts::VERSION_V6 => true,
             _ => {
                 return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                     "fts section version {version}"
@@ -635,11 +638,14 @@ impl FtsReader {
         };
         let has_position_subindex = version == format::fts::VERSION_V3
             || version == format::fts::VERSION_V4
-            || version == format::fts::VERSION_V5;
-        let has_bitset_blocks =
-            version == format::fts::VERSION_V4 || version == format::fts::VERSION_V5;
-        // V5 appends a per-term coarse block-max table; V1–V4 do not.
-        let has_coarse_block_max = version == format::fts::VERSION_V5;
+            || version == format::fts::VERSION_V5
+            || version == format::fts::VERSION_V6;
+        let has_bitset_blocks = version == format::fts::VERSION_V4
+            || version == format::fts::VERSION_V5
+            || version == format::fts::VERSION_V6;
+        // V5 and V6 append a per-term coarse block-max table; V1–V4 do not.
+        let has_coarse_block_max =
+            version == format::fts::VERSION_V5 || version == format::fts::VERSION_V6;
         let header_size = match positional_blob {
             true => format::fts::HEADER_SIZE_V2,
             false => FTS_HEADER_SIZE,

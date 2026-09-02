@@ -3296,7 +3296,11 @@ fn assemble_and_write_blob<W: Write>(
     // suppressed (test-only), so the backwards-compat tests can produce a
     // genuine pre-086 blob.
     let fts_version = if write_coarse {
-        format::fts::VERSION_V5
+        // V6: same as V5 plus the per-block all-ones-tf encoding, which the
+        // block codec emits self-describingly (`tf_bits == 0`) whenever a block
+        // is all-tf-1. Always safe to stamp — a blob with no such block is a
+        // valid V6 that reads identically to V5.
+        format::fts::VERSION_V6
     } else if finish_profile.saw_bitset_block {
         format::fts::VERSION_V4
     } else if positions_region.1 > format::CRC_BYTES as u64 {
@@ -4210,9 +4214,9 @@ mod tests {
 
         // Magic.
         assert_eq!(&blob[0..8], format::fts::MAGIC);
-        // Version — new code always writes V5 (coarse block-max table).
+        // Version — new code always writes V6 (coarse table + all-ones-tf).
         let version = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]);
-        assert_eq!(version, format::fts::VERSION_V5);
+        assert_eq!(version, format::fts::VERSION_V6);
         // n_columns.
         let n_cols = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]);
         assert_eq!(n_cols, 1);
@@ -5004,7 +5008,7 @@ mod tests {
             ver(&legacy) < format::fts::VERSION_V5,
             "legacy must be < V5"
         );
-        assert_eq!(ver(&v5), format::fts::VERSION_V5);
+        assert_eq!(ver(&v5), format::fts::VERSION_V6);
 
         let r_legacy = FtsReader::open(legacy, title_json(false)).expect("legacy opens");
         let r_v5 = FtsReader::open(v5, title_json(false)).expect("v5 opens");
@@ -5180,7 +5184,7 @@ mod tests {
         let blob = bytes::Bytes::from(b.finish().expect("finish"));
         assert_eq!(
             u32::from_le_bytes(blob[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V5
+            format::fts::VERSION_V6
         );
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"},{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
         let r = FtsReader::open(blob, json).expect("open");

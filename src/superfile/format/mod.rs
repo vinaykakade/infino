@@ -91,6 +91,18 @@ pub mod fts {
     /// table), so existing indices read unchanged and need no reindex.
     pub const VERSION_V5: u32 = 5;
 
+    /// The version new code writes: everything `V5` allows **plus** a per-block
+    /// **all-ones tf** encoding. A posting block whose every doc has term
+    /// frequency 1 (common for content terms) stores a **0-byte** tf sub-block —
+    /// the header's `tf_bits` field is `0` (a real block always needs `tf_bits
+    /// >= 1`, so `0` is a free sentinel), and the reader fills tf 1 without
+    /// reading or decoding any tf bytes. Eliminates the tf sub-block's bytes and
+    /// SIMD decode on the scored path for all-tf-1 blocks. The encoding is
+    /// self-describing per block via `tf_bits == 0`; header + region layout are
+    /// otherwise identical to `V5`. Readers accept `V1`–`V6`; `V1`–`V5` blobs
+    /// never emit `tf_bits == 0`, so they read unchanged with no reindex.
+    pub const VERSION_V6: u32 = 6;
+
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
     /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.
