@@ -623,6 +623,13 @@ impl FtsReader {
             // Smallest-df cursor at index 0 = leader. Ascending-df order reduces
             // the expected number of leapfrog bumps per candidate.
             cursors.sort_by_key(|c| c.block_count());
+            // Score tf lazily: the flat-merge touches a common term's blocks to
+            // align doc ids, but at small k only a fraction contribute a scored
+            // match, so decode each block's tf only when a doc is actually
+            // scored (`tf_at`), not eagerly on every touched block.
+            for c in cursors.iter_mut() {
+                c.lazy_tfs = true;
+            }
             self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
         }
         Ok(drain_top_k_desc(heap))
@@ -988,11 +995,14 @@ impl FtsReader {
                 if all_match {
                     let score = if sink.needs_score() {
                         let norm = dl_norm_k1.get(a);
-                        let mut score =
-                            bm25::score_with_dl_norm_k1(c0.idf_x_k1p1, c0.block_tfs[i], norm);
-                        for o in others.iter() {
-                            score +=
-                                bm25::score_with_dl_norm_k1(o.idf_x_k1p1, o.block_tfs[o.pos], norm);
+                        // Lazy tf: decode each term's tf only now that the doc
+                        // is a confirmed match (see `TermCursor::tf_at`).
+                        let c0_tf = c0.tf_at(i);
+                        let mut score = bm25::score_with_dl_norm_k1(c0.idf_x_k1p1, c0_tf, norm);
+                        for o in others.iter_mut() {
+                            let idf = o.idf_x_k1p1;
+                            let tf = o.tf_at(o.pos);
+                            score += bm25::score_with_dl_norm_k1(idf, tf, norm);
                         }
                         score
                     } else {
@@ -1110,8 +1120,11 @@ impl FtsReader {
                 } else {
                     let score = if sink.needs_score() {
                         let norm = dl_norm_k1.get(a);
-                        bm25::score_with_dl_norm_k1(c0_idf, c0.block_tfs[i], norm)
-                            + bm25::score_with_dl_norm_k1(c1_idf, c1.block_tfs[j], norm)
+                        // Lazy tf: decode each term's tf only on a confirmed match.
+                        let t0 = c0.tf_at(i);
+                        let t1 = c1.tf_at(j);
+                        bm25::score_with_dl_norm_k1(c0_idf, t0, norm)
+                            + bm25::score_with_dl_norm_k1(c1_idf, t1, norm)
                     } else {
                         0.0
                     };

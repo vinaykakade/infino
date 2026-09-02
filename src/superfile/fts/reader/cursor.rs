@@ -414,6 +414,14 @@ pub(crate) struct TermCursor {
     /// without expanding the block's doc ids. Lets the probe reuse the
     /// decoded tfs across a run of candidates landing in the same block.
     pub(super) tf_decoded_block: usize,
+    /// When set, [`Self::decode_current_block`] decodes only the doc ids and
+    /// leaves the tf array for [`Self::tf_at`] to decode on first use — so a
+    /// block visited only for doc-id alignment or a non-matching merge step
+    /// never pays the tf decode. Set on the ranked-AND flat-merge cursors, where
+    /// at small k many touched blocks contribute few or no scored matches. Left
+    /// `false` for the union kernels, which read `block_tfs` SIMD-wide and so
+    /// want it eagerly filled.
+    pub(super) lazy_tfs: bool,
 }
 
 impl TermCursor {
@@ -500,6 +508,7 @@ impl TermCursor {
             count_only,
             decoded_block: usize::MAX,
             tf_decoded_block: usize::MAX,
+            lazy_tfs: false,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -561,6 +570,7 @@ impl TermCursor {
             count_only: false,
             decoded_block: 0,
             tf_decoded_block: 0,
+            lazy_tfs: false,
         }
     }
 
@@ -569,19 +579,38 @@ impl TermCursor {
         // Borrow in place rather than clone an owned `Bytes` (disjoint from the
         // `&mut self.block_*` decode targets, which are separate fields).
         let bytes = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        // Count-only cursors skip the tf half of the block; the count
-        // kernels never read `block_tfs`, so it is left stale.
-        self.block_n = match self.count_only {
-            true => decode_block_doc_ids(bytes, &mut self.block_doc_ids),
-            false => decode_block(bytes, &mut self.block_doc_ids, &mut self.block_tfs),
+        // Count-only cursors never read tf, and `lazy_tfs` cursors defer it to
+        // `tf_at` — both decode only the doc ids here; the tf half of the block
+        // stays stale until (and unless) a doc is actually scored.
+        let eager_tfs = !self.count_only && !self.lazy_tfs;
+        self.block_n = if eager_tfs {
+            decode_block(bytes, &mut self.block_doc_ids, &mut self.block_tfs)
+        } else {
+            decode_block_doc_ids(bytes, &mut self.block_doc_ids)
         };
         self.pos = 0;
         self.decoded_block = self.current_block;
-        // A non-count decode also fills `block_tfs` for this block, so the
-        // tf-only probe can reuse it without re-decoding.
-        if !self.count_only {
+        // An eager decode also fills `block_tfs` for this block, so the tf-only
+        // probe / `tf_at` can reuse it without re-decoding.
+        if eager_tfs {
             self.tf_decoded_block = self.current_block;
         }
+    }
+
+    /// Decode this block's tf array into `block_tfs` if it isn't already, then
+    /// return the tf at position `pos`. Lets the ranked-AND flat-merge decode
+    /// doc ids eagerly but pay the tf decode only for blocks that actually
+    /// contribute a scored match. A no-op re-fetch when the block's tfs are
+    /// already decoded (an eager cursor, or a second doc scored in the block).
+    #[inline]
+    pub(super) fn tf_at(&mut self, pos: usize) -> u32 {
+        if self.tf_decoded_block != self.current_block {
+            let block = self.blocks[self.current_block];
+            let bytes = &self.bytes[block.block_byte_offset..block.block_byte_end];
+            posting::decode_block_tfs(bytes, &mut self.block_tfs);
+            self.tf_decoded_block = self.current_block;
+        }
+        self.block_tfs[pos]
     }
 
     /// Membership probe: does this term contain `doc`? Advances the block
