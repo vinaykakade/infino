@@ -1281,6 +1281,37 @@ async fn oracle_long_doc_vs_short_doc_dl_norm() {
     assert_eq!(infino_top2, oracle_top2, "framework top-2 sets disagree");
 }
 
+#[tokio::test]
+async fn oracle_impact_bound_union_matches_brute_force() {
+    // Exercise the V6 per-candidate impact bound in the union walk. "common" is
+    // in every doc, with widely varying length, so a block-max set by a short
+    // doc is a loose bound for a long candidate; "rare" sits in five short docs
+    // of distinct lengths, giving a tie-free top-5. The impact-tightened
+    // non-essential bound (`common` is non-essential under `rare`) must still
+    // return the exact top-k, verified against ground-truth BM25.
+    let rare_docs = [3u64, 8, 15, 24, 35];
+    let mut corp: Vec<(u64, String)> = Vec::new();
+    for i in 0..600u64 {
+        let mut text = String::from("common");
+        if rare_docs.contains(&i) {
+            text.push_str(" rare");
+        }
+        // Distinct per-doc filler length spreads the length-norms wide within
+        // each posting block, so the impact bound diverges from the block-max.
+        for j in 0..(i % 50) {
+            text.push_str(&format!(" f{i}_{j}"));
+        }
+        corp.push((i, text));
+    }
+    let refs: Vec<(u64, &str)> = corp.iter().map(|(d, s)| (*d, s.as_str())).collect();
+    let infino = build_infino_superfile(&refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&refs, tok.as_ref());
+    for k in [10usize, 50, 200] {
+        assert_top_k_head_agrees(&infino, &oracle, "common rare", 5, k).await;
+    }
+}
+
 // ─── Multi-block AND oracles ──────────────────────────────────────────
 //
 // The 60-doc corpus above holds every term in a single PFOR block

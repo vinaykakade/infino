@@ -1227,6 +1227,10 @@ pub struct FtsBuilder {
     /// `false` to emit a legacy (V2–V4, no coarse) blob for the
     /// backwards-compatibility tests.
     write_coarse: bool,
+    /// Whether to write the V6 per-term block max-tf table (and stamp the blob
+    /// V6). Always `true` in production; the legacy backwards-compatibility
+    /// tests set it `false` (together with `write_coarse`) to emit a pre-V6 blob.
+    write_impacts: bool,
 }
 
 impl FtsBuilder {
@@ -1282,6 +1286,7 @@ impl FtsBuilder {
             run_scratch: Vec::new(),
             bump: Bump::new(),
             write_coarse: true,
+            write_impacts: true,
         }
     }
 
@@ -2408,6 +2413,7 @@ impl FtsBuilder {
             run_scratch: _,
             bump,
             write_coarse,
+            write_impacts,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -2525,6 +2531,7 @@ impl FtsBuilder {
                     &mut finish_profile,
                     &mut term_scratch,
                     write_coarse,
+                    write_impacts,
                 )?;
                 n_terms_total_usize += 1;
             }
@@ -2548,6 +2555,7 @@ impl FtsBuilder {
                 scratch_dir,
                 finish_profile,
                 write_coarse,
+                write_impacts,
             },
             &mut w,
         )
@@ -2579,6 +2587,7 @@ impl FtsBuilder {
             run_scratch: _,
             bump,
             write_coarse,
+            write_impacts,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -2730,6 +2739,7 @@ impl FtsBuilder {
                             &mut finish_profile,
                             &mut term_scratch,
                             write_coarse,
+                            write_impacts,
                         )?;
                         n_terms_total_usize += 1;
                     }
@@ -2876,6 +2886,7 @@ impl FtsBuilder {
                             &mut finish_profile,
                             &mut term_scratch,
                             write_coarse,
+                            write_impacts,
                         )?,
                         SpillStore::Positional { blobs, .. } => {
                             // mmap each partition's positions blob so
@@ -2913,6 +2924,7 @@ impl FtsBuilder {
                                 &mut finish_profile,
                                 &mut term_scratch,
                                 write_coarse,
+                                write_impacts,
                             )?
                         }
                     };
@@ -3008,6 +3020,7 @@ impl FtsBuilder {
                 scratch_dir,
                 finish_profile,
                 write_coarse,
+                write_impacts,
             },
             &mut w,
         )
@@ -3087,6 +3100,8 @@ struct BlobAssemblyInputs {
     /// Whether the per-term coarse block-max table was written (V5). When
     /// false the blob is a legacy V2–V4 (no coarse) — test-only.
     write_coarse: bool,
+    /// Whether the per-term block max-tf table was written (V6).
+    write_impacts: bool,
 }
 
 /// FST emission sink picked by the active finish path.
@@ -3129,6 +3144,7 @@ fn assemble_and_write_blob<W: Write>(
         scratch_dir,
         mut finish_profile,
         write_coarse,
+        write_impacts,
     } = inputs;
 
     debug_assert!(
@@ -3295,7 +3311,9 @@ fn assemble_and_write_blob<W: Write>(
     // The legacy ladder (V2/V3/V4) is written only when the coarse table is
     // suppressed (test-only), so the backwards-compat tests can produce a
     // genuine pre-086 blob.
-    let fts_version = if write_coarse {
+    let fts_version = if write_impacts {
+        format::fts::VERSION_V6
+    } else if write_coarse {
         format::fts::VERSION_V5
     } else if finish_profile.saw_bitset_block {
         format::fts::VERSION_V4
@@ -3442,6 +3460,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     finish_profile: &mut FinishProfile,
     term_scratch: &mut TermScratch,
     write_coarse: bool,
+    write_impacts: bool,
 ) -> Result<usize, BuildError> {
     let mmap_start = finish_profile.enabled.then(Instant::now);
     let mut mmaps: Vec<Mmap> = Vec::with_capacity(sorted_files.len());
@@ -3554,6 +3573,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
             finish_profile,
             term_scratch,
             write_coarse,
+            write_impacts,
         )?;
         n_emitted += 1;
     }
@@ -3595,6 +3615,7 @@ fn encode_and_emit_term<W: Write>(
     profile: &mut FinishProfile,
     scratch: &mut TermScratch,
     write_coarse: bool,
+    write_impacts: bool,
 ) -> Result<(), BuildError> {
     let encode_start = profile.enabled.then(Instant::now);
     profile.encode_calls += 1;
@@ -3739,11 +3760,20 @@ fn encode_and_emit_term<W: Write>(
             false => 0,
         };
         let coarse_table_size = num_coarse * format::fts::U32_BYTES;
+        // Per-block max-tf table (V6), one `u8` per block, after the coarse
+        // table. Lets the reader form a per-candidate-norm impact bound tighter
+        // than the block-max. Appended last so no existing offset moves.
+        let maxtf_table_size = if write_impacts {
+            num_blocks as usize
+        } else {
+            0
+        };
         let postings_length = (term_meta_size
             + skip_table_size
             + subindex_size
             + blocks_total_size
-            + coarse_table_size) as u64;
+            + coarse_table_size
+            + maxtf_table_size) as u64;
 
         // Walk the runs once, recording where each 128-doc block's first
         // run starts (the skip table's per-block offset) and, every
@@ -3884,6 +3914,19 @@ fn encode_and_emit_term<W: Write>(
         // Coarse block-max table: the term region's tail.
         for &cm in &coarse_maxes {
             term_buf.extend_from_slice(&cm.to_le_bytes());
+        }
+        // Per-block max-tf table (V6): one byte per block, the block's largest
+        // term frequency saturated at `BLOCK_MAX_TF_SATURATED` (the reader then
+        // falls back to the exact block-max for that block). Follows the coarse
+        // table; sized into `postings_length` above.
+        if write_impacts {
+            for blk in encoded_blocks.iter() {
+                let maxtf = blk
+                    .max_tf
+                    .min(u32::from(format::fts::BLOCK_MAX_TF_SATURATED))
+                    as u8;
+                term_buf.push(maxtf);
+            }
         }
         debug_assert_eq!(term_buf.len(), postings_length as usize);
         write_counted(postings_writer, postings_crc_acc, postings_len, term_buf)?;
@@ -4805,6 +4848,7 @@ mod tests {
         }
         // Legacy (no-coarse) blob — see `build_title_blob`.
         b.write_coarse = false;
+        b.write_impacts = false;
         b.register_column("title".into(), positional)
             .expect("register column");
         for (i, text) in docs.iter().enumerate() {
@@ -5039,6 +5083,7 @@ mod tests {
         // the reader's backwards-compatibility with it; the production V5
         // path is covered by the FTS integration suite.
         b.write_coarse = false;
+        b.write_impacts = false;
         b.register_column("title".into(), positional)
             .expect("register column");
         for (i, text) in docs.iter().enumerate() {

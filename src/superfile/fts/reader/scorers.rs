@@ -1815,16 +1815,19 @@ impl FtsReader {
                     let essential_score =
                         bm25::score_with_dl_norm_k1(c0.idf_x_k1p1, c0.current_tf(), norm);
                     // Bound the non-essentials at `candidate` by each one's
-                    // block-max for the block that *contains* it (monotonic
-                    // `shallow_advance` hint — amortized O(1), no decode), not by
-                    // its global term-max. Far tighter for a common term, so the
-                    // skip below fires on many more docs, dropping the completion
-                    // probe + heap work — the dominant per-doc cost on a dense
-                    // leader query.
+                    // per-block *impact* bound at the block that contains it
+                    // (monotonic `shallow_advance` hint — amortized O(1), no
+                    // decode). The impact bound scores that block's max tf at
+                    // `candidate`'s own length-norm, so for a long candidate it
+                    // is tighter than the block-max (which a short doc in the
+                    // block may set); the skip below then fires on more docs,
+                    // dropping the completion probe + heap work — the dominant
+                    // per-doc cost on a dense leader query. Falls back to the
+                    // block-max on pre-V6 blobs.
                     let mut others_ub = 0.0f32;
                     for c in non_ess.iter_mut() {
                         c.shallow_advance_block_to(candidate);
-                        others_ub += c.inspect_block_max_bm25();
+                        others_ub += c.inspect_block_impact_bound(norm);
                     }
                     if essential_score + others_ub <= threshold {
                         c0.next();

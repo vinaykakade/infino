@@ -65,12 +65,20 @@ pub(super) struct TermMeta {
     /// fixed-point `u32`s at the tail of the term region.
     pub(super) coarse_start: usize,
     /// Term-relative end of the last posting block: `postings_length`
-    /// minus the coarse table's bytes. The blocks end here; the coarse
-    /// table follows.
+    /// minus the coarse table's and (V6) max-tf table's bytes. The blocks
+    /// end here; the coarse table (then the max-tf table) follow.
     pub(super) blocks_end_in_term: usize,
     /// Whether this term carries a coarse block-max table (V5 blobs).
     /// `false` for V1–V4 — the ranked walk then skips the coarse level.
     pub(super) has_coarse: bool,
+    /// Absolute offset (within the postings region) of this term's per-block
+    /// max-tf table — `num_blocks` `u8`s at the very tail, after the coarse
+    /// table (V6 blobs). Meaningless when `has_impacts` is false.
+    pub(super) maxtf_start: usize,
+    /// Whether this term carries a per-block max-tf table (V6 blobs). `false`
+    /// for V1–V5 — the reader then uses the block-max as the only per-block
+    /// bound.
+    pub(super) has_impacts: bool,
 }
 
 impl TermMeta {
@@ -84,6 +92,7 @@ impl TermMeta {
         positional: bool,
         has_subindex: bool,
         has_coarse: bool,
+        has_impacts: bool,
     ) -> Result<Self, FtsError> {
         // Positional columns carry the extended 32-byte header (the
         // term's positions offset + length after `num_blocks`); the
@@ -166,13 +175,21 @@ impl TermMeta {
             true => num_blocks.div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN) * U32_BYTES,
             false => 0,
         };
-        if coarse_size > postings_length {
+        // Per-block max-tf table (V6 only): one `u8` per block at the very tail,
+        // after the coarse table. The blocks (and then the coarse table) end
+        // where it begins.
+        let maxtf_size = match has_impacts {
+            true => num_blocks,
+            false => 0,
+        };
+        if coarse_size + maxtf_size > postings_length {
             return Err(FtsError::Read(ReadError::MalformedVersion(
-                "coarse block-max table larger than the term region".into(),
+                "coarse block-max + max-tf tables larger than the term region".into(),
             )));
         }
-        let blocks_end_in_term = postings_length - coarse_size;
+        let blocks_end_in_term = postings_length - coarse_size - maxtf_size;
         let coarse_start = metadata_offset + blocks_end_in_term;
+        let maxtf_start = coarse_start + coarse_size;
         Ok(Self {
             df,
             num_blocks,
@@ -183,6 +200,8 @@ impl TermMeta {
             coarse_start,
             blocks_end_in_term,
             has_coarse,
+            maxtf_start,
+            has_impacts,
         })
     }
 
@@ -215,6 +234,18 @@ impl TermMeta {
     pub(super) fn coarse_entry(&self, postings: &[u8], g: usize) -> f32 {
         let at = self.coarse_start + g * U32_BYTES;
         self.decode_block_max(read_u32_le(&postings[at..at + U32_BYTES]))
+    }
+
+    /// The stored per-block max term frequency (V6 blobs) for block `i`, or `0`
+    /// when this term has no max-tf table (V1–V5) — the caller treats `0` (and
+    /// the saturated sentinel) as "no impact tightening, use the block-max".
+    #[inline]
+    fn block_max_tf(&self, postings: &[u8], i: usize) -> u8 {
+        if self.has_impacts {
+            postings[self.maxtf_start + i]
+        } else {
+            0
+        }
     }
 
     /// For a `VERSION_V3` positional term, the run offset of the nearest
@@ -320,6 +351,10 @@ pub(super) struct BlockMeta {
     /// Per-block BM25 upper bound, recovered from the skip table's
     /// fixed-point `max_bm25_x1000` field.
     pub(super) block_max_bm25: f32,
+    /// Per-block max term frequency (V6 blobs), for the per-candidate-norm
+    /// impact bound. `0` when the blob predates V6 or the block's max tf
+    /// saturated the byte — both mean "no impact tightening; use `block_max_bm25`".
+    pub(super) block_max_tf: u8,
 }
 
 /// Per-query-term cursor used by [`FtsReader::run_max_score_bmm`]
@@ -431,6 +466,7 @@ impl TermCursor {
         header_probed: bool,
         count_only: bool,
         has_coarse: bool,
+        has_impacts: bool,
     ) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
@@ -439,7 +475,14 @@ impl TermCursor {
         // sub-index (it reads block offsets straight from the skip table).
         // `has_coarse` (V5) tells it the last block ends before the coarse
         // table, not at `postings_length`.
-        let term_meta = TermMeta::parse(postings, metadata_offset, positional, false, has_coarse)?;
+        let term_meta = TermMeta::parse(
+            postings,
+            metadata_offset,
+            positional,
+            false,
+            has_coarse,
+            has_impacts,
+        )?;
         let local_idf = bm25::idf(n_docs, term_meta.df);
         // Effective idf folds in the query-term-frequency `weight` (> 1 only for a
         // deduplicated repeated term) on top of any global-idf override.
@@ -480,6 +523,7 @@ impl TermCursor {
                     block_byte_offset: metadata_offset + block_offset_in_term,
                     block_byte_end: metadata_offset + term_meta.block_end_in_term(postings, i),
                     block_max_bm25,
+                    block_max_tf: term_meta.block_max_tf(postings, i),
                 }
             })
             .collect();
@@ -536,6 +580,9 @@ impl TermCursor {
             block_byte_offset: 0,
             block_byte_end: 0,
             block_max_bm25,
+            // Single doc: `block_max_bm25` is its exact score, so the sentinel
+            // (use the block-max, no impact formula) is the right, tight bound.
+            block_max_tf: 0,
         }]);
 
         let mut block_doc_ids = vec![0u32; BLOCK_LEN];
@@ -873,6 +920,47 @@ impl TermCursor {
             0.0
         } else {
             self.blocks[self.inspect_block].block_max_bm25
+        }
+    }
+
+    /// A per-block BM25 upper bound tightened for one candidate doc's norm.
+    /// `block_max_bm25` bounds the block's score over *any* doc length; but a
+    /// given candidate has a known `dl_norm`, and this term contributes at most
+    /// `score(block_max_tf, dl_norm)` there. For a long (high-norm) candidate
+    /// that is well below a block-max set by some short doc, so it prunes more
+    /// non-essential probes in the union walk. Falls back to the block-max when
+    /// the block carries no max-tf (pre-V6) or a saturated one (`tf` so high
+    /// BM25's frequency term has essentially saturated anyway).
+    #[inline]
+    fn impact_bound(blk: &BlockMeta, idf_x_k1p1: f32, dl_norm: f32) -> f32 {
+        let max_tf = blk.block_max_tf;
+        if max_tf == 0 || max_tf == format::fts::BLOCK_MAX_TF_SATURATED {
+            blk.block_max_bm25
+        } else {
+            let at_norm = bm25::score_with_dl_norm_k1(idf_x_k1p1, u32::from(max_tf), dl_norm);
+            blk.block_max_bm25.min(at_norm)
+        }
+    }
+
+    /// [`current_block_max_bm25`](Self::current_block_max_bm25) tightened for a
+    /// candidate doc whose length-norm is `dl_norm`.
+    #[inline]
+    pub(super) fn current_block_impact_bound(&self, dl_norm: f32) -> f32 {
+        if self.is_exhausted() {
+            0.0
+        } else {
+            Self::impact_bound(&self.blocks[self.current_block], self.idf_x_k1p1, dl_norm)
+        }
+    }
+
+    /// [`inspect_block_max_bm25`](Self::inspect_block_max_bm25) tightened for a
+    /// candidate doc whose length-norm is `dl_norm`.
+    #[inline]
+    pub(super) fn inspect_block_impact_bound(&self, dl_norm: f32) -> f32 {
+        if self.inspect_block >= self.blocks.len() {
+            0.0
+        } else {
+            Self::impact_bound(&self.blocks[self.inspect_block], self.idf_x_k1p1, dl_norm)
         }
     }
 

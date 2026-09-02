@@ -909,6 +909,7 @@ impl FtsReader {
             col_meta.positions,
             false,
             self.has_coarse_block_max,
+            self.has_per_block_impacts,
         )?;
 
         let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
@@ -1278,6 +1279,7 @@ impl FtsReader {
                         header_probed,
                         count_only,
                         self.has_coarse_block_max,
+                        self.has_per_block_impacts,
                     )?;
                     cursors.push(Some(cursor));
                 }

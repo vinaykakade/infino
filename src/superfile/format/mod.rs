@@ -91,6 +91,33 @@ pub mod fts {
     /// table), so existing indices read unchanged and need no reindex.
     pub const VERSION_V5: u32 = 5;
 
+    /// The version new code writes: everything `V5` allows **plus** a per-term
+    /// **block max-tf table** at the tail of each PFOR term's postings region —
+    /// one `u8` per posting block, the block's largest term frequency clamped
+    /// to [`BLOCK_MAX_TF_SATURATED`] (a sentinel meaning "≥ that; fall back to
+    /// the exact block-max").
+    ///
+    /// It lets the reader compute a per-candidate *impact* bound: a
+    /// non-essential term's contribution to a specific candidate doc is at most
+    /// `score(block_max_tf, that_doc's_norm)`, which — evaluated at the
+    /// candidate's own (often long) document length — is far tighter than the
+    /// block-max (the block's max over *any* doc's length). Tighter bounds prune
+    /// more non-essential tf probes in the union walk, most at small `k`.
+    ///
+    /// Sits after the `V5` coarse block-max table; the header + skip-table
+    /// layout are otherwise identical to `V5`. Readers accept `V1`–`V6` and gate
+    /// the max-tf table on the version, so `V1`–`V5` indices read unchanged and
+    /// need no reindex (they simply fall back to the block-max bound).
+    pub const VERSION_V6: u32 = 6;
+
+    /// Sentinel / clamp for the per-block max-tf byte ([`VERSION_V6`]). A block
+    /// whose largest term frequency reaches this value stores this value, and
+    /// the reader then uses the exact block-max for that block instead of the
+    /// impact formula — at this tf BM25 has all but saturated in the frequency
+    /// term, so the impact bound would equal the block-max anyway, and this
+    /// keeps the table a single byte per block while never under-bounding.
+    pub const BLOCK_MAX_TF_SATURATED: u8 = 255;
+
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
     /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.

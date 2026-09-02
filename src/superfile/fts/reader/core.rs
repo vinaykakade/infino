@@ -465,6 +465,10 @@ pub struct FtsReader {
     /// ends with a coarse block-max table. `V1`–`V4` blobs lack it, so the
     /// ranked walk skips the coarse level and the threshold seed there.
     pub(super) has_coarse_block_max: bool,
+    /// True iff the blob is `VERSION_V6` — each term's postings region ends
+    /// with a per-block max-tf table (after the coarse table), enabling the
+    /// per-candidate-norm impact bound. `V1`–`V5` blobs lack it.
+    pub(super) has_per_block_impacts: bool,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
 }
@@ -627,6 +631,7 @@ impl FtsReader {
             v if v == format::fts::VERSION_V3 => true,
             v if v == format::fts::VERSION_V4 => true,
             v if v == format::fts::VERSION_V5 => true,
+            v if v == format::fts::VERSION_V6 => true,
             _ => {
                 return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                     "fts section version {version}"
@@ -635,11 +640,17 @@ impl FtsReader {
         };
         let has_position_subindex = version == format::fts::VERSION_V3
             || version == format::fts::VERSION_V4
-            || version == format::fts::VERSION_V5;
-        let has_bitset_blocks =
-            version == format::fts::VERSION_V4 || version == format::fts::VERSION_V5;
-        // V5 appends a per-term coarse block-max table; V1–V4 do not.
-        let has_coarse_block_max = version == format::fts::VERSION_V5;
+            || version == format::fts::VERSION_V5
+            || version == format::fts::VERSION_V6;
+        let has_bitset_blocks = version == format::fts::VERSION_V4
+            || version == format::fts::VERSION_V5
+            || version == format::fts::VERSION_V6;
+        // V5 and V6 append a per-term coarse block-max table; V1–V4 do not.
+        let has_coarse_block_max =
+            version == format::fts::VERSION_V5 || version == format::fts::VERSION_V6;
+        // V6 additionally appends a per-term block max-tf table (after the
+        // coarse table), enabling per-candidate-norm impact bounds.
+        let has_per_block_impacts = version == format::fts::VERSION_V6;
         let header_size = match positional_blob {
             true => format::fts::HEADER_SIZE_V2,
             false => FTS_HEADER_SIZE,
@@ -901,6 +912,7 @@ impl FtsReader {
             has_position_subindex,
             has_bitset_blocks,
             has_coarse_block_max,
+            has_per_block_impacts,
             columns,
             column_id_by_name,
         })
@@ -1163,6 +1175,7 @@ impl FtsReader {
                             true,
                             self.has_position_subindex,
                             self.has_coarse_block_max,
+                            self.has_per_block_impacts,
                         )?;
                         positional.push((Some(term_meta), None));
                     }
@@ -1306,6 +1319,7 @@ impl FtsReader {
                             true,
                             false,
                             self.has_coarse_block_max,
+                            self.has_per_block_impacts,
                         )?;
                         let region = positions_region.as_ref().ok_or_else(|| {
                             FtsError::Read(ReadError::MalformedVersion(
@@ -1333,6 +1347,7 @@ impl FtsReader {
                         false,
                         false,
                         self.has_coarse_block_max,
+                        self.has_per_block_impacts,
                     )?;
                     while !cursor.is_exhausted() {
                         while cursor.pos < cursor.block_n {
