@@ -943,7 +943,8 @@ impl TermCursor {
     }
 
     /// [`current_block_max_bm25`](Self::current_block_max_bm25) tightened for a
-    /// candidate doc whose length-norm is `dl_norm`.
+    /// candidate doc whose length-norm is `dl_norm`. Use after a `contains`
+    /// probe has left the cursor on the candidate's block.
     #[inline]
     pub(super) fn current_block_impact_bound(&self, dl_norm: f32) -> f32 {
         if self.is_exhausted() {

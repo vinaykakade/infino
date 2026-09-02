@@ -720,25 +720,36 @@ impl FtsReader {
                     }
                 }
                 if all_match {
-                    let score = if need_score {
+                    if need_score {
                         let norm = dl_norm_k1.get(d);
-                        let mut s = bm25::score_with_dl_norm_k1(
+                        let driver_score = bm25::score_with_dl_norm_k1(
                             driver.idf_x_k1p1,
                             driver.current_tf(),
                             norm,
                         );
-                        // Full match: now read each tf (bit-test + popcount-rank,
-                        // no doc-id decode). `contains` already positioned each
-                        // cursor on `d`'s block, so this doesn't re-seek.
-                        for o in others.iter_mut() {
-                            let tf = o.tf_at_contained(d);
-                            s += bm25::score_with_dl_norm_k1(o.idf_x_k1p1, tf, norm);
+                        // Per-candidate impact skip: bound the full score by the
+                        // driver's actual score plus each other term's impact
+                        // bound at `d`'s norm — its block-max tightened to this
+                        // doc's length (`contains` left each cursor on `d`'s
+                        // block). If that can't beat the heap bar, skip the tf
+                        // reads and the emit, the walk's dominant per-match cost.
+                        let mut ub = driver_score;
+                        for o in others.iter() {
+                            ub += o.current_block_impact_bound(norm);
                         }
-                        s
+                        if ub > sink.bar() {
+                            // Full match: now read each tf (bit-test +
+                            // popcount-rank, no doc-id decode).
+                            let mut s = driver_score;
+                            for o in others.iter_mut() {
+                                let tf = o.tf_at_contained(d);
+                                s += bm25::score_with_dl_norm_k1(o.idf_x_k1p1, tf, norm);
+                            }
+                            sink.emit(d, s);
+                        }
                     } else {
-                        0.0
-                    };
-                    sink.emit(d, score);
+                        sink.emit(d, 0.0);
+                    }
                 }
                 driver.next();
                 if driver.is_exhausted() || driver.current_doc_id() > window_end {
