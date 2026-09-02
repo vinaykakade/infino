@@ -526,6 +526,7 @@ impl FtsReader {
             && version != format::fts::VERSION_V3
             && version != format::fts::VERSION_V4
             && version != format::fts::VERSION_V5
+            && version != format::fts::VERSION_V6
         {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
@@ -540,7 +541,8 @@ impl FtsReader {
             v if v == format::fts::VERSION_V2
                 || v == format::fts::VERSION_V3
                 || v == format::fts::VERSION_V4
-                || v == format::fts::VERSION_V5 =>
+                || v == format::fts::VERSION_V5
+                || v == format::fts::VERSION_V6 =>
             {
                 format::fts::HEADER_SIZE_V2
             }
