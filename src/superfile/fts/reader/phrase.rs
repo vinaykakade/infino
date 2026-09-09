@@ -250,7 +250,7 @@ impl PhraseCursor {
         let mut align_order: Vec<usize> = (0..members.len()).collect();
         align_order.sort_by_key(|&i| members[i].cursor.block_count());
         let mut cursor = Self {
-            idf_x_k1p1: params.idf_x_k1p1(idf_sum),
+            idf_x_k1p1: idf_sum * (bm25::K1 + 1.0),
             idf_sum,
             term_max_bm25: idf_sum * min_scaled_bound,
             members,

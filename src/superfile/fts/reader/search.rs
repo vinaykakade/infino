@@ -1031,7 +1031,7 @@ impl FtsReader {
                     false => tf,
                 };
                 let idf_t = global_idf.unwrap_or_else(|| bm25::idf(self.n_docs as u64, 1));
-                let idf_x_k1p1 = col_meta.params.idf_x_k1p1(idf_t);
+                let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
                 // Drop the lone match if a negated term excludes it.
                 // The inline slot read no postings-region bytes; the
                 // work-stats byte count for this path is genuinely zero.
@@ -1070,7 +1070,7 @@ impl FtsReader {
 
         let local_idf = bm25::idf(self.n_docs as u64, term_meta.df);
         let idf_t = global_idf.unwrap_or(local_idf);
-        let idf_x_k1p1 = col_meta.params.idf_x_k1p1(idf_t);
+        let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
         // Stored block-max and coarse entries bake in the LOCAL idf. Scores
         // below use the (possibly overridden) effective idf, and the score
         // is linear in idf, so rescaling every stored bound by the ratio
@@ -1088,7 +1088,7 @@ impl FtsReader {
         // path. See `ColumnMeta::bound_scale` and `TermCursor::new`,
         // which does the identical composition for the multi-term
         // kernels.
-        * col_meta.bound_scale;
+        ;
         let dl_norm_k1 = &col_meta.dl_norm_k1;
 
         // Top-k min-heap; see `TopKEntry` for the reversed ordering

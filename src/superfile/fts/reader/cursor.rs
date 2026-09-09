@@ -506,7 +506,7 @@ impl TermCursor {
             .collect();
 
         let mut cursor = Self {
-            idf_x_k1p1: params.idf_x_k1p1(idf),
+            idf_x_k1p1: idf * (bm25::K1 + 1.0),
             idf,
             term_max_bm25,
             df: term_meta.df,
@@ -548,7 +548,7 @@ impl TermCursor {
         // Fold the qtf `weight` into the effective idf so the single-doc block-max
         // (computed below from `idf_x_k1p1`) scales together with the score.
         let idf = global_idf.unwrap_or_else(|| bm25::idf(n_docs, 1)) * weight as f32;
-        let idf_x_k1p1 = params.idf_x_k1p1(idf);
+        let idf_x_k1p1 = idf * (bm25::K1 + 1.0);
         let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
 
         let blocks: Arc<[BlockMeta]> = Arc::from([BlockMeta {
