@@ -26,6 +26,7 @@ use std::{collections::HashSet, sync::Arc};
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
+    Bm25SearchOptions,
     superfile::{
         builder::FtsConfig,
         fts::reader::{Bm25Stats, BoolMode},
@@ -273,7 +274,7 @@ fn bm25_global_stats_keeps_the_default_modes_membership() {
             "title",
             "rust",
             TOP_K,
-            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
         )
         .expect("per-superfile bm25");
     let global = reader
@@ -281,7 +282,7 @@ fn bm25_global_stats_keeps_the_default_modes_membership() {
             "title",
             "rust",
             TOP_K,
-            infino::Bm25SearchOptions::new()
+            Bm25SearchOptions::new()
                 .with_mode(BoolMode::Or)
                 .with_stats(Bm25Stats::Global),
             None,
@@ -483,7 +484,7 @@ fn token_match_or_is_the_unranked_bm25_candidate_set() {
             "title",
             "rust",
             TOP_K,
-            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
         )
         .expect("bm25_search OR");
 
@@ -515,7 +516,7 @@ fn token_match_and_intersects_tokens() {
             "title",
             "rust systems",
             TOP_K,
-            infino::Bm25SearchOptions::new().with_mode(BoolMode::And),
+            Bm25SearchOptions::new().with_mode(BoolMode::And),
         )
         .expect("bm25_search AND");
 
@@ -584,7 +585,7 @@ fn hybrid_search_unions_bm25_and_vector_and_orders_by_score() {
             "title",
             "rust",
             TOP_K,
-            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
         )
         .expect("bm25_search");
     let vector = reader
@@ -640,7 +641,7 @@ fn hybrid_search_doc_top_in_both_retrievers_ranks_first() {
             "title",
             "async",
             RANK_TOP_K,
-            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
         )
         .expect("bm25_search");
     let vector = reader
