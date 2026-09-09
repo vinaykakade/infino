@@ -515,13 +515,14 @@ impl Table {
     /// keep belongs on the column (`IndexSpec.fts`), where the bounds
     /// are built with it and the correction disappears.
     ///
-    /// `stats` selects the BM25 corpus statistics: `"per_superfile"`
-    /// (default) scores each segment against its own local document
-    /// count and term frequencies — fastest, but ranking drifts as the
-    /// table fragments across many segments. `"global"` scores against
-    /// table-wide statistics gathered across all segments, so a
-    /// fragmented table ranks like a single unified corpus (the accurate
-    /// choice) at the cost of an extra statistics-gathering pass.
+    /// `stats` selects the BM25 corpus statistics: `"global"` (default)
+    /// scores against table-wide statistics gathered across all segments,
+    /// so a fragmented table ranks like a single unified corpus, at the
+    /// cost of a document-frequency gather before scoring.
+    /// `"per_superfile"` scores each segment against its own local
+    /// document count and term frequencies — fastest, and it skips that
+    /// gather, but a term's idf depends on which segment a document
+    /// landed in, so ranking drifts as the table fragments.
     #[pyo3(signature = (column, query, k, mode=None, projection=None, stats=None, k1=None, b=None))]
     fn bm25_search<'py>(
         &self,
