@@ -29,14 +29,14 @@ pub struct NormTable {
     /// Parameter-free — the buckets are lengths, not norms — and shared
     /// rather than copied so [`NormTable::rescored`] costs one `Arc`
     /// bump plus a 1 KiB table instead of a pass over every doc.
-    bytes: Arc<[u8]>,
+    bytes: Vec<u8>,
     /// Bucket → `k1·(1 - b + b·dequantize_len(bucket)/avgdl)`. A fixed
     /// 256-entry table, boxed so `ColumnMeta` stays pointer-sized (it is
     /// scanned by non-scoring paths — column lookup, listing) while the
     /// `u8` bucket index into a fixed-length array lets the compiler drop
     /// the bounds check in `get`. This is the only parameter-dependent
     /// part of the table.
-    lut: Arc<[f32; 256]>,
+    lut: Box<[f32; 256]>,
     /// Lowest and highest bucket any doc in this column actually
     /// occupies, tracked at build so [`NormTable::bound_scale`] takes
     /// its supremum over lengths that occur rather than over all 256
@@ -68,7 +68,7 @@ impl NormTable {
         }
         let occupied = if bytes.is_empty() { (0, 0) } else { (lo, hi) };
         Self {
-            bytes: Arc::from(bytes),
+            bytes,
             lut: build_lut(avgdl, params),
             occupied,
         }
@@ -82,7 +82,7 @@ impl NormTable {
             return Self::empty();
         }
         Self {
-            bytes: Arc::clone(&self.bytes),
+            bytes: self.bytes.clone(),
             lut: build_lut(avgdl, params),
             occupied: self.occupied,
         }
@@ -148,8 +148,8 @@ impl NormTable {
     /// read.
     pub(super) fn empty() -> Self {
         Self {
-            bytes: Arc::from(Vec::new()),
-            lut: Arc::new([0.0; 256]),
+            bytes: Vec::new(),
+            lut: Box::new([0.0; 256]),
             occupied: (0, 0),
         }
     }
@@ -158,13 +158,13 @@ impl NormTable {
 /// Decode table for one parameter set: bucket → `dl_norm_k1`. Filled in
 /// place on the heap so the 256 `f32`s are not built on the stack and
 /// moved.
-fn build_lut(avgdl: f32, params: bm25::Bm25Params) -> Arc<[f32; 256]> {
+fn build_lut(avgdl: f32, params: bm25::Bm25Params) -> Box<[f32; 256]> {
     let mut lut = Box::new([0.0_f32; 256]);
     for (bucket, slot) in lut.iter_mut().enumerate() {
         let dl = bm25::dequantize_len(bucket as u8);
         *slot = params.dl_norm_k1(dl, avgdl);
     }
-    Arc::from(lut)
+    lut
 }
 
 /// Per-column metadata, indexed by column_id (declaration order).
