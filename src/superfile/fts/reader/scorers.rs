@@ -744,8 +744,11 @@ impl FtsReader {
         // already excludes. Order is irrelevant to the score (Σ is commutative).
         others.sort_by_key(|c| c.df);
         let need_score = sink.needs_score();
+        let (mut n_windows, mut n_pruned, mut n_docs, mut n_contains, mut n_match) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let driver_df = driver.df;
         while !driver.is_exhausted() {
             let doc = driver.current_doc_id();
+            n_windows += 1;
 
             // Block-Max-AND pruning, amortized over a window: the driver's
             // block-max plus each other term's block-max at `doc` (inspect
@@ -763,6 +766,7 @@ impl FtsReader {
                     doc,
                 );
                 if ub <= sink.bar() {
+                    n_pruned += 1;
                     driver.skip_to(window_end.saturating_add(1));
                     continue;
                 }
@@ -779,14 +783,17 @@ impl FtsReader {
                 // Cheap presence pass: bitset bit-test every other, short-circuit
                 // on the first miss. No tf is read here — a miss after k matching
                 // common terms would waste k popcount-rank + tf decodes.
+                n_docs += 1;
                 let mut all_match = true;
                 for o in others.iter_mut() {
+                    n_contains += 1;
                     if !o.contains(d) {
                         all_match = false;
                         break;
                     }
                 }
                 if all_match {
+                    n_match += 1;
                     let score = if need_score {
                         let norm = dl_norm_k1.get(d);
                         let mut s = bm25::score_with_dl_norm_k1(
@@ -813,6 +820,7 @@ impl FtsReader {
                 }
             }
         }
+        eprintln!("ANDSTAT driver_df={driver_df} windows={n_windows} pruned={n_pruned} docs_visited={n_docs} contains={n_contains} matches={n_match} others_df={:?}", others.iter().map(|c| c.df).collect::<Vec<_>>());
     }
 
     /// Ranked must+should walk: the match set is the musts'
