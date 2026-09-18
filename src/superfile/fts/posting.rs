@@ -474,7 +474,10 @@ pub fn encode_block(
     let bitset_words = (last_doc_id - aligned_base) as usize / 64 + 1;
     let bitset_size = bitset_words * 8;
     let tight_delta_bits = bp.num_bits_sorted(b.doc_ids[0].saturating_sub(1), &padded_doc_ids);
-    let use_bitset = bitset_size <= BLOCK_LEN * tight_delta_bits as usize / 8;
+    // EXPERIMENT: claim a bitset for mid-density blocks too, up to four
+    // times the packed size, so a conjunction's membership probe on a
+    // mid-frequency term is a bit test instead of a decode and a bisection.
+    let use_bitset = bitset_size <= 4 * (BLOCK_LEN * tight_delta_bits as usize / 8);
 
     // Patched packing (compact layout only): explicit deltas and tfs,
     // each at the width most lanes fit plus an exception list for the
