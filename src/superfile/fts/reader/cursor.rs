@@ -579,6 +579,58 @@ pub(crate) struct TermCursor {
 /// While a cursor is eager, retry a lazy probe once per this many blocks.
 const EAGER_RETRY_BLOCKS: u8 = 8;
 
+/// How many of a decoded block's [`BLOCK_LEN`] doc-id slots are below `doc`
+/// — the index `doc` has or would have in the block. The decoder fills
+/// every slot (padding repeats the last real doc id), so the count over all
+/// slots is exact for any `doc` at or below the last real id, and at least
+/// the real count above it; callers clamp to their `block_n`. Branchless on
+/// AVX2 — sixteen compare-and-popcount steps — where a bisection's seven
+/// data-dependent branches mispredict on a conjunction's sparse probes.
+#[inline]
+pub(super) fn block_index_of(ids: &[u32], doc: u32) -> usize {
+    debug_assert!(
+        ids.len() >= BLOCK_LEN,
+        "a decoded block has BLOCK_LEN slots"
+    );
+    debug_assert!(doc <= i32::MAX as u32, "doc ids fit a signed lane");
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the AVX2 target feature is present at runtime (checked
+            // above) and `ids` has at least `BLOCK_LEN` elements (asserted
+            // in debug, guaranteed by every caller's buffer allocation).
+            return unsafe { block_index_of_avx2(ids, doc) };
+        }
+    }
+    ids[..BLOCK_LEN].partition_point(|&d| d < doc)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn block_index_of_avx2(ids: &[u32], doc: u32) -> usize {
+    use std::arch::x86_64::*;
+    // SAFETY, per obligation:
+    // - AVX2 intrinsics: reachable only through the dispatcher's
+    //   `is_x86_feature_detected!("avx2")` guard.
+    // - `loadu`: no alignment precondition; every load reads lanes
+    //   `[8·chunk, 8·chunk + 8)` with `8·chunk + 8 <= BLOCK_LEN <= ids.len()`.
+    // - The compare is signed: doc ids are below `i32::MAX` (debug-asserted
+    //   by the dispatcher), so `target > lane` is exactly `lane < doc`.
+    unsafe {
+        let target = _mm256_set1_epi32(doc as i32);
+        let base = ids.as_ptr();
+        let mut below = 0u32;
+        let mut chunk = 0usize;
+        while chunk * 8 + 8 <= BLOCK_LEN {
+            let lanes = _mm256_loadu_si256(base.add(chunk * 8) as *const __m256i);
+            let lt = _mm256_cmpgt_epi32(target, lanes);
+            below += (_mm256_movemask_ps(_mm256_castsi256_ps(lt)) as u32).count_ones();
+            chunk += 1;
+        }
+        below as usize
+    }
+}
+
 impl TermCursor {
     /// Parse one term's metadata + skip table out of its own postings
     /// byte range and decode its first block. `term_bytes` starts at
@@ -909,13 +961,12 @@ impl TermCursor {
             if self.decoded_block != self.current_block {
                 self.decode_current_block();
             }
-            // A bisection, measured against a scan from the last probe's
-            // position: the driver's docs land far apart in another term's
-            // block, so the scan's steps cost more than the halvings here
-            // (the opposite of the tf probe's dense completion pass).
-            self.block_doc_ids[..self.block_n]
-                .binary_search(&doc)
-                .is_ok()
+            // A branchless locate over the whole decoded block, measured
+            // against a bisection (seven mispredicting halvings) and a scan
+            // from the last probe's position (the driver's docs land far
+            // apart in another term's block, so the steps cost more still).
+            let i = block_index_of(&self.block_doc_ids, doc);
+            i < self.block_n && self.block_doc_ids[i] == doc
         }
     }
 
@@ -1583,9 +1634,11 @@ impl TermCursor {
             if self.decoded_block != self.current_block {
                 self.decode_current_block();
             }
-            let pos = self.block_doc_ids[..self.block_n]
-                .binary_search(&doc)
-                .expect("doc confirmed present");
+            let pos = block_index_of(&self.block_doc_ids, doc);
+            debug_assert!(
+                pos < self.block_n && self.block_doc_ids[pos] == doc,
+                "doc confirmed present"
+            );
             self.block_tfs[pos]
         }
     }
@@ -1650,6 +1703,46 @@ mod tests {
     /// probability of a Zipf rank-1 word, so its frequency grows with the
     /// document and every block holds documents scoring within a hair of
     /// each other — the shape block-max pruning is most sensitive to.
+    /// The branchless block locate must agree with a bisection on every
+    /// slot, on random blocks of every fill (padding repeats the last id),
+    /// for present docs, absent docs, and docs past the block.
+    #[test]
+    fn block_index_of_matches_partition_point() {
+        let mut rng = StdRng::seed_from_u64(9);
+        for trial in 0..2000 {
+            let n = 1 + rng.random_range(0..BLOCK_LEN);
+            let mut ids = vec![0u32; BLOCK_LEN];
+            let mut d = rng.random_range(0..1_000u32);
+            for slot in ids.iter_mut().take(n) {
+                *slot = d;
+                d += 1 + rng.random_range(0..(1 + trial as u32 % 50));
+            }
+            let last = ids[n - 1];
+            for slot in ids.iter_mut().skip(n) {
+                *slot = last;
+            }
+            for _ in 0..8 {
+                let doc = match rng.random_range(0..3) {
+                    0 => ids[rng.random_range(0..n)],
+                    1 => rng.random_range(0..(last + 3)),
+                    _ => last.saturating_add(rng.random_range(0..10)),
+                };
+                let want = ids.partition_point(|&x| x < doc);
+                assert_eq!(
+                    block_index_of(&ids, doc),
+                    want,
+                    "trial {trial} n={n} doc={doc}"
+                );
+                let hit = want < n && ids[want] == doc;
+                assert_eq!(
+                    hit,
+                    ids[..n].binary_search(&doc).is_ok(),
+                    "trial {trial} doc={doc}"
+                );
+            }
+        }
+    }
+
     fn realistic_reader(n_docs: u32) -> FtsReader {
         let mut rng = StdRng::seed_from_u64(114);
         let lengths = LogNormal::new(4.4886, 1.55).expect("log-normal params");
