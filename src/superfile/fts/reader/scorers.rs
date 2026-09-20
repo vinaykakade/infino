@@ -2196,46 +2196,37 @@ impl FtsReader {
                             continue;
                         }
                     }
+                    // Score the rest of the decoded block that lies inside the
+                    // window in one pass rather than four postings at a time:
+                    // gather every doc's norm, compute every contribution in a
+                    // loop the compiler vectorises across the whole block, then
+                    // scatter into the window. The four-wide form paid a
+                    // branch, four scalar lookups and a cursor step per four
+                    // postings; on a stopword's list that overhead was of the
+                    // same order as the arithmetic. Doc ids ascend, so the part
+                    // of the block inside the window is a prefix.
                     let pos = c.pos;
-                    if pos + bm25::SCORE_SIMD_LANES <= c.block_n {
-                        // Bind the 4-wide window as one subslice per array:
-                        // the guard proves `pos + LANES <= block_n <= len`,
-                        // so this is a single range check and the lane reads
-                        // off the fixed-length-4 slice carry none — replacing
-                        // the eight separate element bounds checks the direct
-                        // `block_doc_ids[pos+i]` / `block_tfs[pos+i]` indexing
-                        // emitted in this per-block SIMD group.
-                        let dids = &c.block_doc_ids[pos..pos + bm25::SCORE_SIMD_LANES];
-                        let doc_ids = [dids[0], dids[1], dids[2], dids[3]];
-                        if doc_ids[bm25::SCORE_SIMD_LANES - 1] < window_end {
-                            let tfs = &c.block_tfs[pos..pos + bm25::SCORE_SIMD_LANES];
-                            let contributions = bm25::score_one_term_x4(
-                                c.idf_weight,
-                                [tfs[0], tfs[1], tfs[2], tfs[3]],
-                                [
-                                    dl_norm_k1.get(doc_ids[0]),
-                                    dl_norm_k1.get(doc_ids[1]),
-                                    dl_norm_k1.get(doc_ids[2]),
-                                    dl_norm_k1.get(doc_ids[3]),
-                                ],
-                            );
-                            for lane in 0..bm25::SCORE_SIMD_LANES {
-                                let local = (doc_ids[lane] - base) as usize;
-                                scores[local] += contributions[lane];
-                                present[local >> 6] |= 1u64 << (local & 63);
-                            }
-                            c.advance_by(bm25::SCORE_SIMD_LANES);
-                            continue;
-                        }
+                    let ids = &c.block_doc_ids[pos..c.block_n];
+                    let n = ids.partition_point(|&doc| doc < window_end);
+                    debug_assert!(n > 0, "the cursor's doc is inside the window");
+                    let ids = &ids[..n];
+                    let tfs = &c.block_tfs[pos..pos + n];
+                    let mut norms = [0.0f32; BLOCK_LEN];
+                    let mut contrib = [0.0f32; BLOCK_LEN];
+                    for (norm, &doc) in norms.iter_mut().zip(ids) {
+                        *norm = dl_norm_k1.get(doc);
                     }
-                    let local = (d - base) as usize;
-                    scores[local] += bm25::score_with_dl_norm_k1(
-                        c.idf_weight,
-                        c.current_tf(),
-                        dl_norm_k1.get(d),
-                    );
-                    present[local >> 6] |= 1u64 << (local & 63);
-                    c.next();
+                    let idf = c.idf_weight;
+                    for ((out, &tf), &norm) in contrib.iter_mut().zip(tfs).zip(&norms) {
+                        let tf = tf as f32;
+                        *out = idf * tf / (tf + norm);
+                    }
+                    for (&doc, &score) in ids.iter().zip(&contrib) {
+                        let local = (doc - base) as usize;
+                        scores[local] += score;
+                        present[local >> 6] |= 1u64 << (local & 63);
+                    }
+                    c.advance_by(n);
                 }
             }
 
