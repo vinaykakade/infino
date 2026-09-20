@@ -367,13 +367,12 @@ impl GroupIndex {
 
     /// The absolute positions of pair `pair` (whose term frequency is
     /// `tf`), appended to `out`. `None` on an overflowing gap.
-    pub(crate) fn run_positions(
-        &mut self,
-        bytes: &[u8],
-        pair: usize,
-        tf: u32,
-        out: &mut Vec<u32>,
-    ) -> Option<()> {
+    /// Account for serving pair `pair`'s run and return where its lanes
+    /// begin: the bookkeeping every per-run access shares. Once a packed
+    /// group has served [`BULK_AFTER_RUNS`] runs densely enough, both
+    /// streams are decoded whole here and the group becomes
+    /// [`GroupKind::Bulk`], so later runs are slices, not lane reads.
+    fn open_run(&mut self, bytes: &[u8], pair: usize) -> Option<usize> {
         let start = *self.starts.get(pair)? as usize;
         if self.kind == GroupKind::Packed
             && self.served >= BULK_AFTER_RUNS
@@ -388,6 +387,74 @@ impl GroupIndex {
             self.kind = GroupKind::Bulk;
         }
         self.served += 1;
+        Some(start)
+    }
+
+    /// Account for pair `pair`'s run and return where its lanes begin: the
+    /// mutable half of opening a run as a stream, split from
+    /// [`Self::stream_at`] so a caller can open several groups' runs before
+    /// it holds their streams together.
+    pub(crate) fn open_run_at(&mut self, bytes: &[u8], pair: usize) -> Option<usize> {
+        self.open_run(bytes, pair)
+    }
+
+    /// The run [`Self::open_run_at`] accounted for, as a stream that yields
+    /// one absolute position per call and reads each lane only when asked.
+    /// A phrase verification leapfrogs its members' streams and stops the
+    /// moment one runs dry, never paying for the positions past that point,
+    /// where [`Self::run_positions`] materializes the whole run first.
+    /// Positions within a doc are gaps summed onto the doc's first position,
+    /// so a stream is inherently sequential; there is no random access to
+    /// give up.
+    #[inline]
+    pub(crate) fn stream_at<'a>(
+        &'a self,
+        bytes: &'a [u8],
+        pair: usize,
+        start: usize,
+        tf: u32,
+    ) -> RunStream<'a> {
+        RunStream {
+            group: self,
+            bytes,
+            pair,
+            start,
+            tf,
+            done: 0,
+            prev: 0,
+        }
+    }
+
+    /// Read lane `i` of the first-position stream in whatever form the
+    /// group currently holds it.
+    #[inline]
+    fn first_at(&self, bytes: &[u8], pair: usize, start: usize) -> Option<u32> {
+        match self.kind {
+            GroupKind::Leb128 => self.values.get(start).copied(),
+            GroupKind::Packed => self.first.lane(bytes, pair),
+            GroupKind::Bulk => self.firsts.get(pair).copied(),
+        }
+    }
+
+    /// Read the `k`-th gap of a run whose gap lanes begin at `start`.
+    #[inline]
+    fn gap_at(&self, bytes: &[u8], start: usize, k: usize) -> Option<u32> {
+        match self.kind {
+            // A LEB128 run stores its first position at `start`, gaps after.
+            GroupKind::Leb128 => self.values.get(start + 1 + k).copied(),
+            GroupKind::Packed => self.gap.lane(bytes, start + k),
+            GroupKind::Bulk => self.gaps.get(start + k).copied(),
+        }
+    }
+
+    pub(crate) fn run_positions(
+        &mut self,
+        bytes: &[u8],
+        pair: usize,
+        tf: u32,
+        out: &mut Vec<u32>,
+    ) -> Option<()> {
+        let start = self.open_run(bytes, pair)?;
         self.run.clear();
         match self.kind {
             GroupKind::Leb128 => {
@@ -420,6 +487,52 @@ impl GroupIndex {
             }
         }
         positions_from_run_values(&self.run, out)
+    }
+}
+
+/// One pair's position run, read a position at a time. See
+/// [`GroupIndex::run_stream`].
+pub(crate) struct RunStream<'a> {
+    group: &'a GroupIndex,
+    bytes: &'a [u8],
+    pair: usize,
+    /// Where the run's gap lanes begin (its value index for LEB128).
+    start: usize,
+    /// Positions the run holds in total (its term frequency).
+    tf: u32,
+    /// Positions yielded so far.
+    done: u32,
+    /// The last position yielded; gaps are summed onto it.
+    prev: u32,
+}
+
+/// The run's bytes ended or overflowed before it yielded every position
+/// its term frequency promised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunTruncated;
+
+impl RunStream<'_> {
+    /// The next absolute position, `Ok(None)` once the run is exhausted.
+    #[inline]
+    pub(crate) fn next(&mut self) -> Result<Option<u32>, RunTruncated> {
+        if self.done == self.tf {
+            return Ok(None);
+        }
+        let p = if self.done == 0 {
+            self.group
+                .first_at(self.bytes, self.pair, self.start)
+                .ok_or(RunTruncated)?
+        } else {
+            // Gap `done - 1` carries position `done` onto position `done - 1`.
+            let gap = self
+                .group
+                .gap_at(self.bytes, self.start, (self.done - 1) as usize)
+                .ok_or(RunTruncated)?;
+            self.prev.checked_add(gap).ok_or(RunTruncated)?
+        };
+        self.done += 1;
+        self.prev = p;
+        Ok(Some(p))
     }
 }
 

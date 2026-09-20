@@ -18,7 +18,7 @@ use crate::superfile::{
     error::FtsError,
     fts::{
         bm25,
-        positions::{GroupIndex, decode_run, skip_run},
+        positions::{GroupIndex, RunStream, RunTruncated, decode_run, skip_run},
     },
 };
 
@@ -84,6 +84,65 @@ impl PhraseMember {
     /// bitset block holds only that one doc (`block_n == 1`, `pos == 0`)
     /// and would read the wrong run; `materialize_at` expands it first,
     /// which is why every caller goes through it.
+    /// Whether the member's positions are stored as per-block groups, the
+    /// layout a run can be streamed from. Inline members and the legacy
+    /// per-run layouts decode a doc's positions whole instead.
+    #[inline]
+    fn streams_positions(&self) -> bool {
+        self.inline_position.is_none() && self.term_meta.is_some_and(|m| m.positions_grouped)
+    }
+
+    /// Locate the current block's position group (once per block) and
+    /// account for the current doc's run, returning where its lanes begin.
+    /// The stream itself is built by [`Self::run_stream`] from shared
+    /// borrows, so two members' streams can be held at once. Same cursor
+    /// contract as [`Self::decode_current_positions`].
+    fn open_run(&mut self) -> Result<usize, FtsError> {
+        debug_assert!(self.streams_positions());
+        debug_assert_eq!(
+            self.cursor.decoded_block, self.cursor.current_block,
+            "positions need the whole block decoded; call materialize_at first"
+        );
+        let block = self.cursor.current_block;
+        let pair = self.cursor.pos;
+        let term_meta = *self
+            .term_meta
+            .as_ref()
+            .expect("grouped member has term meta");
+        if self.group_block != block {
+            let mut at =
+                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
+            let tfs = &self.cursor.block_tfs[..self.cursor.block_n];
+            self.group_index
+                .locate(&self.positions, &mut at, tfs)
+                .ok_or_else(|| {
+                    FtsError::Read(ReadError::MalformedVersion(
+                        "position group truncated or malformed".into(),
+                    ))
+                })?;
+            self.group_block = block;
+        }
+        self.group_index
+            .open_run_at(&self.positions, pair)
+            .ok_or_else(|| {
+                FtsError::Read(ReadError::MalformedVersion(
+                    "position run index out of range".into(),
+                ))
+            })
+    }
+
+    /// The current doc's positions as a stream, given the run start
+    /// [`Self::open_run`] returned. Reads a lane per position on demand.
+    #[inline]
+    fn run_stream(&self, start: usize) -> RunStream<'_> {
+        self.group_index.stream_at(
+            &self.positions,
+            self.cursor.pos,
+            start,
+            self.cursor.block_tfs[self.cursor.pos],
+        )
+    }
+
     pub(super) fn decode_current_positions(&mut self) -> Result<(), FtsError> {
         self.pos_scratch.clear();
         if let Some(p) = self.inline_position {
@@ -568,6 +627,12 @@ impl PhraseCursor {
         // so these calls are not optional.
         let anchor = self.align_order[0];
         let anchor_off = self.position_offsets[anchor];
+        if self.members.len() == 2
+            && self.members[0].streams_positions()
+            && self.members[1].streams_positions()
+        {
+            return self.verify_two_streaming(aligned);
+        }
         self.members[anchor].cursor.materialize_at(aligned);
         self.members[anchor].decode_current_positions()?;
         self.verify_scratch.clear();
@@ -605,6 +670,82 @@ impl PhraseCursor {
         // `verify_at` (the single-phase `skip_to_pruned` sets it itself).
         self.current_tf = self.verify_scratch.len() as u32;
         Ok(self.current_tf)
+    }
+
+    /// Two-member verification as a leapfrog over the members' position
+    /// streams, reading each position only when the merge asks for it.
+    ///
+    /// A phrase start `s` has member `j` at `s + position_offsets[j]`, so
+    /// each stream is walked as starts (`p - offset`; positions below the
+    /// offset can start nothing). Whichever stream is behind advances to
+    /// the other's start; on agreement both advance and the count grows;
+    /// the moment either runs dry the doc is done. Almost every candidate
+    /// fails, and this stops on that failure at the first position past
+    /// the other member's last, having read nothing beyond it. The general
+    /// path decodes both members' runs whole, builds every start, and
+    /// searches each; those lists and searches were the bulk of a phrase
+    /// candidate's cost, with the positions themselves a small part.
+    ///
+    /// Only for members whose positions are grouped per block; the inline
+    /// and legacy layouts take the general path.
+    fn verify_two_streaming(&mut self, aligned: u32) -> Result<u32, FtsError> {
+        // Open both runs first (each needs `&mut` for the block's group and
+        // the run accounting), then hold both streams from shared borrows.
+        let (a, b) = (self.align_order[0], self.align_order[1]);
+        self.members[a].cursor.materialize_at(aligned);
+        let start_a = self.members[a].open_run()?;
+        self.members[b].cursor.materialize_at(aligned);
+        let start_b = self.members[b].open_run()?;
+        let (off_a, off_b) = (self.position_offsets[a], self.position_offsets[b]);
+        let mut sa = self.members[a].run_stream(start_a);
+        let mut sb = self.members[b].run_stream(start_b);
+        let truncated =
+            || FtsError::Read(ReadError::MalformedVersion("position run truncated".into()));
+        // The next start a stream offers: positions below the member's
+        // offset cannot begin a phrase and are passed over.
+        let next_start = |st: &mut RunStream<'_>, off: u32| -> Result<Option<u32>, RunTruncated> {
+            while let Some(p) = st.next()? {
+                if let Some(s) = p.checked_sub(off) {
+                    return Ok(Some(s));
+                }
+            }
+            Ok(None)
+        };
+        let mut count = 0u32;
+        let (Some(mut ca), Some(mut cb)) = (
+            next_start(&mut sa, off_a).map_err(|_| truncated())?,
+            next_start(&mut sb, off_b).map_err(|_| truncated())?,
+        ) else {
+            self.current_tf = 0;
+            return Ok(0);
+        };
+        loop {
+            if ca == cb {
+                count += 1;
+                match (
+                    next_start(&mut sa, off_a).map_err(|_| truncated())?,
+                    next_start(&mut sb, off_b).map_err(|_| truncated())?,
+                ) {
+                    (Some(na), Some(nb)) => {
+                        ca = na;
+                        cb = nb;
+                    }
+                    _ => break,
+                }
+            } else if ca < cb {
+                match next_start(&mut sa, off_a).map_err(|_| truncated())? {
+                    Some(na) => ca = na,
+                    None => break,
+                }
+            } else {
+                match next_start(&mut sb, off_b).map_err(|_| truncated())? {
+                    Some(nb) => cb = nb,
+                    None => break,
+                }
+            }
+        }
+        self.current_tf = count;
+        Ok(count)
     }
 
     /// Score the phrase at its current doc with the caller-supplied
@@ -1403,6 +1544,60 @@ mod tests {
     /// A three-member phrase matches only where all three are adjacent in
     /// order: a doc missing the last member is never a candidate, a doc
     /// holding all three out of order is aligned but fails verification.
+    #[tokio::test]
+    async fn two_member_streaming_verify_counts_every_adjacency() {
+        // Every two-member phrase over grouped positions takes the streaming
+        // leapfrog. Grade it against the phrase frequency each document is
+        // built to contain: the corpus cycles seven fixed shapes, so the
+        // expected count per document is known exactly. Shapes cover
+        // overlapping starts of a repeated word, a run longer than the
+        // small-tf fast path (so lanes come from the generic reader and,
+        // once the block is visited densely, from the bulk decode), a doc
+        // with one member only, and members present but never adjacent.
+        const SHAPES: [(&str, Option<u32>); 7] = [
+            ("quick brown quick brown quick brown fox", Some(3)),
+            ("quick quick quick quick quick quick brown", Some(1)),
+            ("brown fox jumps over the lazy dog", None),
+            ("quick fox brown fox quick fox brown", Some(0)),
+            ("", Some(40)),
+            ("the quick brown quick brown end", Some(2)),
+            ("nothing to see here", None),
+        ];
+        let text = |i: u32| -> String {
+            let (body, _) = SHAPES[(i % 7) as usize];
+            if body.is_empty() {
+                "quick brown ".repeat(40)
+            } else {
+                body.to_owned()
+            }
+        };
+        let r = open_positional((0..3000u32).map(text));
+        let mut cursor = phrase_cursor(&r, &["quick", "brown"]).await;
+        assert!(
+            cursor.members.iter().all(PhraseMember::streams_positions),
+            "this corpus must take the streaming path for the test to grade it"
+        );
+        let mut checked = 0usize;
+        for doc in 0..3000u32 {
+            let Some(expected) = SHAPES[(doc % 7) as usize].1 else {
+                continue;
+            };
+            // Position each member's walk cursor on `doc`, as the walk does
+            // before it verifies an aligned candidate.
+            for m in cursor.members.iter_mut() {
+                m.cursor.skip_to(doc);
+                assert_eq!(m.cursor.current_doc_id(), doc, "member holds doc {doc}");
+            }
+            let tf = cursor.verify_at_aligned(doc).expect("streaming verify");
+            assert_eq!(tf, expected, "phrase tf at doc {doc}");
+            checked += 1;
+        }
+        let gradable = (0..3000u32)
+            .filter(|d| SHAPES[(d % 7) as usize].1.is_some())
+            .count();
+        assert_eq!(checked, gradable, "every two-member doc was graded");
+    }
+
     #[tokio::test]
     async fn three_member_phrase_rejects_a_missing_or_misplaced_member() {
         let r = open_positional(
