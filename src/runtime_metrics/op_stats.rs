@@ -140,6 +140,12 @@ pub struct OpStats {
     /// counting them would break the warm/cold invariance);
     /// [`Self::rows_materialized`] is that leg's invariant signal.
     pub planned_read_ranges: u64,
+    /// Superfiles this query entered — opened for reading — across every
+    /// fan-out. Read against the table's superfile count it says how much of
+    /// the table the routing and pruning actually spared: a query that opens
+    /// every superfile got no benefit from either, whatever the manifest and
+    /// term index claimed to know about it.
+    pub superfiles_opened: u64,
     /// Parquet **data-page** bytes SQL scans requested through the
     /// DataFusion store, independent of whether they were served from
     /// resident bytes or fetched. Footer and page-index reads never
@@ -386,6 +392,7 @@ impl OpStatsCollector {
             vector_candidates_scanned: self.vector_candidates_scanned.load(Ordering::Relaxed),
             vector_rows_reranked: self.vector_rows_reranked.load(Ordering::Relaxed),
             planned_read_ranges: self.planned_read_ranges.load(Ordering::Relaxed),
+            superfiles_opened: self.superfiles_opened.load(Ordering::Relaxed),
             sql_page_bytes: self.sql_page_bytes.load(Ordering::Relaxed),
             rows_materialized: self.rows_materialized.load(Ordering::Relaxed),
             kernel_cpu_ns: self.kernel_cpu_ns.load(Ordering::Relaxed),
