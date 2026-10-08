@@ -2448,6 +2448,46 @@ impl SupertableReader {
     /// query on a delete-free superfile resolves in O(1) from the stored
     /// document frequency. Drives the async kernel via the sync→async
     /// bridge.
+    /// Diagnostic: what the table-level term index can actually answer for
+    /// `term` in `column`, on this snapshot.
+    ///
+    /// Routing, score-ceiling ordering and the single-term count shortcut all
+    /// depend on that index, and all three go inert together when it is absent
+    /// or does not list a superfile. Behaviour alone cannot tell those apart
+    /// from weak bounds, so this reports the inputs rather than the outcome.
+    ///
+    /// Returns `(index_present, superfiles, indexed, postings, finite_bounds)`:
+    /// whether a term index loaded at all; how many superfiles the snapshot
+    /// holds; how many of those the index lists; how many postings it holds
+    /// for the term; and how many of those carry a finite score bound (an
+    /// infinite bound can never be skipped on).
+    #[cfg(feature = "test-helpers")]
+    pub async fn routing_facts(
+        &self,
+        column: &str,
+        term: &str,
+    ) -> (bool, usize, usize, usize, usize) {
+        let manifest = self.manifest();
+        let total = manifest.superfiles.len();
+        let Some(index) = manifest.term_index().await else {
+            return (false, total, 0, 0, 0);
+        };
+        let indexed = manifest
+            .superfiles
+            .iter()
+            .filter(|e| index.is_indexed(&e.superfile_id))
+            .count();
+        let Some(column_id) = manifest.field_id(column) else {
+            return (true, total, indexed, 0, 0);
+        };
+        let postings = match index.postings(column_id, term).await {
+            Ok(p) => p,
+            Err(_) => return (true, total, indexed, 0, 0),
+        };
+        let finite = postings.iter().filter(|p| p.bound.is_finite()).count();
+        (true, total, indexed, postings.len(), finite)
+    }
+
     pub fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
         self.block_on(self.token_match_count_async(column, query, mode))
