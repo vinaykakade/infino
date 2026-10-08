@@ -2469,7 +2469,22 @@ impl SupertableReader {
     ) -> (bool, usize, usize, usize, usize) {
         let manifest = self.manifest();
         let total = manifest.superfiles.len();
+        // Which of the three `None` paths is it? A missing reference means the
+        // stamp never published; a reference that will not load means the
+        // object is unreadable and the error is being swallowed. Those have
+        // different owners, so say which before saying anything else.
+        let has_ref = manifest.term_index_ref().is_some();
+        let complete = manifest.term_index_complete();
+        eprintln!(
+            "  [routing_facts] list has term_index ref: {has_ref}, complete flag: {complete}"
+        );
+        if let Some(r) = manifest.term_index_ref() {
+            eprintln!("  [routing_facts] ref = {r:?}");
+        }
         let Some(index) = manifest.term_index().await else {
+            eprintln!(
+                "  [routing_facts] term_index() returned None (ref present: {has_ref})"
+            );
             return (false, total, 0, 0, 0);
         };
         let indexed = manifest
