@@ -2461,6 +2461,52 @@ impl SupertableReader {
             .collect())
     }
 
+    /// How a column's terms are spread across the table's superfiles.
+    ///
+    /// Routing can only prune a term that is absent somewhere, so the
+    /// quantity that decides whether presence routing has anything to work
+    /// with is how many superfiles hold each term, and how unevenly the
+    /// term's documents are split between them. Reads the term index only:
+    /// no superfile is opened.
+    ///
+    /// Walks every term under `prefix`, keeping one in `stride`. Each row is
+    /// `(term, total_df, superfiles_holding_it, largest_single_df)`.
+    #[cfg(feature = "test-helpers")]
+    pub async fn term_structure(
+        &self,
+        column: &str,
+        prefix: &str,
+        stride: usize,
+    ) -> Result<Vec<(String, u64, usize, u64)>, QueryError> {
+        let manifest = self.manifest();
+        let Some(column_id) = manifest.field_id(column) else {
+            return Ok(Vec::new());
+        };
+        let Some(index) = manifest.term_index().await else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        let mut seen = 0usize;
+        index
+            .for_each_prefix(column_id, prefix, |key, run| {
+                seen += 1;
+                if seen % stride.max(1) == 0 {
+                    let total: u64 = run.iter().map(|p| p.df).sum();
+                    let max = run.iter().map(|p| p.df).max().unwrap_or(0);
+                    out.push((
+                        String::from_utf8_lossy(key).into_owned(),
+                        total,
+                        run.len(),
+                        max,
+                    ));
+                }
+                true
+            })
+            .await
+            .map_err(|e| QueryError::Internal(e.to_string()))?;
+        Ok(out)
+    }
+
     pub fn bm25_hits(
         &self,
         column: &str,
