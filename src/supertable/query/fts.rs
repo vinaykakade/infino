@@ -2396,28 +2396,52 @@ impl SupertableReader {
         query: &str,
     ) -> Result<Vec<(SuperfileUri, f32)>, QueryError> {
         let manifest = self.manifest();
-        let (match_set, _negatives, kept) =
-            self.parse_and_prune(column, query, BoolMode::Or).await?;
+        let Some(tokenizer) = manifest.try_fts_tokenizer_for(column) else {
+            return Ok(Vec::new());
+        };
+        // The ranked clause split, not the unranked one: a should term
+        // still raises a document's score, so leaving it out of the
+        // ceiling would report a bound the scores can exceed.
+        let clauses = tokenizer.parse(query).into_clauses(BoolMode::Or);
+        let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
+        let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
+        let own_phrases = |phrases: Vec<Phrase<Cow<'_, str>>>| -> Vec<Phrase<String>> {
+            phrases.iter().map(|p| p.map(|t| t.to_string())).collect()
+        };
+        let must_phrases = own_phrases(clauses.must_phrases);
+        let should_phrases = own_phrases(clauses.should_phrases);
+        let has_musts = !musts.is_empty() || !must_phrases.is_empty();
+        let prune_leaf = match has_musts {
+            true => presence_leaf(column, &musts, &must_phrases, BoolMode::And),
+            false => presence_leaf(column, &shoulds, &should_phrases, BoolMode::Or),
+        };
+        let kept =
+            select_fts_superfiles(manifest.as_ref(), slice::from_ref(&prune_leaf), column).await?;
         let Some(index) = manifest.term_index().await else {
             return Ok(Vec::new());
         };
         let Some(column_id) = manifest.field_id(column) else {
             return Ok(Vec::new());
         };
-        let terms: Vec<&str> = match_set.terms.iter().map(String::as_str).collect();
-        let phrases: Vec<Vec<&str>> = match_set
-            .phrases
+        let terms: Vec<&str> = musts
             .iter()
+            .chain(shoulds.iter())
+            .map(String::as_str)
+            .collect();
+        let phrases: Vec<Vec<&str>> = must_phrases
+            .iter()
+            .chain(should_phrases.iter())
             .map(|p| p.iter().map(String::as_str).collect())
             .collect();
         // Score the bounds with the same table-wide idf the ranked path
         // uses, so a ceiling and an observed score are on one scale.
         let mut scored: Vec<String> = Vec::new();
-        for t in match_set
-            .terms
-            .iter()
-            .chain(match_set.phrases.iter().flat_map(|p| p.iter()))
-        {
+        for t in musts.iter().chain(shoulds.iter()).chain(
+            must_phrases
+                .iter()
+                .chain(should_phrases.iter())
+                .flat_map(|p| p.iter()),
+        ) {
             if !scored.contains(t) {
                 scored.push(t.clone());
             }
