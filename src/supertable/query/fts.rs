@@ -2377,6 +2377,53 @@ impl SupertableReader {
     ///
     /// Takes the same [`Bm25SearchOptions`] as
     /// [`bm25_search`](Self::bm25_search).
+    /// Diagnostic: the score ceiling this query would compute for each
+    /// superfile, keyed by superfile URI.
+    ///
+    /// A ceiling only prunes when it is below the running k-th score, so what
+    /// matters is not whether ceilings exist but how far above the real best
+    /// score they sit. Paired with [`Self::bm25_hits`], whose hits carry their
+    /// source superfile and score, this gives the slack per superfile:
+    /// `ceiling / actual_best`. A ratio near 1 means the bound is tight and
+    /// nothing is recoverable by tightening it; a large ratio is headroom.
+    ///
+    /// Scored with global idf, matching the only configuration in which
+    /// ceilings and a cross-superfile floor are comparable.
+    #[cfg(feature = "test-helpers")]
+    pub async fn ceiling_slack(
+        &self,
+        column: &str,
+        query: &str,
+    ) -> Result<Vec<(SuperfileUri, f32)>, QueryError> {
+        let manifest = self.manifest();
+        let (match_set, _negatives, kept) =
+            self.parse_and_prune(column, query, BoolMode::Or).await?;
+        let Some(index) = manifest.term_index().await else {
+            return Ok(Vec::new());
+        };
+        let Some(column_id) = manifest.field_id(column) else {
+            return Ok(Vec::new());
+        };
+        let terms: Vec<&str> = match_set.terms.iter().map(String::as_str).collect();
+        let phrases: Vec<Vec<&str>> = match_set
+            .phrases
+            .iter()
+            .map(|p| p.iter().map(String::as_str).collect())
+            .collect();
+        // The identity idf: this reports the stored bounds as the ranked path
+        // would see them with no global rescale, which is what a comparison
+        // against observed scores needs.
+        let idf_used = |_t: &str, local: f32| local;
+        let ceilings = index
+            .query_ceilings(column_id, &terms, &phrases, &kept, &idf_used)
+            .await
+            .map_err(|e| QueryError::Internal(e.to_string()))?;
+        Ok(kept
+            .iter()
+            .filter_map(|e| ceilings.get(&e.superfile_id).map(|c| (e.uri, *c)))
+            .collect())
+    }
+
     pub fn bm25_hits(
         &self,
         column: &str,
