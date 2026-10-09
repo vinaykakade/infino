@@ -2410,10 +2410,23 @@ impl SupertableReader {
             .iter()
             .map(|p| p.iter().map(String::as_str).collect())
             .collect();
-        // The identity idf: this reports the stored bounds as the ranked path
-        // would see them with no global rescale, which is what a comparison
-        // against observed scores needs.
-        let idf_used = |_t: &str, local: f32| local;
+        // Score the bounds with the same table-wide idf the ranked path
+        // uses, so a ceiling and an observed score are on one scale.
+        let mut scored: Vec<String> = Vec::new();
+        for t in match_set
+            .terms
+            .iter()
+            .chain(match_set.phrases.iter().flat_map(|p| p.iter()))
+        {
+            if !scored.contains(t) {
+                scored.push(t.clone());
+            }
+        }
+        let corpus = manifest.fts_length_stats(column);
+        let (gidf, _memos) = self
+            .global_idf_open_wave(manifest.as_ref(), column, &scored, &kept, corpus)
+            .await?;
+        let idf_used = |term: &str, local: f32| gidf.get(term).copied().unwrap_or(local);
         let ceilings = index
             .query_ceilings(column_id, &terms, &phrases, &kept, &idf_used)
             .await
