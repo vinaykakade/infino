@@ -775,6 +775,342 @@ pub(crate) fn order_cost(fwd: &ForwardIndex, order: &[u32], window: usize) -> f6
     total
 }
 
+/// How far a layout spreads each term across the files it would be stored in.
+///
+/// Routing can only skip a file that does not hold one of a query's terms, so
+/// the quantity that decides whether routing can prune at all is how many
+/// files hold each term. Arrival order gives no grouping, and a term then
+/// lands in as many files as chance allows. This measures what the bisection
+/// would change about that, on a sample, before anything is rewritten.
+///
+/// Three numbers per term, all over the same documents and the same groups:
+/// where the bisection puts it, where chance puts it, and the analytic
+/// expectation for a term of that frequency. The first against the last is
+/// the whole question.
+#[cfg(feature = "test-helpers")]
+pub mod spread {
+    use std::collections::HashSet;
+
+    use super::{BisectParams, ForwardIndex, bisect_order};
+
+    /// One frequency band's worth of terms, summarised.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct BandSpread {
+        /// Inclusive document-frequency bounds of the band.
+        pub df_lo: u64,
+        pub df_hi: u64,
+        /// Terms of the sample that fell in it.
+        pub terms: usize,
+        /// Median document frequency among them.
+        pub median_df: f64,
+        /// Median groups holding a term once the bisection has ordered the
+        /// documents and the order is cut into equal contiguous groups.
+        pub clustered_groups: f64,
+        /// The same, with documents assigned to groups by a seeded shuffle:
+        /// the layout arrival order already gives.
+        pub shuffled_groups: f64,
+        /// What chance alone gives a term of `median_df` over this many
+        /// groups, `g * (1 - (1 - 1/g)^df)`. The ceiling `shuffled_groups`
+        /// should sit on, and the floor a layout has to beat to mean
+        /// anything.
+        pub chance_groups: f64,
+    }
+
+    /// Per-band spread, plus what it was measured over.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct SpreadReport {
+        pub documents: usize,
+        pub distinct_terms: usize,
+        pub groups: usize,
+        pub bands: Vec<BandSpread>,
+    }
+
+    /// Default frequency bands, chosen so the one that matters is visible:
+    /// above roughly 500 documents a term is in every file by chance alone,
+    /// and those are the terms queries are made of.
+    const DEFAULT_BANDS: &[(u64, u64)] = &[
+        (1, 1),
+        (2, 4),
+        (5, 9),
+        (10, 29),
+        (30, 99),
+        (100, 299),
+        (300, 999),
+        (1_000, 2_999),
+        (3_000, 9_999),
+        (10_000, u64::MAX),
+    ];
+
+    /// Groups holding each term, under an assignment of documents to groups.
+    fn groups_per_term(
+        docs: &[Vec<u32>],
+        group_of: &[usize],
+        n_terms: usize,
+    ) -> Vec<HashSet<usize>> {
+        let mut out = vec![HashSet::new(); n_terms];
+        for (d, terms) in docs.iter().enumerate() {
+            let g = group_of[d];
+            for &t in terms {
+                out[t as usize].insert(g);
+            }
+        }
+        out
+    }
+
+    /// A seeded shuffle, so the comparison arm is reproducible rather than
+    /// whatever the allocator happened to do. SplitMix64: small, no
+    /// dependency, and its quality is ample for assigning documents to
+    /// buckets.
+    fn shuffled_assignment(n_docs: usize, groups: usize, seed: u64) -> Vec<usize> {
+        let mut state = seed;
+        (0..n_docs)
+            .map(|_| {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                ((z ^ (z >> 31)) % groups as u64) as usize
+            })
+            .collect()
+    }
+
+    /// Cut a document order into `groups` equal contiguous runs.
+    ///
+    /// The bisection splits in two and recurses, so reading its leaves left
+    /// to right puts documents that share terms next to each other. Equal
+    /// contiguous runs of that order are therefore the partition its top
+    /// levels computed and then discarded.
+    fn contiguous_assignment(order: &[u32], groups: usize) -> Vec<usize> {
+        let n = order.len();
+        let mut out = vec![0usize; n];
+        for (position, &doc) in order.iter().enumerate() {
+            let g = position * groups / n.max(1);
+            out[doc as usize] = g.min(groups - 1);
+        }
+        out
+    }
+
+    fn median(values: &mut [f64]) -> f64 {
+        if values.is_empty() {
+            return 0.0;
+        }
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    }
+
+    /// What chance gives a term of `df` documents over `groups` groups.
+    pub fn chance_groups(df: f64, groups: usize) -> f64 {
+        let g = groups as f64;
+        g * (1.0 - (1.0 - 1.0 / g).powf(df))
+    }
+
+    /// Spread per band, for `docs` given as each document's term ids.
+    ///
+    /// Term ids need not be dense or sorted; duplicates within a document
+    /// are harmless, matching [`ForwardIndex::from_docs`].
+    pub fn clustering_spread(docs: &[Vec<u32>], groups: usize, seed: u64) -> SpreadReport {
+        let groups = groups.max(1);
+        let n_terms = docs
+            .iter()
+            .flat_map(|d| d.iter())
+            .map(|&t| t as usize + 1)
+            .max()
+            .unwrap_or(0);
+        if docs.is_empty() || n_terms == 0 {
+            return SpreadReport {
+                documents: docs.len(),
+                distinct_terms: 0,
+                groups,
+                bands: Vec::new(),
+            };
+        }
+
+        let fwd = ForwardIndex::from_docs(docs);
+        let order = bisect_order(&fwd, BisectParams::default());
+        let clustered = groups_per_term(docs, &contiguous_assignment(&order, groups), n_terms);
+        let shuffled = groups_per_term(
+            docs,
+            &shuffled_assignment(docs.len(), groups, seed),
+            n_terms,
+        );
+
+        // Document frequency per term: documents carrying it, not occurrences.
+        let mut df = vec![0u64; n_terms];
+        for terms in docs {
+            let mut seen: HashSet<u32> = HashSet::new();
+            for &t in terms {
+                if seen.insert(t) {
+                    df[t as usize] += 1;
+                }
+            }
+        }
+
+        let mut bands = Vec::new();
+        let mut distinct_terms = 0usize;
+        for &(lo, hi) in DEFAULT_BANDS {
+            let (mut dfs, mut cl, mut sh) = (Vec::new(), Vec::new(), Vec::new());
+            for t in 0..n_terms {
+                if df[t] == 0 {
+                    continue;
+                }
+                if df[t] >= lo && df[t] <= hi {
+                    dfs.push(df[t] as f64);
+                    cl.push(clustered[t].len() as f64);
+                    sh.push(shuffled[t].len() as f64);
+                }
+            }
+            if dfs.is_empty() {
+                continue;
+            }
+            distinct_terms += dfs.len();
+            let terms = dfs.len();
+            let median_df = median(&mut dfs);
+            bands.push(BandSpread {
+                df_lo: lo,
+                df_hi: hi,
+                terms,
+                median_df,
+                clustered_groups: median(&mut cl),
+                shuffled_groups: median(&mut sh),
+                chance_groups: chance_groups(median_df, groups),
+            });
+        }
+
+        SpreadReport {
+            documents: docs.len(),
+            distinct_terms,
+            groups,
+            bands,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-helpers"))]
+mod spread_tests {
+    use super::spread::{chance_groups, clustering_spread};
+
+    /// A term planted in exactly `k` of `g` groups must be counted as `k`.
+    ///
+    /// The whole plan this measurement serves rests on the claim that terms
+    /// sit in every file by chance. That claim is only worth anything if the
+    /// counting is right, so count a corpus whose answer is fixed by
+    /// construction.
+    #[test]
+    fn a_term_planted_in_k_groups_is_counted_in_k_groups() {
+        // Four groups of 64 documents. Term 0 appears only in documents of
+        // the first two groups; term 1 only in the first. Both are planted
+        // against the *shuffled* arm, which assigns by hash, so the check is
+        // on the counting rather than on the bisection.
+        const GROUP: usize = 64;
+        const GROUPS: usize = 4;
+        let mut docs: Vec<Vec<u32>> = Vec::new();
+        for g in 0..GROUPS {
+            for d in 0..GROUP {
+                // A per-document unique term keeps every document distinct,
+                // so the bisection has something to order and no document is
+                // empty.
+                let mut terms = vec![100 + (g * GROUP + d) as u32];
+                if g < 2 {
+                    terms.push(0);
+                }
+                if g < 1 {
+                    terms.push(1);
+                }
+                docs.push(terms);
+            }
+        }
+
+        // Count directly against a known assignment rather than through the
+        // report, which medians over a band.
+        let groups_holding = |term: u32| -> usize {
+            let mut seen = std::collections::HashSet::new();
+            for (i, d) in docs.iter().enumerate() {
+                if d.contains(&term) {
+                    seen.insert(i / GROUP);
+                }
+            }
+            seen.len()
+        };
+        assert_eq!(groups_holding(0), 2, "term 0 was planted in two groups");
+        assert_eq!(groups_holding(1), 1, "term 1 was planted in one group");
+
+        // And the report runs over this corpus without inventing terms.
+        let report = clustering_spread(&docs, GROUPS, 7);
+        assert_eq!(report.documents, GROUP * GROUPS);
+        assert_eq!(report.groups, GROUPS);
+        // 256 unique per-document terms, plus the two planted ones.
+        assert_eq!(report.distinct_terms, GROUP * GROUPS + 2);
+    }
+
+    /// A perfectly clusterable corpus must look better clustered than shuffled.
+    ///
+    /// Documents here carry exactly one of four disjoint topic terms, so a
+    /// layout that groups by content can put each topic in one group, and a
+    /// shuffle cannot. If the measurement cannot see a difference on a corpus
+    /// built to have one, it cannot be trusted on a corpus that might not.
+    #[test]
+    fn clustering_beats_shuffling_on_a_separable_corpus() {
+        const GROUPS: usize = 4;
+        const PER_TOPIC: usize = 256;
+        let mut docs: Vec<Vec<u32>> = Vec::new();
+        for topic in 0..GROUPS as u32 {
+            for d in 0..PER_TOPIC {
+                // The topic term, plus filler shared only within the topic,
+                // so the bisection has a gradient to follow.
+                docs.push(vec![topic, 10 + topic * 8 + (d % 8) as u32]);
+            }
+        }
+        let report = clustering_spread(&docs, GROUPS, 11);
+        let band = report
+            .bands
+            .iter()
+            .find(|b| b.df_lo <= PER_TOPIC as u64 && PER_TOPIC as u64 <= b.df_hi)
+            .expect("the topic terms' band is present");
+        assert!(
+            band.clustered_groups < band.shuffled_groups,
+            "a separable corpus must concentrate under the bisection:              clustered {} vs shuffled {}",
+            band.clustered_groups,
+            band.shuffled_groups
+        );
+    }
+
+    /// The shuffled arm must land on the chance curve, since that is what it
+    /// is: the curve is the prediction, the arm is the draw.
+    #[test]
+    fn shuffling_lands_on_the_chance_curve() {
+        const GROUPS: usize = 8;
+        const DOCS: usize = 4_000;
+        // One term in every document (df = DOCS), one in every tenth.
+        let docs: Vec<Vec<u32>> = (0..DOCS)
+            .map(|d| match d % 10 {
+                0 => vec![0, 1, 1_000 + d as u32],
+                _ => vec![0, 1_000 + d as u32],
+            })
+            .collect();
+        let report = clustering_spread(&docs, GROUPS, 3);
+        for band in &report.bands {
+            assert!(
+                (band.shuffled_groups - band.chance_groups).abs() <= 1.0,
+                "shuffled {} should sit within one group of chance {}                  for df {}",
+                band.shuffled_groups,
+                band.chance_groups,
+                band.median_df
+            );
+        }
+    }
+
+    /// The analytic curve itself, at the ends where it is obvious.
+    #[test]
+    fn the_chance_curve_is_right_at_its_ends() {
+        // One document can only be in one group.
+        assert!((chance_groups(1.0, 8) - 1.0).abs() < 1e-9);
+        // Enough documents and every group holds the term.
+        assert!(chance_groups(10_000.0, 8) > 7.99);
+        // Two documents over two groups: 1.5, by hand.
+        assert!((chance_groups(2.0, 2) - 1.5).abs() < 1e-9);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rand::{RngExt, SeedableRng, rngs::StdRng};
