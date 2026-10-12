@@ -2351,6 +2351,38 @@ impl SupertableReader {
     ///
     /// Takes the same [`Bm25SearchOptions`] as
     /// [`bm25_search`](Self::bm25_search).
+    /// What the manifest knows about each superfile's open-time bytes.
+    ///
+    /// A cold open is documented to cost no superfile GETs when the entry
+    /// carries a complete open blob, because the bytes an open reads rode
+    /// along in the manifest part. This reports, per superfile, whether that
+    /// is actually so: the subsection offsets, whether the FTS subsection is
+    /// named, how many open ranges there are, and how many bytes the blob
+    /// inlines. Reads the manifest only.
+    ///
+    /// Each row is `(uri, has_offsets, has_fts, n_open_ranges, blob_bytes)`.
+    #[cfg(feature = "test-helpers")]
+    pub async fn open_blob_facts(&self) -> Result<Vec<(SuperfileUri, bool, bool, usize, usize)>, QueryError> {
+        let manifest = self.manifest();
+        let entries = manifest
+            .get_all_superfiles_loaded()
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        Ok(entries
+            .iter()
+            .map(|e| match &e.subsection_offsets {
+                None => (e.uri, false, false, 0, 0),
+                Some(o) => (
+                    e.uri,
+                    true,
+                    o.fts.is_some(),
+                    o.fts_open_ranges.len(),
+                    o.open_blob.iter().map(|(_, b)| b.len()).sum(),
+                ),
+            })
+            .collect())
+    }
+
     pub fn bm25_hits(
         &self,
         column: &str,
