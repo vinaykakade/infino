@@ -2351,6 +2351,85 @@ impl SupertableReader {
     ///
     /// Takes the same [`Bm25SearchOptions`] as
     /// [`bm25_search`](Self::bm25_search).
+    /// The ceiling the term index gives each kept superfile for `query`.
+    ///
+    /// The same bounds the ranked path orders superfiles by, scored with the
+    /// table-wide idf so a ceiling and an observed score are on one scale.
+    /// Paired with [`Self::bm25_hits`] this is what a bounded-approximation
+    /// certificate needs: the largest ceiling among superfiles not yet read
+    /// bounds every document they could still contribute.
+    #[cfg(feature = "test-helpers")]
+    pub async fn ceiling_slack(
+        &self,
+        column: &str,
+        query: &str,
+    ) -> Result<Vec<(SuperfileUri, f32)>, QueryError> {
+        let manifest = self.manifest();
+        let Some(tokenizer) = manifest.try_fts_tokenizer_for(column) else {
+            return Ok(Vec::new());
+        };
+        // The ranked clause split, not the unranked one: a should term
+        // still raises a document's score, so leaving it out of the
+        // ceiling would report a bound the scores can exceed.
+        let clauses = tokenizer.parse(query).into_clauses(BoolMode::Or);
+        let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
+        let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
+        let own_phrases = |phrases: Vec<Phrase<Cow<'_, str>>>| -> Vec<Phrase<String>> {
+            phrases.iter().map(|p| p.map(|t| t.to_string())).collect()
+        };
+        let must_phrases = own_phrases(clauses.must_phrases);
+        let should_phrases = own_phrases(clauses.should_phrases);
+        let has_musts = !musts.is_empty() || !must_phrases.is_empty();
+        let prune_leaf = match has_musts {
+            true => presence_leaf(column, &musts, &must_phrases, BoolMode::And),
+            false => presence_leaf(column, &shoulds, &should_phrases, BoolMode::Or),
+        };
+        let kept =
+            select_fts_superfiles(manifest.as_ref(), slice::from_ref(&prune_leaf), column).await?;
+        let Some(index) = manifest.term_index().await else {
+            return Ok(Vec::new());
+        };
+        let Some(column_id) = manifest.field_id(column) else {
+            return Ok(Vec::new());
+        };
+        let terms: Vec<&str> = musts
+            .iter()
+            .chain(shoulds.iter())
+            .map(String::as_str)
+            .collect();
+        let phrases: Vec<Vec<&str>> = must_phrases
+            .iter()
+            .chain(should_phrases.iter())
+            .map(|p| p.iter().map(String::as_str).collect())
+            .collect();
+        // Score the bounds with the same table-wide idf the ranked path
+        // uses, so a ceiling and an observed score are on one scale.
+        let mut scored: Vec<String> = Vec::new();
+        for t in musts.iter().chain(shoulds.iter()).chain(
+            must_phrases
+                .iter()
+                .chain(should_phrases.iter())
+                .flat_map(|p| p.iter()),
+        ) {
+            if !scored.contains(t) {
+                scored.push(t.clone());
+            }
+        }
+        let corpus = manifest.fts_length_stats(column);
+        let (gidf, _memos) = self
+            .global_idf_open_wave(manifest.as_ref(), column, &scored, &kept, corpus)
+            .await?;
+        let idf_used = |term: &str, local: f32| gidf.get(term).copied().unwrap_or(local);
+        let ceilings = index
+            .query_ceilings(column_id, &terms, &phrases, &kept, &idf_used)
+            .await
+            .map_err(|e| QueryError::Internal(e.to_string()))?;
+        Ok(kept
+            .iter()
+            .filter_map(|e| ceilings.get(&e.superfile_id).map(|c| (e.uri, *c)))
+            .collect())
+    }
+
     pub fn bm25_hits(
         &self,
         column: &str,
