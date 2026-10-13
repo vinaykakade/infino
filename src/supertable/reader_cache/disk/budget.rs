@@ -334,6 +334,14 @@ impl DiskCacheStore {
                 continue;
             }
             let needed = (cur + bytes).saturating_sub(budget);
+            tracing::info!(
+                target: "infino::cache",
+                want = bytes,
+                accounted = cur,
+                budget,
+                needed,
+                "reserve: over budget, evicting"
+            );
             self.evict_at_least(needed).await?;
         }
     }
@@ -465,12 +473,21 @@ impl DiskCacheStore {
         // Never-opened files go first; freeing one cannot hurt a live reader.
         let freed = self.evict_unindexed(bytes_needed);
         if freed >= bytes_needed {
+            tracing::info!(target: "infino::cache", freed, bytes_needed, "evict: satisfied from never-opened files");
             return Ok(());
         }
-        let freed = freed + self.evict_block_files(bytes_needed - freed);
+        let from_blocks = self.evict_block_files(bytes_needed - freed);
+        let freed = freed + from_blocks;
         if freed >= bytes_needed {
+            tracing::info!(target: "infino::cache", freed, from_blocks, bytes_needed, "evict: satisfied from block files");
             return Ok(());
         }
+        tracing::info!(
+            target: "infino::cache",
+            freed,
+            bytes_needed,
+            "evict: unindexed and block files were not enough, falling through to live entries"
+        );
         let bytes_needed = bytes_needed - freed;
 
         // Clone the current pinned_fn out of the mutex
