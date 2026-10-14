@@ -982,13 +982,7 @@ mod tests {
         assert_eq!(store.stats().current_bytes, size);
 
         let served = store
-            .cold_fetch_lazy(
-                &uri,
-                &uri.storage_path(),
-                None,
-                store.resolve_storage(None),
-                false,
-            )
+            .cold_fetch_lazy(&uri, &uri.storage_path(), None, store.resolve_storage(None))
             .await
             .expect("late lazy admission");
 

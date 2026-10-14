@@ -723,12 +723,8 @@ impl DiskCacheStore {
             // whole-superfile range reads, defeating the lazy/open-batch
             // path. Eager cache promotion can still verify when it
             // materializes the full superfile.
-            let lazy_reader = SuperfileReader::open_lazy_with(
-                Arc::clone(&source),
-                OpenOptions { verify_crc: false },
-            )
-            .await?;
-            lazy_reader
+            SuperfileReader::open_lazy_with(Arc::clone(&source), OpenOptions { verify_crc: false })
+                .await?
         } else {
             // Unknown-size path: avoid the cold-open HEAD round-trip.
             // The first `tail()` inside `open_lazy_with` is a native
@@ -750,12 +746,8 @@ impl DiskCacheStore {
             );
             block_source_arc = Arc::clone(&block_source);
             let source: Arc<dyn LazyByteSource> = block_source;
-            let lazy_reader = SuperfileReader::open_lazy_with(
-                Arc::clone(&source),
-                OpenOptions { verify_crc: false },
-            )
-            .await?;
-            lazy_reader
+            SuperfileReader::open_lazy_with(Arc::clone(&source), OpenOptions { verify_crc: false })
+                .await?
         };
 
         // A paged entry charges only the blocks it has actually filled, whatever the read intent.
