@@ -189,10 +189,17 @@ async fn seed(storage: &dyn StorageProvider, uri: SuperfileUri, bytes: Bytes) {
 }
 
 fn fresh_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStore>) {
+    cache_with_budget(storage, DISK_CACHE_BUDGET_BYTES)
+}
+
+fn cache_with_budget(
+    storage: Arc<dyn StorageProvider>,
+    disk_budget_bytes: u64,
+) -> (TempDir, Arc<DiskCacheStore>) {
     let dir = TempDir::new().expect("tempdir");
     let cfg = DiskCacheConfig {
         cache_root: dir.path().to_path_buf(),
-        disk_budget_bytes: DISK_CACHE_BUDGET_BYTES,
+        disk_budget_bytes,
         cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
         cold_fetch_streams: COLD_FETCH_STREAMS,
         cold_fetch_chunk_bytes: LAZY_COLD_FETCH_CHUNK_BYTES,
@@ -512,5 +519,90 @@ fn term_pass_on_a_lazy_cache_makes_few_gets() {
         gets <= TERM_PASS_MAX_OPTIMIZE_GETS,
         "optimize made {gets} range GETs on a cold lazy cache; at most \
          {TERM_PASS_MAX_OPTIMIZE_GETS} expected with the FTS section prefetched"
+    );
+}
+
+// ============================================================
+// A file bigger than the budget.
+//
+// A paged entry holds only the ranges read so far, so what it
+// costs the budget is what it has filled. Charging it the whole
+// file instead makes the budget a floor on file size: a superfile
+// larger than the cache could not be read at all, and under a
+// budget smaller than the table the reservations evict each other
+// while most of the budget backs bytes that are not on disk.
+// ============================================================
+
+/// How much smaller than the superfile the budget is set. A quarter is
+/// comfortably below the file and far above the few blocks one search fills.
+const UNDERSIZED_BUDGET_DIVISOR: u64 = 4;
+
+/// A term held by the first document of [`term_pass_titles`].
+const LARGE_CORPUS_TERM: &str = "t000000";
+
+fn build_large_fts_bytes() -> Bytes {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
+        Field::new("title", DataType::LargeUtf8, false),
+    ]));
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![FtsConfig::new("title")],
+        vec![],
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("builder");
+    let titles = term_pass_titles();
+    let ids = decimal128_ids(0..titles.len() as u64);
+    let titles = LargeStringArray::from(titles);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
+    b.add_batch(&batch, &[]).expect("add_batch");
+    Bytes::from(b.finish().expect("finish"))
+}
+
+/// A superfile larger than the entire cache budget still opens and answers a
+/// search. The budget bounds what the cache keeps, not how big a file it can
+/// serve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn superfile_larger_than_the_budget_is_still_queryable() {
+    let store_dir = TempDir::new().expect("storage");
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
+    let bytes = build_large_fts_bytes();
+    let superfile_len = bytes.len() as u64;
+    let budget = superfile_len / UNDERSIZED_BUDGET_DIVISOR;
+    assert!(
+        budget > 0 && budget < superfile_len,
+        "the budget must sit below the superfile for this test to mean anything; \
+         superfile_len={superfile_len}, budget={budget}"
+    );
+
+    let uri = SuperfileUri::new_v4();
+    seed(&*local, uri, bytes).await;
+    let (_d, cache) = cache_with_budget(local, budget);
+
+    let reader = cache
+        .reader(&uri)
+        .await
+        .expect("a superfile larger than the budget must still open through the paged path");
+    let fts = reader.fts().expect("fts");
+    let hits = fts
+        .search("title", &[LARGE_CORPUS_TERM], FTS_TOP_K, BoolMode::Or)
+        .await
+        .expect("bm25");
+    assert!(
+        !hits.is_empty(),
+        "the search must return the documents holding {LARGE_CORPUS_TERM}"
+    );
+
+    let charged = cache.stats().current_bytes;
+    assert!(
+        charged <= budget,
+        "a paged entry must be charged for what it filled, not the whole file; \
+         charged={charged}, budget={budget}, superfile_len={superfile_len}"
     );
 }

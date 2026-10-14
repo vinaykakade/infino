@@ -453,15 +453,8 @@ impl DiskCacheStore {
                     .into(),
             )),
             ColdFetchMode::LazyForegroundWithBackgroundFill => {
-                let allow_background_fill = intent == ReadIntent::Warm;
-                self.cold_fetch_lazy(
-                    uri,
-                    storage_key,
-                    offsets,
-                    fetch_storage,
-                    allow_background_fill,
-                )
-                .await
+                self.cold_fetch_lazy(uri, storage_key, offsets, fetch_storage)
+                    .await
             }
         }
     }
@@ -616,11 +609,10 @@ impl DiskCacheStore {
         storage_key: &str,
         offsets: Option<&SubsectionOffsets>,
         fetch_storage: Arc<dyn StorageProvider>,
-        allow_background_fill: bool,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = storage_key.to_owned();
         let block_source_arc: Arc<BlockCachedSource>;
-        let (lazy_reader, size) = if let Some(offsets) = offsets {
+        let lazy_reader = if let Some(offsets) = offsets {
             let total_size = offsets.total_size;
 
             // Match `SuperfileReader::open_lazy_with`'s parquet tail
@@ -665,7 +657,7 @@ impl DiskCacheStore {
                 Arc::downgrade(self),
                 *uri,
                 self.blocks_path(uri),
-                !allow_background_fill,
+                true,
                 // FTS subsection reads bypass block rounding (exact ranges);
                 // see the `passthrough` field docs.
                 offsets.fts,
@@ -736,7 +728,7 @@ impl DiskCacheStore {
                 OpenOptions { verify_crc: false },
             )
             .await?;
-            (lazy_reader, total_size)
+            lazy_reader
         } else {
             // Unknown-size path: avoid the cold-open HEAD round-trip.
             // The first `tail()` inside `open_lazy_with` is a native
@@ -752,7 +744,7 @@ impl DiskCacheStore {
                 Arc::downgrade(self),
                 *uri,
                 self.blocks_path(uri),
-                !allow_background_fill,
+                true,
                 // No manifest hints here, so the FTS subsection is unknown.
                 None,
             );
@@ -763,26 +755,19 @@ impl DiskCacheStore {
                 OpenOptions { verify_crc: false },
             )
             .await?;
-            let size = source.size();
-            (lazy_reader, size)
+            lazy_reader
         };
 
-        // A Stream open charges only the blocks it fills (SourceOwned), so a fanout over many
-        // superfiles does not reserve them all in full and evict live peers. A Warm open will
-        // download the whole file, so it reserves the full size now.
-        if allow_background_fill {
-            self.reserve_manual(size).await?;
-        }
-
+        // A paged entry charges only the blocks it has actually filled, whatever the read intent.
+        // Charging the whole file here would reserve budget for bytes that are not on disk and
+        // may never be: the download is deferred, and an entry evicted before it starts never
+        // writes them. Against a budget smaller than the table, those reservations evict live
+        // peers to hold space for downloads that then do not happen, so the cache churns while
+        // most of its budget backs nothing. `maybe_spawn_background_fill` takes the full-size
+        // reservation when a fill actually starts.
         let lazy_reader = Arc::new(lazy_reader);
-        let (size_bytes, accounting) = if allow_background_fill {
-            (Arc::new(AtomicU64::new(size)), EntryAccounting::Eager)
-        } else {
-            (
-                block_source_arc.filled_bytes_handle(),
-                EntryAccounting::SourceOwned,
-            )
-        };
+        let size_bytes = block_source_arc.filled_bytes_handle();
+        let accounting = EntryAccounting::SourceOwned;
         let entry = Arc::new(CachedEntry {
             reader: Arc::clone(&lazy_reader),
             // Unlatched: a later Warm read starts the fill, see `maybe_spawn_background_fill`.
