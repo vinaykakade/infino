@@ -55,6 +55,7 @@ use serde::{
 
 use crate::{
     runtime_metrics::rss::available_memory_bytes,
+    superfile::fts::builder::DEFAULT_SPILL_THRESHOLD_BYTES,
     supertable::reader_cache::config::DEFAULT_PROMOTION_DEFER_TIMEOUT,
 };
 
@@ -245,6 +246,14 @@ pub struct SupertableSettings {
     /// every this many bytes and builds one superfile per piece, so the file count follows the
     /// data volume rather than the core count. `0` falls back to one piece per pool thread.
     pub superfile_buffer_split_mb: u64,
+    /// How much of a full-text column's postings one commit shard accumulates in memory
+    /// before it starts spilling sorted runs to the scratch directory, in mebibytes. The
+    /// spill is what keeps a build's memory bounded, and it is also what the build waits on
+    /// when the scratch disk is slower than the tokenizer: a shard that spills everything
+    /// writes and then reads back several times its input. Raise it on a host with memory
+    /// to spare so large shards build in memory; each shard holds this much per column on
+    /// top of its share of the write buffer.
+    pub fts_spill_threshold_mb: u64,
     /// Verify the trailing whole-blob CRC and per-subsection
     /// CRCs on every `SuperfileReader::open`. Defaults to
     /// `true`. Set to `false` only when the underlying
@@ -263,6 +272,7 @@ impl Default for SupertableSettings {
             id_column: default_id_column(),
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
             superfile_buffer_split_mb: DEFAULT_SUPERFILE_BUFFER_SPLIT_MB,
+            fts_spill_threshold_mb: DEFAULT_FTS_SPILL_THRESHOLD_MB,
             verify_crc_on_open: DEFAULT_VERIFY_CRC_ON_OPEN,
         }
     }
@@ -270,6 +280,8 @@ impl Default for SupertableSettings {
 
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 const DEFAULT_SUPERFILE_BUFFER_SPLIT_MB: u64 = 64;
+/// The full-text builder's own default, expressed in the unit the config uses.
+const DEFAULT_FTS_SPILL_THRESHOLD_MB: u64 = (DEFAULT_SPILL_THRESHOLD_BYTES / (1024 * 1024)) as u64;
 const DEFAULT_VERIFY_CRC_ON_OPEN: bool = true;
 
 // Compaction defaults
@@ -1831,6 +1843,7 @@ mod tests {
     fn embedded_default_loads_with_expected_value() {
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.supertable.commit_threshold_size_mb, 1024);
+        assert_eq!(cfg.supertable.fts_spill_threshold_mb, 256);
     }
 
     /// Drain graph-assign ships on, and the kill-switch parses to `false`.

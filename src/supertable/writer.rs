@@ -2792,6 +2792,9 @@ fn build_one_shard_with_layout(
             .with_vector_layout(vector_layout)
             .with_vector_centroids(provided_centroids),
     )?;
+    builder.set_fts_spill_threshold_bytes(
+        (options.fts_spill_threshold_mb as usize).saturating_mul(MIB),
+    );
 
     let scalar_schema = manifest.scalar_schema();
     // The supertable always prepends the id column at index 0 of the
