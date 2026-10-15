@@ -54,6 +54,14 @@ supertable:
   # than the core count. Set 0 to fall back to one piece per writer-pool thread.
   superfile_buffer_split_mb: 64
 
+  # In-memory postings budget per full-text column per commit shard, in
+  # MiB, before the builder spills sorted runs to the scratch directory.
+  # The spill bounds build memory; it is also what a build waits on when
+  # the scratch disk is slower than the tokenizer, since a shard that
+  # spills everything writes and reads back several times its input. Raise
+  # it on a host with memory to spare so large shards build in memory.
+  fts_spill_threshold_mb: 256
+
   # Verify the trailing whole-blob CRC and per-subsection CRCs
   # on every SuperfileReader::open. Defaults to true. Set to
   # false only when the underlying storage already validates

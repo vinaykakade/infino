@@ -78,6 +78,7 @@ use crate::{
     superfile::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
+        fts::builder::DEFAULT_SPILL_THRESHOLD_BYTES,
         vector::layout::VectorLayout,
     },
     supertable::{
@@ -235,6 +236,7 @@ const DEFAULT_DRAIN_BATCH_SUPERFILES: i64 = 1;
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Default target buffered bytes per commit shard (in MiB units).
 const DEFAULT_SUPERFILE_BUFFER_SPLIT_MB: u64 = 64;
+const DEFAULT_FTS_SPILL_THRESHOLD_MB: u64 = (DEFAULT_SPILL_THRESHOLD_BYTES / (1024 * 1024)) as u64;
 /// Default object size (100 MiB) above which uploads route through
 /// multipart.
 const DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES: u64 = 100 * (1 << 20);
@@ -580,6 +582,10 @@ pub struct SupertableOptions {
     /// `0` removes the target: one shard per pool thread, tying file count to the machine.
     /// Default: 64.
     pub superfile_buffer_split_mb: u64,
+    /// In-memory postings budget per full-text column per commit shard before the builder
+    /// spills, in MiB. See [`crate::config::SupertableSettings::fts_spill_threshold_mb`].
+    /// Default: the builder's own 256.
+    pub fts_spill_threshold_mb: u64,
     /// Superfile size (in bytes) at or above which the writer
     /// routes the storage write through
     /// [`StorageProvider::put_multipart`] instead of
@@ -800,6 +806,7 @@ impl SupertableOptions {
             max_sealed_retries: DEFAULT_MAX_SEALED_RETRIES,
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
             superfile_buffer_split_mb: DEFAULT_SUPERFILE_BUFFER_SPLIT_MB,
+            fts_spill_threshold_mb: DEFAULT_FTS_SPILL_THRESHOLD_MB,
             put_multipart_threshold_bytes: DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES,
             verify_crc_on_open: true,
             read_consistency: Consistency::default(),
@@ -1039,6 +1046,13 @@ impl SupertableOptions {
         self
     }
 
+    /// Set the per-shard, per-column in-memory postings budget before the full-text
+    /// builder spills, in MiB.
+    pub fn with_fts_spill_threshold_mb(mut self, mb: u64) -> Self {
+        self.fts_spill_threshold_mb = mb;
+        self
+    }
+
     /// Override the superfile-size threshold (bytes) at which
     /// the writer routes through `put_multipart` instead of
     /// `put_atomic`. See [`Self::put_multipart_threshold_bytes`].
@@ -1139,6 +1153,7 @@ impl SupertableOptions {
         };
         self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
         self.superfile_buffer_split_mb = cfg.supertable.superfile_buffer_split_mb;
+        self.fts_spill_threshold_mb = cfg.supertable.fts_spill_threshold_mb;
         self.verify_crc_on_open = cfg.supertable.verify_crc_on_open;
         self.drain_batch_superfiles = cfg.vector.drain_batch_superfiles;
         self.target_recall = cfg.vector.target_recall;
@@ -1752,6 +1767,7 @@ supertable:
         assert_eq!(opts.reader_pool.current_num_threads(), reader_default);
         assert_eq!(opts.writer_pool.current_num_threads(), writer_default);
         assert_eq!(opts.commit_threshold_size_mb, 1024);
+        assert_eq!(opts.fts_spill_threshold_mb, 256);
         assert_eq!(opts.id_column, "_id");
     }
 
