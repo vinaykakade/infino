@@ -20,6 +20,7 @@
 use std::{sync::Arc, time::Duration};
 
 use futures::future::join_all;
+use tokio::task::JoinSet;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -93,8 +94,10 @@ pub(crate) enum FooterState {
     Inconsistent,
 }
 
-/// What one scan found: the superfiles a reindex can repair, the ones it
-/// must leave for a person, and how many the snapshot held.
+/// What one scan found: the superfiles a reindex can repair — behind on an
+/// axis, or stored in arrival order, which only [`ReindexMode::Reorder`]
+/// acts on — the ones it must leave for a person, and how many the
+/// snapshot held.
 pub(crate) struct Assessment {
     pub(crate) stale: Vec<StaleSuperfile>,
     pub(crate) inconsistent_footers: Vec<Uuid>,
@@ -133,6 +136,12 @@ impl StaleSuperfile {
     /// Whether this file is behind on anything a reindex repairs.
     pub(crate) fn is_current(&self) -> bool {
         self.fts.is_current() && !self.has_duplicated_region_keys
+    }
+
+    /// Whether `mode` has work on this file: every mode acts on staleness,
+    /// and [`ReindexMode::Reorder`] also on arrival order.
+    pub(crate) fn behind_under(&self, mode: ReindexMode) -> bool {
+        !self.is_current() || (matches!(mode, ReindexMode::Reorder) && self.fts.needs_reorder())
     }
 
     /// Columns a rewrite cannot repair, because their text was never
@@ -215,6 +224,15 @@ pub struct StalenessReport {
     /// these *and* the files in [`Self::awaiting_reanalysis`], and costs
     /// far more per byte besides, so this does not bound it.
     pub bytes_to_rewrite: u64,
+    /// Superfiles storing their documents in arrival order, with more of
+    /// them than the merge's reorder minimum — what
+    /// [`crate::ReindexMode::Reorder`] would rewrite for order alone.
+    ///
+    /// Not staleness, and not counted by [`Self::is_current`]: such a file
+    /// is what a plain build writes and it reads correctly. It is slower
+    /// to query than the same file after a merge chose its order, which is
+    /// why a caller may ask for the rewrite by name.
+    pub unordered: usize,
     /// Columns no rewrite and no re-analysis can repair, because their
     /// text was never stored.
     ///
@@ -349,6 +367,10 @@ pub(crate) fn plan_jobs(
             // revision — planning one for a file that is only
             // analysis-stale would emit the same job forever.
             ReindexMode::Rewrite => s.needs_rewrite(),
+            // The same rewrite, also for files whose only fault is their
+            // order; a file already carrying one is skipped, which is what
+            // makes the mode terminate.
+            ReindexMode::Reorder => s.needs_rewrite() || s.fts.needs_reorder(),
             // Re-analysis produces new terms and a current container, so
             // it repairs either axis.
             ReindexMode::Auto | ReindexMode::Reanalyze => {
@@ -362,6 +384,7 @@ pub(crate) fn plan_jobs(
         .map(|s| {
             let repair = match mode {
                 ReindexMode::Rewrite => Repair::Layout,
+                ReindexMode::Reorder => Repair::Reorder,
                 ReindexMode::Reanalyze => Repair::Terms,
                 // The cheapest repair that makes *this* file current:
                 // copying postings cannot clear a stale revision, so only
@@ -408,6 +431,11 @@ pub(crate) enum Repair {
     Layout,
     /// Re-analyze the stored text, which brings the layout current too.
     Terms,
+    /// Rewrite through the merge, which chooses the document order and
+    /// brings the layout current on the way. Distinct from [`Repair::Layout`]
+    /// because that repair may carry the blob across without a merge, and
+    /// only the merge orders.
+    Reorder,
 }
 
 impl Supertable {
@@ -472,7 +500,9 @@ impl Supertable {
                     &reader,
                     has_duplicated_region_keys,
                 );
-                if !assessed.is_current() {
+                // Arrival order is not staleness, but it is work one mode
+                // does, so such files ride along for the planner to pick.
+                if !assessed.is_current() || assessed.fts.needs_reorder() {
                     stale.push(assessed);
                 }
             }
@@ -524,6 +554,7 @@ impl Supertable {
                 mode: match repair {
                     Repair::Layout => ReindexMode::Rewrite,
                     Repair::Terms => ReindexMode::Reanalyze,
+                    Repair::Reorder => ReindexMode::Reorder,
                 },
                 live_bytes: job.estimated_output_bytes,
             })
@@ -586,6 +617,9 @@ impl Supertable {
             }
             if file.fts.needs_reanalysis() {
                 report.awaiting_reanalysis += 1;
+            }
+            if file.fts.needs_reorder() {
+                report.unordered += 1;
             }
         }
         report.unrepairable_columns = unrepairable_column_names(&stale);
@@ -673,8 +707,11 @@ impl Supertable {
             );
         }
 
+        // Files the scan listed only for their order are current under every
+        // mode but one, so "current" is judged against the mode that runs.
+        let behind = all.iter().filter(|s| s.behind_under(opts.mode)).count();
         let mut report = ReindexReport {
-            already_current: total.saturating_sub(all.len() + inconsistent_footers.len()),
+            already_current: total.saturating_sub(behind + inconsistent_footers.len()),
             awaiting_reanalysis: match opts.mode {
                 // Re-analysis is what clears this axis, so a run that
                 // performs it leaves nothing waiting — except the columns
@@ -682,7 +719,9 @@ impl Supertable {
                 // re-analyzes exactly the files on this axis, so it clears
                 // it too.
                 ReindexMode::Auto | ReindexMode::Reanalyze => 0,
-                ReindexMode::Rewrite => all.iter().filter(|s| s.fts.needs_reanalysis()).count(),
+                ReindexMode::Rewrite | ReindexMode::Reorder => {
+                    all.iter().filter(|s| s.fts.needs_reanalysis()).count()
+                }
             },
             inconsistent_footers,
             ..Default::default()
@@ -702,16 +741,42 @@ impl Supertable {
         // because the plan picks between them per superfile.
         let layout: Arc<dyn SuperfileMerge> = Arc::new(build::RepairMerge(Repair::Layout));
         let terms: Arc<dyn SuperfileMerge> = Arc::new(build::RepairMerge(Repair::Terms));
-        for (done, (job, repair)) in plan_jobs(&all, opts.mode).into_iter().enumerate() {
-            let merge = match repair {
-                Repair::Layout => &layout,
-                Repair::Terms => &terms,
+        let reorder: Arc<dyn SuperfileMerge> = Arc::new(build::RepairMerge(Repair::Reorder));
+        // Up to `concurrency` rewrites in flight, each its own task: a job
+        // seals, builds and commits one superfile, which is what already
+        // lets compaction run merges side by side. Outcomes are handled as
+        // they land; a fatal one aborts what is still running.
+        let concurrency = opts.concurrency.max(1);
+        let mut queued = plan_jobs(&all, opts.mode).into_iter();
+        let mut running: JoinSet<(Uuid, Result<JobOutcome, CompactionError>)> = JoinSet::new();
+        let mut done = 0usize;
+        loop {
+            while running.len() < concurrency {
+                let Some((job, repair)) = queued.next() else {
+                    break;
+                };
+                let merge = Arc::clone(match repair {
+                    Repair::Layout => &layout,
+                    Repair::Terms => &terms,
+                    Repair::Reorder => &reorder,
+                });
+                let superfile_id = job.inputs[0];
+                let table = self.clone();
+                running.spawn(async move {
+                    let outcome = table
+                        .run_compaction_job_with(job, stale_seal_timeout, merge)
+                        .await;
+                    (superfile_id, outcome)
+                });
+            }
+            let Some(joined) = running.join_next().await else {
+                break;
             };
-            let superfile_id = job.inputs[0];
-            let outcome = match self
-                .run_compaction_job_with(job, stale_seal_timeout, Arc::clone(merge))
-                .await
-            {
+            let (superfile_id, outcome) = joined.map_err(|e| ReindexError::Rewrite {
+                superfile_id: Uuid::nil(),
+                cause: format!("rewrite task failed: {e}"),
+            })?;
+            let outcome = match outcome {
                 Ok(outcome) => outcome,
                 // Someone else holds this superfile. That is the seal
                 // doing its job, not a failure: the owner may be a live
@@ -735,8 +800,12 @@ impl Supertable {
                 // and the job. Its staleness went with it, so there is
                 // nothing here to repair and nothing to report.
                 Err(CompactionError::SuperfileNotFound(_)) => continue,
-                Err(CompactionError::Unsupported(m)) => return Err(ReindexError::Unsupported(m)),
+                Err(CompactionError::Unsupported(m)) => {
+                    running.abort_all();
+                    return Err(ReindexError::Unsupported(m));
+                }
                 Err(e) => {
+                    running.abort_all();
                     return Err(ReindexError::Rewrite {
                         superfile_id,
                         cause: e.to_string(),
@@ -750,9 +819,9 @@ impl Supertable {
             if outcome == JobOutcome::Committed {
                 report.rewritten += 1;
             }
-
+            done += 1;
             // See REWRITES_PER_TERM_INDEX_REFRESH.
-            if (done + 1) % REWRITES_PER_TERM_INDEX_REFRESH == 0 {
+            if done.is_multiple_of(REWRITES_PER_TERM_INDEX_REFRESH) {
                 self.refresh_term_index_best_effort();
             }
         }
@@ -1058,6 +1127,7 @@ mod tests {
         FtsStaleness {
             container: Some(4),
             analysis: Vec::new(),
+            unordered: false,
         }
     }
 
@@ -1070,6 +1140,16 @@ mod tests {
                 current: 1,
                 stored: true,
             }],
+            unordered: false,
+        }
+    }
+
+    /// Current on both axes, stored in arrival order.
+    fn unordered() -> FtsStaleness {
+        FtsStaleness {
+            container: None,
+            analysis: Vec::new(),
+            unordered: true,
         }
     }
 
@@ -1258,6 +1338,33 @@ mod tests {
         );
     }
 
+    /// Arrival order is work for one mode only: `Reorder` rewrites such a
+    /// file, and also one whose container is behind, and leaves an
+    /// analysis-stale file to be reported; every other mode treats an
+    /// arrival-ordered current file as nothing to do.
+    #[test]
+    fn only_reorder_rewrites_an_arrival_ordered_current_superfile() {
+        let stale = [
+            entry(1, unordered()),
+            entry(2, behind_container()),
+            entry(3, behind_analysis()),
+        ];
+        let reorder = plan_jobs(&stale, ReindexMode::Reorder);
+        assert_eq!(
+            reorder
+                .iter()
+                .map(|(job, repair)| (job.inputs[0], *repair))
+                .collect::<Vec<_>>(),
+            vec![
+                (Uuid::from_u128(1), Repair::Reorder),
+                (Uuid::from_u128(2), Repair::Reorder),
+            ]
+        );
+        assert!(plan_jobs(&[entry(1, unordered())], ReindexMode::Rewrite).is_empty());
+        assert!(plan_jobs(&[entry(1, unordered())], ReindexMode::Auto).is_empty());
+        assert!(plan_jobs(&[entry(1, unordered())], ReindexMode::Reanalyze).is_empty());
+    }
+
     /// Behind on both axes: the rewrite is still worth doing for the
     /// container, and the analysis stays for re-analysis to clear.
     #[test]
@@ -1265,6 +1372,7 @@ mod tests {
         let both = FtsStaleness {
             container: Some(4),
             analysis: behind_analysis().analysis,
+            unordered: false,
         };
         assert_eq!(plan_jobs(&[entry(5, both)], ReindexMode::Rewrite).len(), 1);
     }
@@ -1281,6 +1389,7 @@ mod tests {
         let both = FtsStaleness {
             container: Some(4),
             analysis: behind_analysis().analysis,
+            unordered: false,
         };
         let plan = plan_jobs(
             &[

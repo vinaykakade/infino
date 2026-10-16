@@ -8,8 +8,9 @@ BoolMode: TypeAlias = Literal["or", "and"]
 # How much a reindex repairs: "auto" gives each superfile the cheapest repair
 # that makes it current; "rewrite" brings layouts current and leaves superfiles
 # whose terms are stale (reported); "reanalyze" re-tokenizes every stale
-# superfile from its stored text.
-ReindexMode: TypeAlias = Literal["auto", "rewrite", "reanalyze"]
+# superfile from its stored text; "reorder" rewrites superfiles stored in
+# arrival order so their documents take the order a merge would choose.
+ReindexMode: TypeAlias = Literal["auto", "rewrite", "reanalyze", "reorder"]
 ColdFetchMode: TypeAlias = Literal[
     "hybrid_with_prefetch",
     "range_only",
@@ -295,6 +296,8 @@ class StalenessReport:
     @property
     def bytes_to_rewrite(self) -> int: ...
     @property
+    def unordered(self) -> int: ...
+    @property
     def unrepairable_columns(self) -> list[str]: ...
     @property
     def inconsistent_footers(self) -> list[str]: ...
@@ -307,7 +310,7 @@ class PlannedRepair:
     def superfile_id(self) -> str: ...
     # Never "auto": the plan has already resolved it per superfile.
     @property
-    def mode(self) -> Literal["rewrite", "reanalyze"]: ...
+    def mode(self) -> Literal["rewrite", "reanalyze", "reorder"]: ...
     @property
     def live_bytes(self) -> int: ...
     def __repr__(self) -> str: ...

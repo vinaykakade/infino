@@ -100,6 +100,11 @@ impl SuperfileMerge for RepairMerge {
         inputs: MergeInputs<'_>,
         output: &mut dyn Write,
     ) -> Result<SuperfileStats, BuildError> {
+        // The order a merge chooses is the whole point of a reorder, and the
+        // carrying path below never merges, so that repair skips it.
+        if matches!(self.0, Repair::Reorder) {
+            return CompactionMerge.build(inputs, output);
+        }
         match carry_body(&inputs) {
             Some((reader, entry)) => repair_carrying_body_to(
                 self.0,
@@ -111,7 +116,7 @@ impl SuperfileMerge for RepairMerge {
             // Restating compaction's merge here would be a second copy that
             // could drift from the one the table is actually compacted with.
             None => match self.0 {
-                Repair::Layout => CompactionMerge.build(inputs, output),
+                Repair::Layout | Repair::Reorder => CompactionMerge.build(inputs, output),
                 Repair::Terms => reanalyze_to(inputs.inputs, inputs.builder_options, output),
             },
         }
@@ -142,11 +147,12 @@ fn repair_carrying_body_to(
     let inputs = [MergeInput::same_shape(Arc::clone(source), None)];
     let opts = merge_builder_opts(&inputs, base)?;
     let mut builder = SuperfileBuilder::new(match repair {
-        Repair::Layout => opts,
+        // A reorder never carries; it is routed to the merge before this.
+        Repair::Layout | Repair::Reorder => opts,
         Repair::Terms => opts.reanalyze_stored_columns(),
     })?;
     match repair {
-        Repair::Layout => {
+        Repair::Layout | Repair::Reorder => {
             builder.carry_fts_from_reader_scoped(source, None, CarryScope::AllColumns)?
         }
         Repair::Terms => builder.reanalyze_fts_from_reader(source)?,
