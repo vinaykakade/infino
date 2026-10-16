@@ -19,8 +19,16 @@
 //!
 //! Reporting them apart is what lets a migration choose the cheap repair
 //! where it suffices and reserve the expensive one for where it does not.
+//!
+//! A third property is reported beside them without being staleness: whether
+//! the blob stores its documents in an order a merge chose, or in the order
+//! they arrived. An arrival-ordered blob is current and correct; it is only
+//! slower to query, because the documents sharing a term sit far apart. A
+//! rewrite through the merge gives it an order, and that is a repair a
+//! caller asks for by name rather than one a stale table needs.
 
 use crate::superfile::{
+    builder::REORDER_MIN_DOCS,
     format,
     fts::{
         analysis::{UNKNOWN_ANALYSIS_REVISION, chain_revision},
@@ -37,6 +45,11 @@ pub(crate) struct FtsStaleness {
     /// Columns whose terms were produced by an older revision of their
     /// own analysis chain, with the revision each records.
     pub(crate) analysis: Vec<StaleColumn>,
+    /// The blob stores its documents in arrival order and holds more of
+    /// them than the merge's reorder minimum, so a rewrite through the
+    /// merge would give it an order. Not staleness: an arrival-ordered
+    /// blob is what a plain build writes, and it reads correctly.
+    pub(crate) unordered: bool,
 }
 
 /// One column whose terms predate its chain's current revision.
@@ -90,6 +103,14 @@ impl FtsStaleness {
         self.analysis.iter().any(|c| c.stored)
     }
 
+    /// Whether a rewrite through the merge would store this blob's
+    /// documents in a chosen order where they now sit in arrival order.
+    /// Independent of [`Self::is_current`]: order is a repair asked for by
+    /// name, never one a current table needs.
+    pub(crate) fn needs_reorder(&self) -> bool {
+        self.unordered
+    }
+
     /// Stale columns no rebuild can repair, because their text was never
     /// stored.
     pub(crate) fn unrepairable_columns(&self) -> impl Iterator<Item = &StaleColumn> {
@@ -122,9 +143,14 @@ impl FtsReader {
                 })
             })
             .collect();
+        // The merge leaves a blob this small in arrival order, so asking
+        // for an order would rewrite it for nothing; the same bound keeps
+        // the two from disagreeing.
+        let unordered = !self.has_doc_map() && self.n_docs() as usize > REORDER_MIN_DOCS;
         FtsStaleness {
             container,
             analysis,
+            unordered,
         }
     }
 }
@@ -210,6 +236,47 @@ mod tests {
         assert_eq!(stale.analysis.len(), 1, "{stale:?}");
         assert_eq!(stale.analysis[0].recorded, UNKNOWN_ANALYSIS_REVISION);
         assert!(stale.needs_reanalysis(), "{stale:?}");
+    }
+
+    /// Arrival order is reported, and it is not staleness: a blob above the
+    /// merge's reorder minimum with no doc-id map is unordered and current;
+    /// the same documents behind a map are ordered; and a blob too small for
+    /// the merge to reorder is never called unordered, since asking would
+    /// rewrite it for nothing.
+    #[test]
+    fn arrival_order_is_reported_apart_from_staleness() {
+        use crate::superfile::fts::builder::FtsBuilder;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let build = |n_docs: u32, mapped: bool| -> FtsReader {
+            let mut b = FtsBuilder::new();
+            b.register_column("body".into(), false).expect("register");
+            for id in 0..n_docs {
+                b.add_doc(0, id, &format!("term{} shared", id % 97))
+                    .expect("add doc");
+            }
+            if mapped {
+                b.doc_map = Some((0..n_docs).rev().collect());
+            }
+            FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+        };
+        let above = REORDER_MIN_DOCS as u32 + 1;
+
+        let unordered = build(above, false).staleness();
+        assert!(unordered.needs_reorder(), "{unordered:?}");
+        // The hand-written column JSON records no analysis revision, so the
+        // analysis axis reads stale here; the container axis is what order
+        // must not touch, and it does not.
+        assert_eq!(
+            unordered.container, None,
+            "order is not staleness: {unordered:?}"
+        );
+        assert!(!unordered.needs_rewrite(), "{unordered:?}");
+
+        let ordered = build(above, true).staleness();
+        assert!(!ordered.needs_reorder(), "{ordered:?}");
+
+        let small = build(REORDER_MIN_DOCS as u32, false).staleness();
+        assert!(!small.needs_reorder(), "{small:?}");
     }
 
     /// A file this engine just wrote is behind on nothing.

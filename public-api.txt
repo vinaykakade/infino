@@ -239,6 +239,7 @@ impl core::panic::unwind_safe::UnwindSafe for infino::ReindexError
 #[non_exhaustive] pub enum infino::ReindexMode
 pub infino::ReindexMode::Auto
 pub infino::ReindexMode::Reanalyze
+pub infino::ReindexMode::Reorder
 pub infino::ReindexMode::Rewrite
 impl core::clone::Clone for infino::ReindexMode
 pub fn infino::ReindexMode::clone(&self) -> Self
@@ -811,12 +812,15 @@ impl core::marker::UnsafeUnpin for infino::PlannedRepair
 impl core::panic::unwind_safe::RefUnwindSafe for infino::PlannedRepair
 impl core::panic::unwind_safe::UnwindSafe for infino::PlannedRepair
 #[non_exhaustive] pub struct infino::ReindexOptions
+pub infino::ReindexOptions::concurrency: usize
 pub infino::ReindexOptions::mode: infino::ReindexMode
 pub infino::ReindexOptions::stale_seal_timeout_ms: core::option::Option<u64>
 pub infino::ReindexOptions::target: infino::ReindexTarget
 impl infino::ReindexOptions
 pub fn infino::ReindexOptions::reanalyzing() -> Self
+pub fn infino::ReindexOptions::reordering() -> Self
 pub fn infino::ReindexOptions::rewriting() -> Self
+pub fn infino::ReindexOptions::with_concurrency(self, usize) -> Self
 pub fn infino::ReindexOptions::with_mode(self, infino::ReindexMode) -> Self
 pub fn infino::ReindexOptions::with_stale_seal_timeout_ms(self, u64) -> Self
 pub fn infino::ReindexOptions::with_target(self, infino::ReindexTarget) -> Self
@@ -897,6 +901,7 @@ pub infino::StalenessReport::bytes_to_rewrite: u64
 pub infino::StalenessReport::inconsistent_footers: alloc::vec::Vec<uuid::Uuid>
 pub infino::StalenessReport::needing_rewrite: usize
 pub infino::StalenessReport::superfiles: usize
+pub infino::StalenessReport::unordered: usize
 pub infino::StalenessReport::unrepairable_columns: alloc::vec::Vec<alloc::string::String>
 impl infino::StalenessReport
 pub fn infino::StalenessReport::is_current(&self) -> bool

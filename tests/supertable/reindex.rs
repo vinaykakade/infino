@@ -369,6 +369,77 @@ fn the_default_mode_leaves_the_table_current_where_a_rewrite_cannot() {
     );
 }
 
+/// Documents in the table the reorder test builds. One append fans out
+/// into one superfile per writer thread, so this is sized for every one of
+/// them to clear the merge's reorder minimum with room to spare.
+const REORDER_DOCS: u32 = 40_000;
+
+/// A table built by append alone stores its documents in arrival order.
+/// That is not staleness — every other mode plans nothing — but `Reorder`
+/// rewrites such a superfile through the merge, after which it carries an
+/// order, answers identically, and a second run has nothing to do.
+#[test]
+fn reorder_gives_an_arrival_ordered_superfile_an_order_once() {
+    let dir = TempDir::new().expect("tempdir");
+    let uri = dir.path().to_str().expect("utf-8 path");
+    let table = create_fixture_table(&connect(uri).expect("connect"));
+    append_docs(&table, 0..REORDER_DOCS);
+
+    let reordering = ReindexOptions::reordering();
+    let before = table.index_staleness(&reordering).expect("assess");
+    assert!(
+        before.is_current(),
+        "arrival order is not staleness: {before:?}"
+    );
+    assert!(before.superfiles >= 1, "{before:?}");
+    assert_eq!(
+        before.unordered, before.superfiles,
+        "every superfile a plain append wrote is in arrival order: {before:?}"
+    );
+    for other in [
+        ReindexOptions::default(),
+        ReindexOptions::rewriting(),
+        ReindexOptions::reanalyzing(),
+    ] {
+        assert!(
+            table.reindex_plan(&other).expect("plan").is_empty(),
+            "only Reorder acts on order"
+        );
+    }
+    let plan = table.reindex_plan(&reordering).expect("plan");
+    assert_eq!(plan.len(), before.superfiles, "{plan:?}");
+    assert!(
+        plan.iter().all(|p| p.mode == ReindexMode::Reorder),
+        "{plan:?}"
+    );
+
+    let ranking_before = scores_by_id(&table, "body", "common shared", REORDER_DOCS as usize);
+    let common_before = hits_k(&table, "body", "common", REORDER_DOCS as usize);
+    assert_eq!(common_before, REORDER_DOCS as usize);
+
+    let report = table.reindex(&reordering).expect("reorder");
+    assert_eq!(report.rewritten, before.superfiles, "{report:?}");
+    assert_eq!(report.already_current, 0, "{report:?}");
+
+    let after = table.index_staleness(&reordering).expect("assess again");
+    assert_eq!(after.unordered, 0, "{after:?}");
+    assert!(after.is_current(), "{after:?}");
+    assert_scores_equivalent(
+        &scores_by_id(&table, "body", "common shared", REORDER_DOCS as usize),
+        &ranking_before,
+        "reorder",
+    );
+    assert_eq!(
+        hits_k(&table, "body", "common", REORDER_DOCS as usize),
+        common_before
+    );
+
+    let again = table.reindex(&reordering).expect("a second run");
+    assert_eq!(again.rewritten, 0, "reorder is not idempotent: {again:?}");
+    assert_eq!(again.already_current, before.superfiles, "{again:?}");
+    assert!(table.reindex_plan(&reordering).expect("plan").is_empty());
+}
+
 /// Vector hits from a superfile opened from its bytes alone, with no
 /// manifest hints, so every region is located through the footer.
 fn footer_only_vector_hits(bytes: &Bytes, probe: &[f32]) -> Vec<(u32, f32)> {

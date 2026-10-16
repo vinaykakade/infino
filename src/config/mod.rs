@@ -1202,6 +1202,19 @@ pub enum ReindexMode {
     /// thing this offers over [`ReindexMode::Auto`], and the reason to
     /// reach for it is not trusting that record.
     Reanalyze,
+    /// Store each superfile's documents in the order a merge would choose,
+    /// where they now sit in the order they arrived.
+    ///
+    /// A superfile written by append alone keeps arrival order, which
+    /// reads correctly but slowly: documents sharing a term sit far apart,
+    /// so their postings compress worse and skip less. Compaction picks an
+    /// order when it merges, and this gives the same treatment, one file
+    /// in and one file out, to superfiles compaction never touched. Files
+    /// already carrying a chosen order are skipped, so a run is idempotent
+    /// and an interrupted one resumes by running again. Superfiles behind
+    /// on their layout are rewritten in the same pass; ones whose terms
+    /// are stale are left and reported, as under [`ReindexMode::Rewrite`].
+    Reorder,
 }
 
 /// What a reindex repairs.
@@ -1262,6 +1275,12 @@ pub struct ReindexOptions {
     /// tuned it for compaction meant it for this too. A value here
     /// overrides that for one run.
     pub stale_seal_timeout_ms: Option<u64>,
+    /// How many superfiles to rewrite at once. `0` and `1` both mean one
+    /// at a time, which is what a migration of a few files wants; a table
+    /// of a thousand files wants more, each rewrite being one independent
+    /// merge that seals and commits its own superfile. Size it by memory:
+    /// a rewrite holds roughly the merge's working set for its superfile.
+    pub concurrency: usize,
 }
 
 impl ReindexOptions {
@@ -1281,6 +1300,20 @@ impl ReindexOptions {
             mode: ReindexMode::Reanalyze,
             ..Self::default()
         }
+    }
+
+    /// Store every arrival-ordered superfile's documents in a chosen order.
+    pub fn reordering() -> Self {
+        Self {
+            mode: ReindexMode::Reorder,
+            ..Self::default()
+        }
+    }
+
+    /// Rewrite up to `n` superfiles at once.
+    pub fn with_concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n;
+        self
     }
 
     /// Repair `target` instead of the default.

@@ -140,7 +140,7 @@ use crate::{
 
 /// Merges below this many surviving documents keep arrival order: a
 /// corpus this small has short gaps already and nothing to regroup.
-const REORDER_MIN_DOCS: usize = 4_096;
+pub(crate) const REORDER_MIN_DOCS: usize = 4_096;
 
 /// Bytes in a mebibyte, for the merge memory budget the config states in MiB.
 const BYTES_PER_MIB: u64 = 1 << 20;

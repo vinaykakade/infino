@@ -178,14 +178,16 @@ fn reindex_err(e: ReindexError) -> PyErr {
     }
 }
 
-/// Parse a reindex mode name (`"auto"` / `"rewrite"` / `"reanalyze"`).
+/// Parse a reindex mode name (`"auto"` / `"rewrite"` / `"reanalyze"` /
+/// `"reorder"`).
 fn reindex_mode_from_str(s: &str) -> PyResult<ReindexMode> {
     match s.to_ascii_lowercase().as_str() {
         "auto" => Ok(ReindexMode::Auto),
         "rewrite" => Ok(ReindexMode::Rewrite),
         "reanalyze" => Ok(ReindexMode::Reanalyze),
+        "reorder" => Ok(ReindexMode::Reorder),
         other => Err(PyValueError::new_err(format!(
-            "unknown reindex mode {other:?}; use 'auto', 'rewrite', or 'reanalyze'"
+            "unknown reindex mode {other:?}; use 'auto', 'rewrite', 'reanalyze', or 'reorder'"
         ))),
     }
 }
@@ -196,8 +198,9 @@ fn reindex_mode_name(mode: ReindexMode) -> String {
         ReindexMode::Auto => "auto".into(),
         ReindexMode::Rewrite => "rewrite".into(),
         ReindexMode::Reanalyze => "reanalyze".into(),
+        ReindexMode::Reorder => "reorder".into(),
         // `ReindexMode` is `#[non_exhaustive]`: a newer mode keeps its own
-        // name rather than masquerading as one of the three above.
+        // name rather than masquerading as one of the four above.
         other => format!("{other:?}").to_ascii_lowercase(),
     }
 }
@@ -811,6 +814,8 @@ struct StalenessReport {
     #[pyo3(get)]
     bytes_to_rewrite: u64,
     #[pyo3(get)]
+    unordered: usize,
+    #[pyo3(get)]
     unrepairable_columns: Vec<String>,
     #[pyo3(get)]
     inconsistent_footers: Vec<String>,
@@ -826,6 +831,7 @@ impl StalenessReport {
             needing_rewrite: r.needing_rewrite,
             awaiting_reanalysis: r.awaiting_reanalysis,
             bytes_to_rewrite: r.bytes_to_rewrite,
+            unordered: r.unordered,
             unrepairable_columns: r.unrepairable_columns,
             inconsistent_footers: ids_to_strings(&r.inconsistent_footers),
         }
@@ -842,12 +848,13 @@ impl StalenessReport {
     fn __repr__(&self) -> String {
         format!(
             "StalenessReport(superfiles={}, needing_rewrite={}, awaiting_reanalysis={}, \
-             bytes_to_rewrite={}, unrepairable_columns={:?}, inconsistent_footers={:?}, \
-             is_current={})",
+             bytes_to_rewrite={}, unordered={}, unrepairable_columns={:?}, \
+             inconsistent_footers={:?}, is_current={})",
             self.superfiles,
             self.needing_rewrite,
             self.awaiting_reanalysis,
             self.bytes_to_rewrite,
+            self.unordered,
             self.unrepairable_columns,
             self.inconsistent_footers,
             if self.is_current { "True" } else { "False" },
