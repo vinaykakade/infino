@@ -316,14 +316,15 @@ impl DiskCacheStore {
             self.open_holed_entry(uri, size, storage_key, self.resolve_storage(storage))
                 .await
         } else {
-            // A landing, and the one the comment above `insert_warm` points
-            // at: this file was written by a previous run and nothing has
-            // validated it since.
-            self.open_cached_entry(
-                &path,
-                size,
-                self.config.crc_verification.verifies_on_landing(),
-            )
+            // Not a landing: nothing is being written here. The file was
+            // written by an earlier run, which verified it as it landed, and
+            // adopting it only reads the header. Checking it would mean
+            // reading every byte of every cached superfile at process start,
+            // which is the scan this policy exists to remove and which the
+            // engines we are matching default to off. An operator who wants
+            // that pass has `always`, which gets it here, and `scrub`, which
+            // gets it on demand.
+            self.open_cached_entry(&path, size, self.config.crc_verification.verifies_on_open())
         };
 
         match opened {
@@ -471,6 +472,8 @@ mod landing_tests {
         path::Path,
     };
 
+    use bytes::Bytes;
+
     use super::super::test_support::{
         put_superfile, reopen_store, test_store_with, tiny_vector_superfile_bytes,
     };
@@ -485,7 +488,7 @@ mod landing_tests {
     /// would reject whatever the policy said.
     const CORRUPT_INTO_VEC: usize = 16;
 
-    /// Flip one byte inside the cached copy's vector blob, which is a region
+    /// `bytes` with one byte of its vector blob flipped, which is a region
     /// the superfile's own checksums cover.
     ///
     /// The region matters. Most of the file is Parquet, which these checksums
@@ -493,24 +496,108 @@ mod landing_tests {
     /// prove nothing about the policy. The fixture is chosen for the same
     /// reason: a superfile built with no FTS and no vector config carries no
     /// embedded blob, and therefore nothing for verification to check.
-    fn corrupt_the_cached_blob(path: &Path) {
-        let mut bytes = read(path).expect("the landed copy is on disk");
-        let kv = read_kv_metadata(&bytes).expect("the copy carries its footer");
+    fn corrupt_the_vector_blob(bytes: impl AsRef<[u8]>) -> Bytes {
+        let mut bytes = bytes.as_ref().to_vec();
+        let kv = read_kv_metadata(&bytes).expect("the fixture carries its footer");
         let vec_off: usize = kv["inf.vec.offset"].parse().expect("vector blob offset");
         let vec_len: usize = kv["inf.vec.length"].parse().expect("vector blob length");
         bytes[vec_off + vec_len - CORRUPT_INTO_VEC] ^= 0xFF;
-        write(path, &bytes).expect("write the corrupted copy back");
+        Bytes::from(bytes)
     }
 
-    /// A restart reuses the copy a previous run left on disk, and verifying it
-    /// does not get in the way.
+    /// Flip the same byte in a copy already on the cache disk.
+    fn corrupt_the_cached_copy(path: &Path) {
+        let bytes = read(path).expect("the landed copy is on disk");
+        write(path, corrupt_the_vector_blob(bytes)).expect("write the corrupted copy back");
+    }
+
+    /// Bytes that arrive corrupted are caught as they land, and the entry is
+    /// not admitted.
     ///
-    /// This is the half that matters most. Verification that rejected healthy
-    /// data would turn a readable table into an unreadable one, which is a
-    /// worse failure than the gap it closes, and it would show up as exactly
-    /// this test failing.
+    /// This is the true-positive half of the landing check. The cache file is
+    /// written from these bytes and opened, so a flip anywhere the superfile's
+    /// checksums cover has to surface here or nowhere: nothing downstream
+    /// re-reads the file to check it.
     #[tokio::test]
-    async fn a_healthy_cached_copy_is_reused_after_a_restart() {
+    async fn a_corrupt_download_is_refused_as_it_lands() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Auto;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(
+            &store,
+            &uri,
+            corrupt_the_vector_blob(tiny_vector_superfile_bytes()),
+        )
+        .await;
+
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect_err("corrupt bytes must not be admitted to the cache");
+
+        // And nothing is left behind under the name a later read, or a later
+        // process scanning this directory, would adopt. Adoption does not
+        // re-check the file, so a rejected download promoted anyway would be
+        // laundered into the cache by the very next attempt.
+        assert!(
+            !store.cache_path(&uri).is_file(),
+            "a download that failed verification must not keep the cache name"
+        );
+    }
+
+    /// With verification off the same bytes are admitted, which is what makes
+    /// the test above a statement about the policy rather than about some
+    /// other check happening to fire.
+    #[tokio::test]
+    async fn never_admits_the_corrupt_download_it_does_not_check() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Never;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(
+            &store,
+            &uri,
+            corrupt_the_vector_blob(tiny_vector_superfile_bytes()),
+        )
+        .await;
+
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("never checks, so the corruption goes unnoticed");
+    }
+
+    /// Healthy bytes land and serve.
+    ///
+    /// The half that matters more. Verification that rejected good data would
+    /// turn a readable table into an unreadable one, which is a worse failure
+    /// than the gap it closes, and it would show up as exactly this test
+    /// failing.
+    #[tokio::test]
+    async fn a_healthy_download_lands_and_serves() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Auto;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("healthy bytes must land and serve");
+    }
+
+    /// A copy a previous run left on disk is adopted without being read back,
+    /// even when it is corrupt.
+    ///
+    /// Deliberate, and the exposure this policy accepts by name. Adoption
+    /// writes nothing, so there is no landing to check at; verifying here
+    /// would mean reading every byte of every cached superfile at process
+    /// start, which is the scan the policy removes. The engines this matches
+    /// default that scan to off and carry the same exposure.
+    #[tokio::test]
+    async fn a_copy_left_by_a_previous_run_is_adopted_unread() {
         let (_dir, store) = test_store_with(|cfg| {
             cfg.crc_verification = CrcVerification::Auto;
         });
@@ -520,6 +607,8 @@ mod landing_tests {
             .reader_synchronous(&uri)
             .await
             .expect("a Load read lands the whole file on disk");
+
+        corrupt_the_cached_copy(&store.cache_path(&uri));
 
         let restarted = reopen_store(&store, |cfg| {
             cfg.crc_verification = CrcVerification::Auto;
@@ -528,35 +617,26 @@ mod landing_tests {
         restarted.scan_cache_root();
 
         let before = restarted.stats();
-        restarted
-            .reader_synchronous(&uri)
-            .await
-            .expect("restart reuses the copy");
+        let _ = restarted.reader_synchronous(&uri).await;
         let after = restarted.stats();
-
-        assert_eq!(
-            after.n_disk_reuses - before.n_disk_reuses,
-            1,
-            "the healthy copy must be adopted, not refetched"
-        );
         assert_eq!(
             after.n_cold_fetches - before.n_cold_fetches,
             0,
-            "and adopting it must cost no fetch"
+            "auto does not look, and so must not refetch"
         );
     }
 
-    /// A corrupted cached copy is caught when it lands and the superfile is
-    /// refetched, so the read still succeeds.
+    /// `always` does look, and a corrupt copy left by a previous run is
+    /// discarded and refetched, so the read still returns.
     ///
-    /// Two things are asserted together on purpose. Detecting the corruption
-    /// is useless if the query then fails, and recovering is useless if the
+    /// Two things asserted together on purpose. Detecting the corruption is
+    /// useless if the query then fails, and recovering is useless if the
     /// corruption went unnoticed; what a caller needs is the right answer
     /// without knowing anything happened.
     #[tokio::test]
-    async fn a_corrupted_cached_copy_is_discarded_and_refetched() {
+    async fn always_rescans_a_copy_left_by_a_previous_run() {
         let (_dir, store) = test_store_with(|cfg| {
-            cfg.crc_verification = CrcVerification::Auto;
+            cfg.crc_verification = CrcVerification::Always;
         });
         let uri = SuperfileUri::new_v4();
         put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
@@ -565,10 +645,10 @@ mod landing_tests {
             .await
             .expect("a Load read lands the whole file on disk");
 
-        corrupt_the_cached_blob(&store.cache_path(&uri));
+        corrupt_the_cached_copy(&store.cache_path(&uri));
 
         let restarted = reopen_store(&store, |cfg| {
-            cfg.crc_verification = CrcVerification::Auto;
+            cfg.crc_verification = CrcVerification::Always;
         });
         drop(store);
         restarted.scan_cache_root();
@@ -593,37 +673,51 @@ mod landing_tests {
         drop(reader);
     }
 
-    /// With verification off the corrupt copy is adopted, which is what makes
-    /// the test above a statement about the policy rather than about some
-    /// other check happening to fire.
+    /// A healthy copy from a previous run is adopted under every policy, and
+    /// adopting it costs no fetch. The `always` arm is the one that could
+    /// regress: it reads the file back, and a false positive there would turn
+    /// a restart into a full refetch of the cache.
     #[tokio::test]
-    async fn never_adopts_the_corrupt_copy_it_does_not_check() {
-        let (_dir, store) = test_store_with(|cfg| {
-            cfg.crc_verification = CrcVerification::Never;
-        });
-        let uri = SuperfileUri::new_v4();
-        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
-        store
-            .reader_synchronous(&uri)
-            .await
-            .expect("a Load read lands the whole file on disk");
+    async fn a_healthy_copy_is_reused_after_a_restart_under_every_policy() {
+        for policy in [
+            CrcVerification::Auto,
+            CrcVerification::Always,
+            CrcVerification::Never,
+        ] {
+            let (_dir, store) = test_store_with(|cfg| {
+                cfg.crc_verification = policy;
+            });
+            let uri = SuperfileUri::new_v4();
+            put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+            store
+                .reader_synchronous(&uri)
+                .await
+                .expect("a Load read lands the whole file on disk");
 
-        corrupt_the_cached_blob(&store.cache_path(&uri));
+            let restarted = reopen_store(&store, |cfg| {
+                cfg.crc_verification = policy;
+            });
+            drop(store);
+            restarted.scan_cache_root();
 
-        let restarted = reopen_store(&store, |cfg| {
-            cfg.crc_verification = CrcVerification::Never;
-        });
-        drop(store);
-        restarted.scan_cache_root();
+            let before = restarted.stats();
+            restarted
+                .reader_synchronous(&uri)
+                .await
+                .expect("restart reuses the copy");
+            let after = restarted.stats();
 
-        let before = restarted.stats();
-        let _ = restarted.reader_synchronous(&uri).await;
-        let after = restarted.stats();
-        assert_eq!(
-            after.n_cold_fetches - before.n_cold_fetches,
-            0,
-            "never must not notice, and so must not refetch"
-        );
+            assert_eq!(
+                after.n_disk_reuses - before.n_disk_reuses,
+                1,
+                "{policy:?}: the healthy copy must be adopted, not refetched"
+            );
+            assert_eq!(
+                after.n_cold_fetches - before.n_cold_fetches,
+                0,
+                "{policy:?}: and adopting it must cost no fetch"
+            );
+        }
     }
 }
 

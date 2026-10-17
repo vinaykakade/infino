@@ -825,18 +825,30 @@ impl DiskCacheStore {
         self.cold_fetch_to_disk(&fetch_storage, &storage_uri, &tmp, size)
             .await?;
 
-        // Promote to final path + open as mmap.
-        tokio::fs::rename(&tmp, &final_path).await?;
         // A landing: the whole superfile has just been written to local disk,
         // the one copy nothing else guards. Verify it once here rather than
         // on every open of it hereafter.
-        let (mmap, bytes) = mmap_readonly_with_handle(&final_path).map_err(DiskCacheError::Io)?;
-        let reader = SuperfileReader::open_with(
+        //
+        // Before the promote, not after, and that order is the whole of it.
+        // A file that fails here must never reach the name a later read — or
+        // a later process scanning this directory — would adopt, because
+        // adoption does not re-check it. The two other fill paths verify
+        // their tempfile for the same reason; the mmap survives the rename,
+        // since it is the same inode under a new name.
+        let (mmap, bytes) = mmap_readonly_with_handle(&tmp).map_err(DiskCacheError::Io)?;
+        let reader = match SuperfileReader::open_with(
             bytes,
             OpenOptions {
                 verify_crc: self.config.crc_verification.verifies_on_landing(),
             },
-        )?;
+        ) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(error.into());
+            }
+        };
+        tokio::fs::rename(&tmp, &final_path).await?;
         let entry = self.build_mmap_entry(Arc::new(reader), mmap, size, None);
 
         let entry = self.admit_entry(*uri, entry);
