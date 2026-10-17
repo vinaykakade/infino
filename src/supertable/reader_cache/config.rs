@@ -380,7 +380,7 @@ mod tests {
             config.mmap_sweep_interval_secs,
             DEFAULT_MMAP_SWEEP_INTERVAL_SECS
         );
-        assert!(config.crc_verification.verifies_on_open());
+        assert_eq!(config.crc_verification, CrcVerification::Auto);
 
         // The Debug impl elides the boxed policy but must keep the
         // tuning knobs readable for log lines.
@@ -407,9 +407,10 @@ mod tests {
         ] {
             assert!(debug.contains(field), "Debug must print {field}: {debug}");
         }
-        assert!(
-            cfg.crc_verification.verifies_on_open(),
-            "CRC verification defaults on"
+        assert_eq!(
+            cfg.crc_verification,
+            CrcVerification::Auto,
+            "the cache mirrors the supertable's default policy"
         );
     }
 }

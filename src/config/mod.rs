@@ -289,10 +289,12 @@ impl CrcVerification {
     /// change what `Auto` means change it here and nowhere else.
     pub fn verifies_on_open(self) -> bool {
         match self {
-            // P0 keeps `Auto` identical to `Always` so the policy can land
-            // without changing behaviour; P1 is where it stops verifying.
-            Self::Auto | Self::Always => true,
-            Self::Never => false,
+            Self::Always => true,
+            // `Auto` verifies where bytes arrive, not where they are read, so
+            // an open verifies nothing. Lucene, Elasticsearch and OpenSearch
+            // all read without recomputing a checksum, and this is the line
+            // that makes us match them.
+            Self::Auto | Self::Never => false,
         }
     }
 }
@@ -2589,9 +2591,8 @@ supertable:
         assert!(CrcVerification::Always.verifies_on_open());
         assert!(!CrcVerification::Never.verifies_on_open());
         assert!(
-            CrcVerification::Auto.verifies_on_open(),
-            "auto still verifies at this phase; the phase that changes it \
-             changes this assertion with it"
+            !CrcVerification::Auto.verifies_on_open(),
+            "auto verifies where bytes arrive, so an open verifies nothing"
         );
     }
 

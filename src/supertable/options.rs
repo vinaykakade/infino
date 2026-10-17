@@ -1837,7 +1837,7 @@ supertable:
     fn new_sets_documented_defaults() {
         let opts = plain_opts();
         assert!(opts.prepopulate_cache_on_commit);
-        assert!(opts.crc_verification.verifies_on_open());
+        assert_eq!(opts.crc_verification, CrcVerification::Auto);
         assert!(opts.storage.is_none());
         assert!(opts.disk_cache.is_none());
         assert!(opts.memory_budget_bytes.is_none());
@@ -1962,11 +1962,22 @@ supertable:
     }
 
     #[test]
-    fn superfile_open_options_track_verify_crc_flag() {
+    fn superfile_open_options_track_the_crc_policy() {
+        // The default is `Auto`, which verifies where bytes arrive rather
+        // than at an open, so the open options it produces verify nothing.
         let opts = plain_opts();
-        assert!(opts.superfile_open_options().verify_crc);
-        let opts = opts.with_verify_crc_on_open(false);
+        assert_eq!(opts.crc_verification, CrcVerification::Auto);
         assert!(!opts.superfile_open_options().verify_crc);
+
+        // The boolean builder still means what it meant: `true` asks for
+        // verification and gets the strict policy, not the default.
+        let strict = plain_opts().with_verify_crc_on_open(true);
+        assert_eq!(strict.crc_verification, CrcVerification::Always);
+        assert!(strict.superfile_open_options().verify_crc);
+
+        let off = plain_opts().with_verify_crc_on_open(false);
+        assert_eq!(off.crc_verification, CrcVerification::Never);
+        assert!(!off.superfile_open_options().verify_crc);
     }
 
     #[test]
