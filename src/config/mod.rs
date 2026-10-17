@@ -2572,7 +2572,10 @@ supertable:
         let settings = SupertableSettings::default();
         assert_eq!(settings.verify_crc_on_open, None);
         assert_eq!(settings.crc_verification, None);
-        assert_eq!(settings.crc_policy(), DEFAULT_CRC_VERIFICATION);
+        // Named, not compared against the constant: a test that reads the
+        // constant back cannot notice the constant changing, which is the
+        // one thing worth noticing here.
+        assert_eq!(settings.crc_policy(), CrcVerification::Auto);
     }
 
     /// The deprecated boolean still decides the policy when it is the only
