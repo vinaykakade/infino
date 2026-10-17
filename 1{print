@@ -1,0 +1,10 @@
+ERROR: (gcloud.compute.ssh) unrecognized arguments: w"t"\$0}
+done
+EOS
+chmod +x /tmp/t0gate.sh
+nohup /tmp/t0gate.sh > /data/logs/t0-gate-100m.tsv 2> /data/logs/t0-gate-100m.err < /dev/null &
+echo pid=\$!
+" 
+
+To search the help text of gcloud commands, run:
+  gcloud help -- SEARCH_TERMS

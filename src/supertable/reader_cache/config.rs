@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use crate::supertable::manifest::SuperfileUri;
+use crate::{config::CrcVerification, supertable::manifest::SuperfileUri};
 
 /// How `DiskCacheStore` services a cache miss.
 ///
@@ -147,7 +147,7 @@ pub struct DiskCacheConfig {
     /// set the right value for their storage backend; the
     /// supertable typically sets both knobs from the same
     /// `Config::supertable::verify_crc_on_open` source.
-    pub verify_crc_on_open: bool,
+    pub crc_verification: CrcVerification,
 }
 
 /// Default Tier-1 disk-cache byte budget (10 GiB).
@@ -183,7 +183,7 @@ impl Default for DiskCacheConfig {
             mmap_sweep_interval_secs: DEFAULT_MMAP_SWEEP_INTERVAL_SECS,
             promotion_defer_timeout: DEFAULT_PROMOTION_DEFER_TIMEOUT,
             eviction: Box::new(LruPolicy::new()),
-            verify_crc_on_open: true,
+            crc_verification: CrcVerification::default(),
         }
     }
 }
@@ -380,7 +380,7 @@ mod tests {
             config.mmap_sweep_interval_secs,
             DEFAULT_MMAP_SWEEP_INTERVAL_SECS
         );
-        assert!(config.verify_crc_on_open);
+        assert!(config.crc_verification.verifies_on_open());
 
         // The Debug impl elides the boxed policy but must keep the
         // tuning knobs readable for log lines.
@@ -407,6 +407,9 @@ mod tests {
         ] {
             assert!(debug.contains(field), "Debug must print {field}: {debug}");
         }
-        assert!(cfg.verify_crc_on_open, "CRC verification defaults on");
+        assert!(
+            cfg.crc_verification.verifies_on_open(),
+            "CRC verification defaults on"
+        );
     }
 }

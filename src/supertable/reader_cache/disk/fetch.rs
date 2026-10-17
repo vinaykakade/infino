@@ -360,7 +360,7 @@ impl DiskCacheStore {
         let foreground_reader = SuperfileReader::open_with(
             foreground_bytes,
             OpenOptions {
-                verify_crc: self.config.verify_crc_on_open,
+                verify_crc: self.config.crc_verification.verifies_on_open(),
             },
         )?;
         let foreground_reader = Arc::new(foreground_reader);
@@ -826,7 +826,7 @@ impl DiskCacheStore {
         let reader = SuperfileReader::open_with(
             bytes,
             OpenOptions {
-                verify_crc: self.config.verify_crc_on_open,
+                verify_crc: self.config.crc_verification.verifies_on_open(),
             },
         )?;
         let entry = self.build_mmap_entry(Arc::new(reader), mmap, size, None);
@@ -956,7 +956,7 @@ async fn finalize_to_mmap(
         let reader = SuperfileReader::open_with(
             bytes,
             OpenOptions {
-                verify_crc: store.config.verify_crc_on_open,
+                verify_crc: store.config.crc_verification.verifies_on_open(),
             },
         )?;
         // Swap in over the buffered entry, which already carries the whole-size charge. The
@@ -1435,7 +1435,7 @@ async fn lazy_background_fill(
                 let reader = SuperfileReader::open_with(
                     bytes,
                     OpenOptions {
-                        verify_crc: store.config.verify_crc_on_open,
+                        verify_crc: store.config.crc_verification.verifies_on_open(),
                     },
                 )?;
                 store.build_mmap_entry(Arc::new(reader), mmap_arc, size, None)

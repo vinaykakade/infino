@@ -316,7 +316,7 @@ impl DiskCacheStore {
             self.open_holed_entry(uri, size, storage_key, self.resolve_storage(storage))
                 .await
         } else {
-            self.open_cached_entry(&path, size, self.config.verify_crc_on_open)
+            self.open_cached_entry(&path, size, self.config.crc_verification.verifies_on_open())
         };
 
         match opened {
