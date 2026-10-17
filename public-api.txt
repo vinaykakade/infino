@@ -25,6 +25,25 @@ impl core::marker::Unpin for infino::BoolMode
 impl core::marker::UnsafeUnpin for infino::BoolMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::BoolMode
 impl core::panic::unwind_safe::UnwindSafe for infino::BoolMode
+pub enum infino::CheckedCopy
+pub infino::CheckedCopy::LocalCache
+pub infino::CheckedCopy::ObjectStore
+impl core::clone::Clone for infino::CheckedCopy
+pub fn infino::CheckedCopy::clone(&self) -> Self
+impl core::cmp::Eq for infino::CheckedCopy
+impl core::cmp::PartialEq for infino::CheckedCopy
+pub fn infino::CheckedCopy::eq(&self, &Self) -> bool
+impl core::fmt::Debug for infino::CheckedCopy
+pub fn infino::CheckedCopy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::CheckedCopy
+impl core::marker::StructuralPartialEq for infino::CheckedCopy
+impl core::marker::Freeze for infino::CheckedCopy
+impl core::marker::Send for infino::CheckedCopy
+impl core::marker::Sync for infino::CheckedCopy
+impl core::marker::Unpin for infino::CheckedCopy
+impl core::marker::UnsafeUnpin for infino::CheckedCopy
+impl core::panic::unwind_safe::RefUnwindSafe for infino::CheckedCopy
+impl core::panic::unwind_safe::UnwindSafe for infino::CheckedCopy
 pub enum infino::ColdFetchMode
 pub infino::ColdFetchMode::HybridWithPrefetch
 pub infino::ColdFetchMode::LazyForegroundWithBackgroundFill
@@ -404,6 +423,21 @@ impl core::marker::Unpin for infino::SchemaError
 impl core::marker::UnsafeUnpin for infino::SchemaError
 impl core::panic::unwind_safe::RefUnwindSafe for infino::SchemaError
 impl core::panic::unwind_safe::UnwindSafe for infino::SchemaError
+#[non_exhaustive] pub enum infino::ScrubError
+pub infino::ScrubError::Enumerate(alloc::string::String)
+pub infino::ScrubError::NoStorage
+impl core::error::Error for infino::ScrubError
+impl core::fmt::Debug for infino::ScrubError
+pub fn infino::ScrubError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for infino::ScrubError
+pub fn infino::ScrubError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::ScrubError
+impl core::marker::Send for infino::ScrubError
+impl core::marker::Sync for infino::ScrubError
+impl core::marker::Unpin for infino::ScrubError
+impl core::marker::UnsafeUnpin for infino::ScrubError
+impl core::panic::unwind_safe::RefUnwindSafe for infino::ScrubError
+impl core::panic::unwind_safe::UnwindSafe for infino::ScrubError
 #[non_exhaustive] pub enum infino::Stemmer
 pub infino::Stemmer::English
 pub infino::Stemmer::None
@@ -591,6 +625,22 @@ impl core::marker::Unpin for infino::Connection
 impl core::marker::UnsafeUnpin for infino::Connection
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::Connection
 impl !core::panic::unwind_safe::UnwindSafe for infino::Connection
+#[non_exhaustive] pub struct infino::DamagedSuperfile
+pub infino::DamagedSuperfile::cause: alloc::string::String
+pub infino::DamagedSuperfile::copy: infino::CheckedCopy
+pub infino::DamagedSuperfile::storage_path: alloc::string::String
+pub infino::DamagedSuperfile::superfile_id: uuid::Uuid
+impl core::clone::Clone for infino::DamagedSuperfile
+pub fn infino::DamagedSuperfile::clone(&self) -> Self
+impl core::fmt::Debug for infino::DamagedSuperfile
+pub fn infino::DamagedSuperfile::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::DamagedSuperfile
+impl core::marker::Send for infino::DamagedSuperfile
+impl core::marker::Sync for infino::DamagedSuperfile
+impl core::marker::Unpin for infino::DamagedSuperfile
+impl core::marker::UnsafeUnpin for infino::DamagedSuperfile
+impl core::panic::unwind_safe::RefUnwindSafe for infino::DamagedSuperfile
+impl core::panic::unwind_safe::UnwindSafe for infino::DamagedSuperfile
 #[non_exhaustive] pub struct infino::FieldDef
 pub infino::FieldDef::converting_from: core::option::Option<arrow_schema::datatype::DataType>
 pub infino::FieldDef::data_type: arrow_schema::datatype::DataType
@@ -893,6 +943,26 @@ impl core::marker::Unpin for infino::SchemaPatch
 impl core::marker::UnsafeUnpin for infino::SchemaPatch
 impl core::panic::unwind_safe::RefUnwindSafe for infino::SchemaPatch
 impl core::panic::unwind_safe::UnwindSafe for infino::SchemaPatch
+#[non_exhaustive] pub struct infino::ScrubReport
+pub infino::ScrubReport::bytes_verified: u64
+pub infino::ScrubReport::damaged: alloc::vec::Vec<infino::DamagedSuperfile>
+pub infino::ScrubReport::from_local_cache: u64
+pub infino::ScrubReport::superfiles_verified: u64
+impl infino::ScrubReport
+pub fn infino::ScrubReport::is_clean(&self) -> bool
+impl core::clone::Clone for infino::ScrubReport
+pub fn infino::ScrubReport::clone(&self) -> Self
+impl core::default::Default for infino::ScrubReport
+pub fn infino::ScrubReport::default() -> Self
+impl core::fmt::Debug for infino::ScrubReport
+pub fn infino::ScrubReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::ScrubReport
+impl core::marker::Send for infino::ScrubReport
+impl core::marker::Sync for infino::ScrubReport
+impl core::marker::Unpin for infino::ScrubReport
+impl core::marker::UnsafeUnpin for infino::ScrubReport
+impl core::panic::unwind_safe::RefUnwindSafe for infino::ScrubReport
+impl core::panic::unwind_safe::UnwindSafe for infino::ScrubReport
 #[non_exhaustive] pub struct infino::StalenessReport
 pub infino::StalenessReport::awaiting_reanalysis: usize
 pub infino::StalenessReport::bytes_to_rewrite: u64
@@ -937,6 +1007,7 @@ pub fn infino::Supertable::optimize(&self, &infino::OptimizeOptions) -> core::re
 pub fn infino::Supertable::reindex(&self, &infino::ReindexOptions) -> core::result::Result<infino::ReindexReport, infino::ReindexError>
 pub fn infino::Supertable::reindex_plan(&self, &infino::ReindexOptions) -> core::result::Result<alloc::vec::Vec<infino::PlannedRepair>, infino::ReindexError>
 pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
+pub fn infino::Supertable::scrub(&self) -> core::result::Result<infino::ScrubReport, infino::ScrubError>
 pub fn infino::Supertable::token_match(&self, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::tokenize(&self, &str, &str) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
 pub fn infino::Supertable::update(&self, datafusion_expr::expr::Expr, &arrow_array::record_batch::RecordBatch) -> core::result::Result<infino::MutationStats, infino::InfinoError>

@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
+    OptimizeOptions, ReindexError, ReindexOptions, ScrubError, ScrubReport, VectorFilter,
     catalog::ensure_expr_within_connective_cap,
     superfile::VectorSearchOptions,
     supertable::{
@@ -98,6 +98,7 @@ pub(crate) trait Table: Send + Sync {
     fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError>;
     fn reindex_plan(&self, opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError>;
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError>;
+    fn scrub(&self) -> Result<ScrubReport, ScrubError>;
 
     /// Test-only: expose the concrete handle behind the trait object so tests
     /// can reach engine internals (`options`, `stats`, `reader`, …) through the
@@ -223,6 +224,9 @@ impl Table for SupertableHandle {
     }
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         SupertableHandle::gc(self, safety_gap)
+    }
+    fn scrub(&self) -> Result<ScrubReport, ScrubError> {
+        SupertableHandle::scrub(self)
     }
     #[cfg(any(test, feature = "test-helpers"))]
     fn as_any(&self) -> &dyn Any {
@@ -607,6 +611,18 @@ impl Supertable {
     /// Garbage-collect orphaned superfiles older than `safety_gap`.
     pub fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         self.inner.gc(safety_gap)
+    }
+
+    /// Read every superfile this table references and verify its checksums,
+    /// reporting the ones that fail.
+    ///
+    /// The deliberate counterpart to the default checksum policy, which
+    /// verifies a superfile once as its bytes land in the local cache and not
+    /// again on each open. Running this is how an operator re-checks a cached
+    /// copy that has sat on disk since, on their own schedule. It writes
+    /// nothing, takes no writer slot, and leaves queries running.
+    pub fn scrub(&self) -> Result<ScrubReport, ScrubError> {
+        self.inner.scrub()
     }
 
     /// Test-only: the underlying local engine handle. Panics for a hosted

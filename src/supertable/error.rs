@@ -780,6 +780,27 @@ pub enum GcError {
     Storage(#[from] crate::storage::StorageError),
 }
 
+/// Errors raised by [`crate::Supertable::scrub`].
+///
+/// Only two, and neither is a damaged superfile: a superfile that fails to
+/// verify is a finding in the report, not an error, because a scrub that
+/// stopped at the first bad file would tell an operator least when there is
+/// most to know.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ScrubError {
+    /// No durable storage backend is configured (e.g. `memory://`); a scrub
+    /// reads committed files, so it needs one.
+    #[error("scrub requires a storage backend")]
+    NoStorage,
+
+    /// The table's superfiles could not be enumerated, so there is no list to
+    /// scrub. Reported rather than scrubbing a partial list, since a clean
+    /// report over an unknown subset is worse than no report.
+    #[error("failed to enumerate the table's superfiles: {0}")]
+    Enumerate(String),
+}
+
 /// Errors raised by the query and search kernels.
 ///
 /// Each variant names a cause, which decides the public [`crate::InfinoError`]

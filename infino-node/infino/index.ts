@@ -156,6 +156,30 @@ export interface GcReport {
   deleteErrors: number;
 }
 
+/** One superfile a `scrub` could not verify. */
+export interface DamagedSuperfile {
+  /** The superfile's identifier, as the manifest records it. */
+  superfileId: string;
+  /** Its object-storage key, so the finding can be acted on directly. */
+  storagePath: string;
+  /** Which copy failed. */
+  copy: "localCache" | "objectStore";
+  /** What went wrong. */
+  cause: string;
+}
+
+/** What a `scrub` pass found. */
+export interface ScrubReport {
+  /** Superfiles whose checksums were verified and matched. */
+  superfilesVerified: number;
+  /** Bytes read and checksummed across those superfiles. */
+  bytesVerified: number;
+  /** How many of them were read from a copy on the local cache disk. */
+  fromLocalCache: number;
+  /** Everything that failed. Empty means the table verified. */
+  damaged: DamagedSuperfile[];
+}
+
 /** Tuning for `optimize`; all fields optional (omitted ⇒ engine default). */
 export interface OptimizeOptions {
   /** Build-time memory budget, in MB. */
@@ -655,6 +679,23 @@ export class Table {
    */
   gc(graceSecs: number): GcReport {
     return guard(this.remote, () => this.inner.gc(graceSecs));
+  }
+
+  /**
+   * Read every superfile this table references and verify its checksums,
+   * reporting the ones that fail.
+   *
+   * The deliberate counterpart to the default checksum policy, which verifies
+   * a superfile once as its bytes land in the local cache and not again on
+   * each open. Running this re-checks a cached copy that has sat on disk
+   * since. It writes nothing and takes no slot, so queries keep running.
+   * Requires durable storage (not `memory://`).
+   *
+   * **Local connections only.** A hosted table's storage is the service's, so
+   * calling this on a hosted connection throws.
+   */
+  scrub(): ScrubReport {
+    return guard(this.remote, () => this.inner.scrub());
   }
 
   /**

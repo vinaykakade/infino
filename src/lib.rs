@@ -202,7 +202,7 @@ pub use superfile::{
     vector::{distance::Metric, rerank_codec::RerankCodec},
 };
 pub use supertable::{
-    Consistency, GcError, GcReport, MutationStats, OptimizeError, ReindexError,
+    Consistency, GcError, GcReport, MutationStats, OptimizeError, ReindexError, ScrubError,
     query::vector::VectorFilter,
     reindex::{PlannedRepair, ReindexReport, StalenessReport},
     schema::{
@@ -210,6 +210,7 @@ pub use supertable::{
         change::{FieldPatch, SchemaPatch},
         error::SchemaError,
     },
+    scrub::{CheckedCopy, DamagedSuperfile, ScrubReport},
 };
 
 /// Convenience builders for test fixtures. Visible to:

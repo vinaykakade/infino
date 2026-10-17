@@ -41,6 +41,7 @@ pub mod query;
 pub mod reader_cache;
 pub(crate) mod reindex;
 pub mod schema;
+pub(crate) mod scrub;
 pub(crate) mod slow_vector_state;
 pub mod stats;
 pub mod tombstones;
@@ -50,6 +51,7 @@ pub mod writer;
 
 pub use error::{
     BuildError, CommitError, GcError, OpenError, OptimizeError, QueryError, ReindexError,
+    ScrubError,
 };
 pub use gc::GcReport;
 pub use handle::{Supertable, SupertableReader};

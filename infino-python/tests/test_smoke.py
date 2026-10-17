@@ -34,6 +34,8 @@ def test_package_metadata():
         "ReindexReport",
         "StalenessReport",
         "PlannedRepair",
+        "ScrubReport",
+        "DamagedSuperfile",
     }
 
 
@@ -556,6 +558,26 @@ def test_gc_rejects_memory():
     t.append([{"title": "alpha"}])
     with pytest.raises(RuntimeError):
         t.gc(0.0)
+
+
+def test_scrub_verifies_a_healthy_table(tmp_path):
+    db = infino.connect(str(tmp_path / "catalog"))  # scrub needs durable storage
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    for title in ("alpha", "beta", "gamma"):  # three appends -> three superfiles
+        t.append([{"title": title}])
+
+    report = t.scrub()
+    assert report.damaged == []  # nothing to report on an undamaged table
+    assert report.superfiles_verified >= 3
+    assert report.bytes_verified > 0
+
+
+def test_scrub_rejects_memory():
+    db = infino.connect("memory://")
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "alpha"}])
+    with pytest.raises(ValueError):  # nothing durable to read
+        t.scrub()
 
 
 def test_vector_search_end_to_end():

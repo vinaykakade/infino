@@ -306,6 +306,28 @@ test("gc requires durable storage (reject memory://)", () => {
   assert.throws(() => docs.gc(0));
 });
 
+test("scrub verifies a healthy table (localfs)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "infino-node-scrub-"));
+  const db = connect(dir);
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  // three appends => three superfiles
+  docs.append([{ title: "alpha" }]);
+  docs.append([{ title: "beta" }]);
+  docs.append([{ title: "gamma" }]);
+
+  const report = docs.scrub();
+  assert.deepEqual(report.damaged, []); // nothing to report on an undamaged table
+  assert.ok(report.superfilesVerified >= 3);
+  assert.ok(report.bytesVerified > 0);
+});
+
+test("scrub requires durable storage (reject memory://)", () => {
+  const db = connect("memory://");
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  docs.append([{ title: "alpha" }]);
+  assert.throws(() => docs.scrub());
+});
+
 test("update and delete require durable storage (reject memory://)", () => {
   const db = connect("memory://");
   const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));

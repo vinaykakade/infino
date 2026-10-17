@@ -39,7 +39,7 @@ use infino::{
     Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, GcError,
     InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
     ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions,
-    SchemaError as SchemaCause, SchemaPatch, Stemmer,
+    SchemaError as SchemaCause, SchemaPatch, ScrubError, Stemmer,
     Stopwords, VectorFilter,
 };
 // Vector tuning knobs are a diagnostic-wheel-only surface; the type is off
@@ -157,6 +157,18 @@ fn optimize_err(e: OptimizeError) -> PyErr {
 
 fn gc_err(e: GcError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
+}
+
+/// A table without its own storage backend has no copies for a scrub to read,
+/// so it refuses as a bad target rather than reporting a table it did not
+/// check as clean.
+fn scrub_err(e: ScrubError) -> PyErr {
+    match e {
+        ScrubError::NoStorage => PyValueError::new_err(
+            "scrub requires durable storage (not memory:// or a hosted table)",
+        ),
+        other => PyRuntimeError::new_err(other.to_string()),
+    }
 }
 
 /// A table without its own storage backend — `memory://`, or a hosted table
@@ -672,6 +684,90 @@ impl GcReport {
             self.objects_skipped_live,
             self.objects_skipped_too_new,
             self.delete_errors,
+        )
+    }
+}
+
+/// One superfile a `scrub` could not verify.
+#[pyclass(name = "DamagedSuperfile", frozen, skip_from_py_object)]
+#[derive(Clone)]
+struct DamagedSuperfile {
+    /// The superfile's identifier, as the manifest records it.
+    #[pyo3(get)]
+    superfile_id: String,
+    /// Its object-storage key, so the finding can be acted on directly.
+    #[pyo3(get)]
+    storage_path: String,
+    /// Which copy failed: `"local_cache"` or `"object_store"`.
+    #[pyo3(get)]
+    copy: String,
+    /// What went wrong.
+    #[pyo3(get)]
+    cause: String,
+}
+
+impl DamagedSuperfile {
+    fn from_core(d: &infino::DamagedSuperfile) -> Self {
+        Self {
+            superfile_id: d.superfile_id.to_string(),
+            storage_path: d.storage_path.clone(),
+            copy: match d.copy {
+                infino::CheckedCopy::LocalCache => "local_cache".to_string(),
+                infino::CheckedCopy::ObjectStore => "object_store".to_string(),
+            },
+            cause: d.cause.clone(),
+        }
+    }
+}
+
+#[pymethods]
+impl DamagedSuperfile {
+    fn __repr__(&self) -> String {
+        format!(
+            "DamagedSuperfile(superfile_id={}, storage_path={}, copy={}, cause={})",
+            self.superfile_id, self.storage_path, self.copy, self.cause
+        )
+    }
+}
+
+/// What a `scrub` pass found.
+#[pyclass(name = "ScrubReport", frozen)]
+struct ScrubReport {
+    /// Superfiles whose checksums were verified and matched.
+    #[pyo3(get)]
+    superfiles_verified: u64,
+    /// Bytes read and checksummed across those superfiles.
+    #[pyo3(get)]
+    bytes_verified: u64,
+    /// How many of them were read from a copy on the local cache disk.
+    #[pyo3(get)]
+    from_local_cache: u64,
+    /// Everything that failed. Empty means the table verified.
+    #[pyo3(get)]
+    damaged: Vec<DamagedSuperfile>,
+}
+
+impl ScrubReport {
+    fn from_core(r: &infino::ScrubReport) -> Self {
+        Self {
+            superfiles_verified: r.superfiles_verified,
+            bytes_verified: r.bytes_verified,
+            from_local_cache: r.from_local_cache,
+            damaged: r.damaged.iter().map(DamagedSuperfile::from_core).collect(),
+        }
+    }
+}
+
+#[pymethods]
+impl ScrubReport {
+    fn __repr__(&self) -> String {
+        format!(
+            "ScrubReport(superfiles_verified={}, bytes_verified={}, \
+             from_local_cache={}, damaged={})",
+            self.superfiles_verified,
+            self.bytes_verified,
+            self.from_local_cache,
+            self.damaged.len(),
         )
     }
 }
@@ -1358,6 +1454,19 @@ impl Table {
         Ok(GcReport::from_core(&report))
     }
 
+    /// Read every superfile this table references and verify its checksums,
+    /// reporting the ones that fail.
+    ///
+    /// The deliberate counterpart to the default checksum policy, which
+    /// verifies a superfile once as its bytes land in the local cache and not
+    /// again on each open. Running this re-checks a cached copy that has sat
+    /// on disk since. It writes nothing and takes no slot, so queries keep
+    /// running. Requires durable storage.
+    fn scrub(&self, py: Python<'_>) -> PyResult<ScrubReport> {
+        let report = py.detach(|| self.inner.scrub()).map_err(scrub_err)?;
+        Ok(ScrubReport::from_core(&report))
+    }
+
     /// Repair every superfile whose full-text index is behind what this
     /// engine writes. Rows, their order and their `_id`s are unchanged. Takes
     /// the table's compaction slot, so it raises `AlreadyRunningError` while
@@ -1755,6 +1864,8 @@ fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IndexSpec>()?;
     m.add_class::<MutationStats>()?;
     m.add_class::<GcReport>()?;
+    m.add_class::<ScrubReport>()?;
+    m.add_class::<DamagedSuperfile>()?;
     m.add_class::<CompactOptions>()?;
     m.add_class::<ReindexOptions>()?;
     m.add_class::<ReindexReport>()?;

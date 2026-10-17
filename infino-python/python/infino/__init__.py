@@ -14,6 +14,7 @@ from infino._infino import (
     SchemaError,
     Connection,
     ConnectionMemoryBudgetError,
+    DamagedSuperfile,
     GcReport,
     IndexSpec,
     InfinoError,
@@ -22,6 +23,7 @@ from infino._infino import (
     PlannedRepair,
     ReindexOptions,
     ReindexReport,
+    ScrubReport,
     StalenessReport,
     Table,
     connect,
@@ -49,4 +51,6 @@ __all__ = [
     "ReindexReport",
     "StalenessReport",
     "PlannedRepair",
+    "ScrubReport",
+    "DamagedSuperfile",
 ]

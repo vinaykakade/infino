@@ -49,7 +49,8 @@ use datafusion::logical_expr::Expr;
 use infino::{
     Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, GcError, InfinoError, Metric,
     OptimizeError, OptimizeOptions as InfinoOptimizeOptions, RecalibratePolicy, ReindexError,
-    ReindexMode, ReindexOptions as InfinoReindexOptions, SchemaPatch, Stemmer, Stopwords,
+    ReindexMode, ReindexOptions as InfinoReindexOptions, SchemaPatch, ScrubError, Stemmer,
+    Stopwords,
 };
 
 // ---------------------------------------------------------------------------
@@ -133,6 +134,16 @@ fn gc_err(e: GcError) -> Error {
         GcError::NoStorage => Error::new(
             Status::InvalidArg,
             "gc requires durable storage (not memory://)",
+        ),
+        other => Error::new(Status::GenericFailure, other.to_string()),
+    }
+}
+
+fn scrub_err(e: ScrubError) -> Error {
+    match e {
+        ScrubError::NoStorage => Error::new(
+            Status::InvalidArg,
+            "scrub requires durable storage (not memory://)",
         ),
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
@@ -612,6 +623,57 @@ impl From<infino::GcReport> for GcReport {
             objects_skipped_live: r.objects_skipped_live as i64,
             objects_skipped_too_new: r.objects_skipped_too_new as i64,
             delete_errors: r.delete_errors as i64,
+        }
+    }
+}
+
+/// One superfile a `scrub` could not verify.
+#[napi(object)]
+pub struct DamagedSuperfile {
+    /// The superfile's identifier, as the manifest records it.
+    pub superfile_id: String,
+    /// Its object-storage key, so the finding can be acted on directly.
+    pub storage_path: String,
+    /// Which copy failed: `"localCache"` or `"objectStore"`.
+    pub copy: String,
+    /// What went wrong.
+    pub cause: String,
+}
+
+impl From<infino::DamagedSuperfile> for DamagedSuperfile {
+    fn from(d: infino::DamagedSuperfile) -> Self {
+        Self {
+            superfile_id: d.superfile_id.to_string(),
+            storage_path: d.storage_path,
+            copy: match d.copy {
+                infino::CheckedCopy::LocalCache => "localCache".to_string(),
+                infino::CheckedCopy::ObjectStore => "objectStore".to_string(),
+            },
+            cause: d.cause,
+        }
+    }
+}
+
+/// What a `scrub` pass found.
+#[napi(object)]
+pub struct ScrubReport {
+    /// Superfiles whose checksums were verified and matched.
+    pub superfiles_verified: i64,
+    /// Bytes read and checksummed across those superfiles.
+    pub bytes_verified: i64,
+    /// How many of them were read from a copy on the local cache disk.
+    pub from_local_cache: i64,
+    /// Everything that failed. Empty means the table verified.
+    pub damaged: Vec<DamagedSuperfile>,
+}
+
+impl From<infino::ScrubReport> for ScrubReport {
+    fn from(r: infino::ScrubReport) -> Self {
+        Self {
+            superfiles_verified: r.superfiles_verified as i64,
+            bytes_verified: r.bytes_verified as i64,
+            from_local_cache: r.from_local_cache as i64,
+            damaged: r.damaged.into_iter().map(DamagedSuperfile::from).collect(),
         }
     }
 }
@@ -1363,6 +1425,14 @@ impl Table {
     pub fn gc(&self, grace_secs: f64) -> Result<GcReport> {
         let grace = Duration::from_secs_f64(grace_secs.max(0.0));
         self.inner.gc(grace).map(GcReport::from).map_err(gc_err)
+    }
+
+    /// Read every superfile this table references and verify its checksums,
+    /// reporting the ones that fail. Writes nothing and takes no slot, so it
+    /// runs against a live table. Requires durable storage.
+    #[napi]
+    pub fn scrub(&self) -> Result<ScrubReport> {
+        self.inner.scrub().map(ScrubReport::from).map_err(scrub_err)
     }
 
     /// Repair every superfile whose full-text index is behind what this engine
