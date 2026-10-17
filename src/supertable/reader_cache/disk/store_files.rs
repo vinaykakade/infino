@@ -316,7 +316,14 @@ impl DiskCacheStore {
             self.open_holed_entry(uri, size, storage_key, self.resolve_storage(storage))
                 .await
         } else {
-            self.open_cached_entry(&path, size, self.config.crc_verification.verifies_on_open())
+            // A landing, and the one the comment above `insert_warm` points
+            // at: this file was written by a previous run and nothing has
+            // validated it since.
+            self.open_cached_entry(
+                &path,
+                size,
+                self.config.crc_verification.verifies_on_landing(),
+            )
         };
 
         match opened {
@@ -454,6 +461,169 @@ impl DiskCacheStore {
         }
 
         present
+    }
+}
+
+#[cfg(test)]
+mod landing_tests {
+    use std::{
+        fs::{read, write},
+        path::Path,
+    };
+
+    use super::super::test_support::{
+        put_superfile, reopen_store, test_store_with, tiny_vector_superfile_bytes,
+    };
+    use crate::{
+        config::CrcVerification, superfile::format::footer::read_kv_metadata,
+        supertable::manifest::SuperfileUri,
+    };
+
+    /// Bytes back from the vector blob's end to flip. Near the end rather
+    /// than near the start so the flip lands in data covered by a checksum
+    /// rather than in a header or an offset table, which a structural check
+    /// would reject whatever the policy said.
+    const CORRUPT_INTO_VEC: usize = 16;
+
+    /// Flip one byte inside the cached copy's vector blob, which is a region
+    /// the superfile's own checksums cover.
+    ///
+    /// The region matters. Most of the file is Parquet, which these checksums
+    /// do not cover, so a flip at an arbitrary offset would go unnoticed and
+    /// prove nothing about the policy. The fixture is chosen for the same
+    /// reason: a superfile built with no FTS and no vector config carries no
+    /// embedded blob, and therefore nothing for verification to check.
+    fn corrupt_the_cached_blob(path: &Path) {
+        let mut bytes = read(path).expect("the landed copy is on disk");
+        let kv = read_kv_metadata(&bytes).expect("the copy carries its footer");
+        let vec_off: usize = kv["inf.vec.offset"].parse().expect("vector blob offset");
+        let vec_len: usize = kv["inf.vec.length"].parse().expect("vector blob length");
+        bytes[vec_off + vec_len - CORRUPT_INTO_VEC] ^= 0xFF;
+        write(path, &bytes).expect("write the corrupted copy back");
+    }
+
+    /// A restart reuses the copy a previous run left on disk, and verifying it
+    /// does not get in the way.
+    ///
+    /// This is the half that matters most. Verification that rejected healthy
+    /// data would turn a readable table into an unreadable one, which is a
+    /// worse failure than the gap it closes, and it would show up as exactly
+    /// this test failing.
+    #[tokio::test]
+    async fn a_healthy_cached_copy_is_reused_after_a_restart() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Auto;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("a Load read lands the whole file on disk");
+
+        let restarted = reopen_store(&store, |cfg| {
+            cfg.crc_verification = CrcVerification::Auto;
+        });
+        drop(store);
+        restarted.scan_cache_root();
+
+        let before = restarted.stats();
+        restarted
+            .reader_synchronous(&uri)
+            .await
+            .expect("restart reuses the copy");
+        let after = restarted.stats();
+
+        assert_eq!(
+            after.n_disk_reuses - before.n_disk_reuses,
+            1,
+            "the healthy copy must be adopted, not refetched"
+        );
+        assert_eq!(
+            after.n_cold_fetches - before.n_cold_fetches,
+            0,
+            "and adopting it must cost no fetch"
+        );
+    }
+
+    /// A corrupted cached copy is caught when it lands and the superfile is
+    /// refetched, so the read still succeeds.
+    ///
+    /// Two things are asserted together on purpose. Detecting the corruption
+    /// is useless if the query then fails, and recovering is useless if the
+    /// corruption went unnoticed; what a caller needs is the right answer
+    /// without knowing anything happened.
+    #[tokio::test]
+    async fn a_corrupted_cached_copy_is_discarded_and_refetched() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Auto;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("a Load read lands the whole file on disk");
+
+        corrupt_the_cached_blob(&store.cache_path(&uri));
+
+        let restarted = reopen_store(&store, |cfg| {
+            cfg.crc_verification = CrcVerification::Auto;
+        });
+        drop(store);
+        restarted.scan_cache_root();
+
+        let before = restarted.stats();
+        let reader = restarted
+            .reader_synchronous(&uri)
+            .await
+            .expect("a corrupt cached copy must not fail the read");
+        let after = restarted.stats();
+
+        assert_eq!(
+            after.n_disk_reuses - before.n_disk_reuses,
+            0,
+            "the corrupt copy must not be adopted"
+        );
+        assert_eq!(
+            after.n_cold_fetches - before.n_cold_fetches,
+            1,
+            "it must be refetched from the authoritative copy instead"
+        );
+        drop(reader);
+    }
+
+    /// With verification off the corrupt copy is adopted, which is what makes
+    /// the test above a statement about the policy rather than about some
+    /// other check happening to fire.
+    #[tokio::test]
+    async fn never_adopts_the_corrupt_copy_it_does_not_check() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Never;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("a Load read lands the whole file on disk");
+
+        corrupt_the_cached_blob(&store.cache_path(&uri));
+
+        let restarted = reopen_store(&store, |cfg| {
+            cfg.crc_verification = CrcVerification::Never;
+        });
+        drop(store);
+        restarted.scan_cache_root();
+
+        let before = restarted.stats();
+        let _ = restarted.reader_synchronous(&uri).await;
+        let after = restarted.stats();
+        assert_eq!(
+            after.n_cold_fetches - before.n_cold_fetches,
+            0,
+            "never must not notice, and so must not refetch"
+        );
     }
 }
 

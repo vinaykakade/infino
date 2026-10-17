@@ -297,6 +297,25 @@ impl CrcVerification {
             Self::Auto | Self::Never => false,
         }
     }
+
+    /// Whether bytes are verified as they land in the local disk cache.
+    ///
+    /// This is where `Auto` does its checking. A cached superfile is the one
+    /// copy of the data nothing else guards: in flight it is covered by TLS,
+    /// and at rest in the object store by the provider, but the local file is
+    /// written by this process and validated by nobody. Checking it once as
+    /// it lands costs a single pass over bytes already in hand, where
+    /// checking at open costs that pass again on every process start.
+    ///
+    /// This is the same boundary Elasticsearch verifies at, where a segment
+    /// received from another node is checksummed as it is written rather than
+    /// when it is later read.
+    pub fn verifies_on_landing(self) -> bool {
+        match self {
+            Self::Auto | Self::Always => true,
+            Self::Never => false,
+        }
+    }
 }
 
 impl SupertableSettings {
@@ -2514,6 +2533,36 @@ supertable:
     fn the_shipped_default_is_auto() {
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.supertable.crc_policy(), CrcVerification::Auto);
+    }
+
+    /// Where each policy verifies. The two questions are independent, and
+    /// `Auto` is the only value that answers them differently: it is the
+    /// whole of what "verify when bytes move, not when they are read" means.
+    #[test]
+    fn each_policy_decides_where_it_verifies() {
+        let cases = [
+            (CrcVerification::Always, true, true),
+            (CrcVerification::Auto, false, true),
+            (CrcVerification::Never, false, false),
+        ];
+        for (policy, on_open, on_landing) in cases {
+            assert_eq!(policy.verifies_on_open(), on_open, "{policy:?} at an open");
+            assert_eq!(
+                policy.verifies_on_landing(),
+                on_landing,
+                "{policy:?} when bytes land"
+            );
+        }
+    }
+
+    /// `Never` means never, at either boundary. Worth its own assertion
+    /// because the landing check was added after the open check, and an
+    /// operator who turned verification off must not have it reappear
+    /// somewhere new.
+    #[test]
+    fn never_verifies_at_neither_boundary() {
+        assert!(!CrcVerification::Never.verifies_on_open());
+        assert!(!CrcVerification::Never.verifies_on_landing());
     }
 
     /// A configuration naming neither field gets the default policy. This is

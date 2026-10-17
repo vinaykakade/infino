@@ -357,6 +357,11 @@ impl DiskCacheStore {
             buf
         };
         let foreground_bytes = Bytes::from(buffer);
+        // Not a landing: this buffer answers the query in flight and the
+        // durable copy is verified by the finalizer below, so checking here
+        // would scan the same bytes twice on the cold path. The buffer
+        // arrived under TLS, which is the guarantee the read path relies on
+        // in every engine we are matching.
         let foreground_reader = SuperfileReader::open_with(
             foreground_bytes,
             OpenOptions {
@@ -822,11 +827,14 @@ impl DiskCacheStore {
 
         // Promote to final path + open as mmap.
         tokio::fs::rename(&tmp, &final_path).await?;
+        // A landing: the whole superfile has just been written to local disk,
+        // the one copy nothing else guards. Verify it once here rather than
+        // on every open of it hereafter.
         let (mmap, bytes) = mmap_readonly_with_handle(&final_path).map_err(DiskCacheError::Io)?;
         let reader = SuperfileReader::open_with(
             bytes,
             OpenOptions {
-                verify_crc: self.config.crc_verification.verifies_on_open(),
+                verify_crc: self.config.crc_verification.verifies_on_landing(),
             },
         )?;
         let entry = self.build_mmap_entry(Arc::new(reader), mmap, size, None);
@@ -952,11 +960,12 @@ async fn finalize_to_mmap(
             guard.sync_all().await?;
         }
         drop(file);
+        // A landing: the finalizer has just completed the file on disk.
         let (mmap, bytes) = mmap_readonly_with_handle(&tmp_path)?;
         let reader = SuperfileReader::open_with(
             bytes,
             OpenOptions {
-                verify_crc: store.config.crc_verification.verifies_on_open(),
+                verify_crc: store.config.crc_verification.verifies_on_landing(),
             },
         )?;
         // Swap in over the buffered entry, which already carries the whole-size charge. The
@@ -1432,10 +1441,12 @@ async fn lazy_background_fill(
                     .await?
             }
             None => {
+                // A landing: the background fill has just downloaded the
+                // whole superfile and is about to promote it.
                 let reader = SuperfileReader::open_with(
                     bytes,
                     OpenOptions {
-                        verify_crc: store.config.crc_verification.verifies_on_open(),
+                        verify_crc: store.config.crc_verification.verifies_on_landing(),
                     },
                 )?;
                 store.build_mmap_entry(Arc::new(reader), mmap_arc, size, None)
