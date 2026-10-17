@@ -140,13 +140,13 @@ pub struct DiskCacheConfig {
     pub promotion_defer_timeout: Duration,
     /// Pluggable eviction policy. Default: [`LruPolicy`].
     pub eviction: Box<dyn CacheEvictionPolicy>,
-    /// Whether the cache's `SuperfileReader::open` calls
-    /// verify CRC. Default `true`. Plumbed independently
-    /// from the supertable's own `verify_crc_on_open` so
-    /// callers constructing a `DiskCacheStore` directly can
-    /// set the right value for their storage backend; the
-    /// supertable typically sets both knobs from the same
-    /// `Config::supertable::verify_crc_on_open` source.
+    /// When the cache verifies a superfile's checksums. Under the
+    /// default [`CrcVerification::Auto`] that is once, as the bytes
+    /// land on the cache disk, and not again on each open of the
+    /// copy they wrote. Plumbed independently from the supertable's
+    /// own policy so callers constructing a `DiskCacheStore`
+    /// directly can set the right value for their storage backend;
+    /// the supertable sets both from one source.
     pub crc_verification: CrcVerification,
 }
 

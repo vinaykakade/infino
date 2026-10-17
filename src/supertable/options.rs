@@ -1051,14 +1051,14 @@ impl SupertableOptions {
         self
     }
 
-    /// Override whether the supertable's `SuperfileReader::open`
-    /// calls verify CRC on the embedded vector blob. Default
-    /// `true`. See [`Self::crc_verification`].
+    /// Override whether this table's `SuperfileReader::open` calls
+    /// verify checksums. See [`Self::with_crc_verification`] for the
+    /// three-valued setting this is a shim over.
     ///
     /// Kept for callers written against the boolean. `true` maps to
     /// [`CrcVerification::Always`] rather than to the default, because a
-    /// caller passing `true` asked for verification and should keep it when
-    /// the default moves.
+    /// caller passing `true` asked for verification at open and must keep
+    /// it now that the default verifies at a different boundary.
     pub fn with_verify_crc_on_open(mut self, v: bool) -> Self {
         self.crc_verification = match v {
             true => CrcVerification::Always,
@@ -1093,10 +1093,14 @@ impl SupertableOptions {
         self
     }
 
-    /// Build the `SuperfileReader::open_with` options that
-    /// match the current `verify_crc_on_open` setting. Used
-    /// by every supertable-internal callsite that opens a
-    /// superfile so the global config knob applies uniformly.
+    /// Build the `SuperfileReader::open_with` options this table's
+    /// checksum policy calls for at an open. Used by every
+    /// supertable-internal callsite that opens a superfile so the
+    /// policy applies uniformly.
+    ///
+    /// An open is one of the two boundaries the policy distinguishes;
+    /// the disk cache asks about the other one, where bytes land,
+    /// through `CrcVerification::verifies_on_landing`.
     pub(crate) fn superfile_open_options(&self) -> OpenOptions {
         OpenOptions {
             verify_crc: self.crc_verification.verifies_on_open(),
