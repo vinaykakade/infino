@@ -3024,22 +3024,32 @@ impl FtsReader {
     pub(super) fn run_windowed_union_counted(
         &self,
         column_id: u32,
+        cursors: Vec<TermCursor>,
+        k: usize,
+        filter: Option<&mut ExcludeFilter>,
+    ) -> Result<(Vec<(FtsDocId, f32)>, u64), FtsError> {
+        self.run_windowed_union_counted_with::<BinaryHeap<TopKEntry>>(column_id, cursors, k, filter)
+    }
+
+    /// [`Self::run_windowed_union_counted`] into any top-k collector.
+    pub(super) fn run_windowed_union_counted_with<C: Collector>(
+        &self,
+        column_id: u32,
         mut cursors: Vec<TermCursor>,
         k: usize,
         mut filter: Option<&mut ExcludeFilter>,
     ) -> Result<(Vec<(FtsDocId, f32)>, u64), FtsError> {
         let dl_norm_k1 = self.columns[column_id as usize].dl_norm_k1();
         let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
-        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
+        let mut heap = C::with_capacity(k, initial_cap);
         let mut threshold: f32 = 0.0;
         let mut count = 0u64;
-        let offer =
-            |heap: &mut BinaryHeap<TopKEntry>, threshold: &mut f32, doc: u32, score: f32| {
-                if k == 0 {
-                    return;
-                }
-                offer_top_k(heap, k, threshold, score, doc);
-            };
+        let offer = |heap: &mut C, threshold: &mut f32, doc: u32, score: f32| {
+            if k == 0 {
+                return;
+            }
+            heap.offer(k, threshold, score, doc);
+        };
         cursors.retain(|c| !c.is_exhausted());
         if let [c] = cursors.as_mut_slice() {
             let mut lane_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
@@ -3064,7 +3074,7 @@ impl FtsReader {
                     None => {
                         count += (to - from) as u64;
                         for (&doc, &score) in docs.zip(&lane_scores) {
-                            if heap.len() < k || score > threshold {
+                            if !heap.is_full(k) || score > threshold {
                                 offer(&mut heap, &mut threshold, doc, score);
                             }
                         }
@@ -3081,7 +3091,7 @@ impl FtsReader {
                 }
                 c.advance_by(to - from);
             }
-            return Ok((drain_top_k_desc(heap), count));
+            return Ok((heap.into_sorted(), count));
         }
         let mut scores = vec![0.0f32; OR_WINDOW as usize];
         let mut present = [0u64; OR_WINDOW_WORDS];
@@ -3117,7 +3127,7 @@ impl FtsReader {
                     // no hit: count it (done above) and clear its slots
                     // without visiting a document.
                     let slots = &mut scores[word_idx << 6..(word_idx + 1) << 6];
-                    if heap.len() >= k && !word_beats(slots, threshold) {
+                    if heap.is_full(k) && !word_beats(slots, threshold) {
                         slots.fill(0.0);
                         continue;
                     }
@@ -3137,7 +3147,7 @@ impl FtsReader {
                 }
             }
         }
-        Ok((drain_top_k_desc(heap), count))
+        Ok((heap.into_sorted(), count))
     }
 
     /// Windowed MaxScore: one kernel that adapts to the running k-th
@@ -4000,6 +4010,11 @@ impl FtsReader {
         // block. One kernel therefore covers both the sparse-selective and the
         // uniform-common regimes with no cross-over routing to tune.
         let no_floor = floor_eff == f32::NEG_INFINITY;
+        if k >= BUFFERED_TOPK_MIN_K && filter.is_none() && no_floor {
+            return Ok(self
+                .run_windowed_union_counted_with::<TopKBuffer>(column_id, cursors, k, None)?
+                .0);
+        }
         if cursors.len() == 2
             && k <= WAND_BMW_2TERM_MAX_K
             && filter.is_none()
