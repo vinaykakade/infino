@@ -289,6 +289,15 @@ impl<C: Collector> MustShouldSink<'_, C> {
     /// Score the held docs' shoulds and offer them to the heap. The walk
     /// calls this once more after its last doc.
     pub(super) fn flush(&mut self) {
+        // A doc whose required score plus every optional term's maximum over
+        // the batch's range cannot beat the bar is dropped before any probe.
+        let bar = match self.heap.is_full(self.k) {
+            true => self.kth.max(self.floor_eff),
+            false => self.floor_eff,
+        };
+        if bar > f32::NEG_INFINITY {
+            self.shoulds.retain_reaching(bar);
+        }
         let (docs, scores) = self.shoulds.score(self.dl_norm_k1);
         for (&doc, &score) in docs.iter().zip(scores) {
             // Floor gate on the FULL score — a must-only score below the
@@ -361,6 +370,28 @@ impl ShouldBatch {
             }
         }
         (&self.docs, &self.scores)
+    }
+
+    /// Keep only the held docs that could beat `bar`: a doc's held score
+    /// plus every should term's maximum over the held docs' range.
+    fn retain_reaching(&mut self, bar: f32) {
+        let (Some(&lo), Some(&hi)) = (self.docs.first(), self.docs.last()) else {
+            return;
+        };
+        let ub: f32 = self
+            .shoulds
+            .iter_mut()
+            .map(|c| c.block_max_in_range(lo, hi))
+            .sum();
+        let mut w = 0usize;
+        for r in 0..self.docs.len() {
+            let (d, s) = (self.docs[r], self.scores[r]);
+            self.docs[w] = d;
+            self.scores[w] = s;
+            w += usize::from(s + ub > bar);
+        }
+        self.docs.truncate(w);
+        self.scores.truncate(w);
     }
 
     fn clear(&mut self) {
