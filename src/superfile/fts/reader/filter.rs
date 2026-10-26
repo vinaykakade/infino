@@ -179,6 +179,38 @@ impl ExcludeFilter {
         // decode and a search, never decoding past the block that holds `doc`.
         !self.cursors.iter_mut().any(|c| c.contains(doc))
     }
+
+    /// [`Self::admits`] for a batch: drop, in place, every doc of the
+    /// ascending `docs` (and the same positions of `scores`) outside the
+    /// allow-set or in a negated list, each negated list asked once for the
+    /// whole batch. The batch must ascend past every doc asked before.
+    pub(super) fn retain_admitted(&mut self, docs: &mut Vec<u32>, scores: &mut Vec<f32>) {
+        let Some(&first) = docs.first() else {
+            return;
+        };
+        debug_assert!(
+            first >= self.last_doc,
+            "ExcludeFilter fed non-monotonic doc"
+        );
+        self.last_doc = docs[docs.len() - 1];
+        if self.allow.is_some() {
+            let mut w = 0usize;
+            for r in 0..docs.len() {
+                let d = docs[r];
+                docs[w] = d;
+                scores[w] = scores[r];
+                w += usize::from(allows(&self.allow, &self.doc_map, d));
+            }
+            docs.truncate(w);
+            scores.truncate(w);
+        }
+        for c in &mut self.cursors {
+            if docs.is_empty() {
+                break;
+            }
+            c.retain_absent(docs, scores);
+        }
+    }
 }
 
 #[cfg(test)]

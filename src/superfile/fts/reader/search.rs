@@ -1815,6 +1815,9 @@ impl SingleTermWalk<'_> {
         let mut buf_d = [0u32; BLOCK_LEN];
         let mut buf_t = [0u32; BLOCK_LEN];
         let mut scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+        // A block's docs that could enter the heap, asked of a negation together.
+        let mut cand_d: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
+        let mut cand_s: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
         let mut threshold = f32::NEG_INFINITY;
         // Two skip levels. The coarse table bounds a whole span of
         // `COARSE_BLOCK_MAX_SPAN` blocks with a single entry, so a span
@@ -1898,6 +1901,29 @@ impl SingleTermWalk<'_> {
                 dl_norm_k1,
                 &mut scores,
             );
+            // With a negation, the docs that could enter the heap at the
+            // block's opening bar are asked of it together, once per block;
+            // each is then offered against the bar as it stands.
+            if let Some(f) = filter.as_deref_mut() {
+                let full = heap.is_full(k);
+                cand_d.clear();
+                cand_s.clear();
+                for (&doc_id, &score) in buf_d[..n].iter().zip(&scores) {
+                    if score > floor_eff && !(full && score <= threshold) {
+                        cand_d.push(doc_id);
+                        cand_s.push(score);
+                    }
+                }
+                f.retain_admitted(&mut cand_d, &mut cand_s);
+                for (&doc_id, &score) in cand_d.iter().zip(&cand_s) {
+                    if heap.is_full(k) && score <= threshold {
+                        continue;
+                    }
+                    heap.offer(k, &mut threshold, score, doc_id);
+                }
+                i += 1;
+                continue;
+            }
             for (&doc_id, &score) in buf_d[..n].iter().zip(&scores) {
                 // Floor gate: strictly-below-floor docs are dead to the
                 // caller; keeping them out also keeps the heap's min
@@ -1906,14 +1932,6 @@ impl SingleTermWalk<'_> {
                     continue;
                 }
                 if heap.is_full(k) && score <= threshold {
-                    continue;
-                }
-                // Drop docs excluded by a negated term (None = keep all). Asked
-                // only of a doc that would enter the heap: one that would not
-                // is dropped either way, and the docs asked still ascend.
-                if let Some(f) = filter.as_deref_mut()
-                    && !f.admits(doc_id)
-                {
                     continue;
                 }
                 heap.offer(k, &mut threshold, score, doc_id);

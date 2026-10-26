@@ -1062,6 +1062,66 @@ impl TermCursor {
         }
     }
 
+    /// Drop, in place, every doc of the ascending list `docs` this term holds,
+    /// with the same positions of `scores`: [`Self::contains`] for a batch, a
+    /// block at a time. A dense block answers each doc with a bit test, a
+    /// packed block is decoded once and searched forward from the last doc.
+    /// Like `contains`, it moves the block cursor only forward.
+    pub(super) fn retain_absent(&mut self, docs: &mut Vec<u32>, scores: &mut Vec<f32>) {
+        debug_assert_eq!(docs.len(), scores.len());
+        let (mut r, mut w) = (0usize, 0usize);
+        while r < docs.len() {
+            if !self.advance_current_block_to(docs[r]) {
+                break;
+            }
+            let last = match self.predecoded {
+                true => u32::MAX,
+                false => self.blocks[self.current_block].last_doc_id,
+            };
+            let r_end = r + docs[r..].partition_point(|&d| d <= last);
+            let hdr = match self.predecoded {
+                true => None,
+                false => Some(self.current_header()),
+            };
+            let dense = hdr.is_some_and(|h| is_dense_encoding(h.encoding));
+            if !dense && !self.predecoded && self.decoded_block != self.current_block {
+                self.decode_current_block();
+            }
+            let raw = match dense {
+                true => {
+                    let block = self.blocks[self.current_block];
+                    &self.bytes[block.block_byte_offset..block.block_byte_end]
+                }
+                false => &[][..],
+            };
+            let mut p = 0usize;
+            for j in r..r_end {
+                let d = docs[j];
+                let held = match (dense, &hdr) {
+                    (true, Some(h)) => Self::dense_contains(raw, h, d),
+                    _ => {
+                        let ids = &self.block_doc_ids[..self.block_n];
+                        p = seek_sorted::<false>(ids, p, d);
+                        p < ids.len() && ids[p] == d
+                    }
+                };
+                docs[w] = d;
+                scores[w] = scores[j];
+                w += usize::from(!held);
+            }
+            r = r_end;
+        }
+        // Past this term's last block nothing more is held.
+        while r < docs.len() {
+            docs[w] = docs[r];
+            scores[w] = scores[r];
+            w += 1;
+            r += 1;
+        }
+        docs.truncate(w);
+        scores.truncate(w);
+    }
+
     /// Keep, in place, the docs of the ascending list `docs` that this term
     /// contains, and say where each kept doc sits in this term's postings:
     /// `locs` receives its (block, pair index) and `kept` its index in the
