@@ -696,6 +696,13 @@ fn must_lead_should_walk<C: Collector>(
     let mut cand_docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     let mut cand_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
     let mut partial: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+    let mut alive: Vec<u16> = Vec::with_capacity(BLOCK_LEN);
+    // The candidates still alive after an optional term, written apart from
+    // `alive` so the compaction never reads a slot it may just have written.
+    // A fixed array and a count in a register, as a `Vec`'s length would
+    // sit in memory between a push and its truncate.
+    let mut alive_next = [0u16; BLOCK_LEN];
+    let mut contribs: Vec<f32> = Vec::with_capacity(m * BLOCK_LEN);
     let mut probe_docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     let mut cand_tfs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     let mut cand_contribs: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
@@ -882,45 +889,114 @@ fn must_lead_should_walk<C: Collector>(
                 }
                 continue;
             }
-            // The optional terms in query order, each probed over the docs
-            // still alive and added into their running sums in place: a sum is
-            // then the score itself, the same bits the general walk adds, and
-            // the docs that cannot reach the bar with the remaining terms at
-            // their block maxima are dropped between terms.
-            if pruning {
-                win_suffix[m] = 0.0;
-                for si in (0..m).rev() {
-                    win_suffix[si] = win_suffix[si + 1] + win[si];
-                }
-            }
-            probe_docs.clear();
-            partial.clear();
-            for (&d, &s) in cand_docs.iter().zip(&cand_scores) {
-                probe_docs.push(d);
-                partial.push(s);
-            }
-            for si in 0..m {
+            // At a large `k` the bar stays low and drops few docs: the optional
+            // terms go in query order, where a running sum is the score itself.
+            // At a smaller `k` strongest first collapses the bound on what is
+            // still unprobed fastest and drops docs sooner; their contributions
+            // are then kept per term and summed in query order at the end.
+            if k >= BUFFERED_TOPK_MIN_K {
+                // The optional terms in query order, each probed over the docs
+                // still alive and added into their running sums in place: a sum is
+                // then the score itself, the same bits the general walk adds, and
+                // the docs that cannot reach the bar with the remaining terms at
+                // their block maxima are dropped between terms.
                 if pruning {
-                    retain_survivors(&mut probe_docs, &mut partial, threshold - win_suffix[si]);
+                    win_suffix[m] = 0.0;
+                    for si in (0..m).rev() {
+                        win_suffix[si] = win_suffix[si + 1] + win[si];
+                    }
                 }
-                if probe_docs.is_empty() {
-                    break;
+                probe_docs.clear();
+                partial.clear();
+                for (&d, &s) in cand_docs.iter().zip(&cand_scores) {
+                    probe_docs.push(d);
+                    partial.push(s);
                 }
-                score_noness_batched(
-                    &mut shoulds[si],
-                    &probe_docs,
-                    &mut partial,
-                    dl_norm_k1,
-                    &mut cand_tfs,
-                );
-            }
-            for (&d, &score) in probe_docs.iter().zip(&partial) {
-                if threshold > f32::NEG_INFINITY && score <= threshold {
-                    continue;
+                for si in 0..m {
+                    if pruning {
+                        retain_survivors(&mut probe_docs, &mut partial, threshold - win_suffix[si]);
+                    }
+                    if probe_docs.is_empty() {
+                        break;
+                    }
+                    score_noness_batched(
+                        &mut shoulds[si],
+                        &probe_docs,
+                        &mut partial,
+                        dl_norm_k1,
+                        &mut cand_tfs,
+                    );
                 }
-                if score > floor_eff {
-                    heap.offer(k, &mut kth, score, d);
-                    threshold = bar(heap, kth);
+                for (&d, &score) in probe_docs.iter().zip(&partial) {
+                    if threshold > f32::NEG_INFINITY && score <= threshold {
+                        continue;
+                    }
+                    if score > floor_eff {
+                        heap.offer(k, &mut kth, score, d);
+                        threshold = bar(heap, kth);
+                    }
+                }
+            } else {
+                if pruning {
+                    win_suffix[m] = 0.0;
+                    for rank in (0..m).rev() {
+                        win_suffix[rank] = win_suffix[rank + 1] + win[order[rank]];
+                    }
+                }
+                alive.clear();
+                for (i, &s) in cand_scores.iter().enumerate() {
+                    alive.push(i as u16);
+                    alive.truncate(
+                        alive.len() - usize::from(pruning && s + win_suffix[0] <= threshold),
+                    );
+                }
+                partial.clear();
+                partial.extend_from_slice(&cand_scores);
+                contribs.clear();
+                contribs.resize(m * n, 0.0);
+                for (rank, &si) in order.iter().enumerate() {
+                    if alive.is_empty() {
+                        break;
+                    }
+                    let c = &mut shoulds[si];
+                    probe_docs.clear();
+                    probe_docs.extend(alive.iter().map(|&i| cand_docs[usize::from(i)]));
+                    cand_tfs.clear();
+                    cand_tfs.resize(probe_docs.len(), 0);
+                    c.probe_tfs(&probe_docs, &mut cand_tfs);
+                    score_postings(
+                        c.idf_weight,
+                        &probe_docs,
+                        &cand_tfs,
+                        dl_norm_k1,
+                        &mut cand_contribs,
+                    );
+                    let rest = win_suffix[rank + 1];
+                    let mut w = 0usize;
+                    for (&a, &x) in alive.iter().zip(&cand_contribs) {
+                        let i = usize::from(a);
+                        contribs[si * n + i] = x;
+                        let p = partial[i] + x;
+                        partial[i] = p;
+                        alive_next[w] = a;
+                        w += usize::from(!(pruning && p + rest <= threshold));
+                    }
+                    alive.clear();
+                    alive.extend_from_slice(&alive_next[..w]);
+                }
+                for &i in &alive {
+                    let i = usize::from(i);
+                    let mut score = cand_scores[i];
+                    for si in 0..m {
+                        score += contribs[si * n + i];
+                    }
+                    if threshold > f32::NEG_INFINITY && score <= threshold {
+                        continue;
+                    }
+                    if score > floor_eff {
+                        heap.offer(k, &mut kth, score, cand_docs[i]);
+                        threshold = bar(heap, kth);
+                    }
                 }
             }
             continue;
