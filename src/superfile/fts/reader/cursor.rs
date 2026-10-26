@@ -347,6 +347,10 @@ impl BlockTableCache {
     }
 }
 
+thread_local! {
+    pub(super) static DIAG_WALK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// Per-term per-block metadata, parsed once at `TermCursor` construction.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BlockMeta {
@@ -1753,6 +1757,10 @@ impl TermCursor {
             i += 1;
         }
         let first = self.inspect_block;
+        DIAG_WALK.with(|c| {
+            let (a, b) = c.get();
+            c.set((a + 1, b + (i - first) as u64));
+        });
         if i == first {
             return (max, 0.0);
         }

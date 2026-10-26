@@ -3072,8 +3072,13 @@ impl FtsReader {
         // Sum of every term's UB — the reference for the essential-side
         // block-max skip below.
         let total_term_ub = partial_max[0];
+        super::cursor::DIAG_WALK.with(|c| c.set((0, 0)));
+        let mut diag_windows = 0u64;
+        let mut diag_span = 0u64;
+        let mut diag_offers = 0u64;
 
         loop {
+            diag_windows += 1;
             // Continuous partition: recompute the essential set from the live
             // threshold. `threshold` only rises, so `f_essential` only shrinks.
             let f_essential = recompute_f(&partial_max, pb(threshold));
@@ -3600,11 +3605,18 @@ impl FtsReader {
             }
 
             // Collect the fully-scored candidates (ascending doc order).
+            diag_span += u64::from(window_end - base);
+            diag_offers += win_docs.len() as u64;
             for (idx, &doc) in win_docs.iter().enumerate() {
                 let score = win_scores[idx];
                 heap.offer(k, &mut threshold, score, doc);
             }
         }
+        let (calls, walked) = super::cursor::DIAG_WALK.with(|c| c.get());
+        eprintln!(
+            "WDIAG n={n} k={k} windows={diag_windows} span={diag_span} offers={diag_offers} bound_calls={calls} blocks_walked={walked} df={:?}",
+            cursors.iter().map(|c| c.block_count()).collect::<Vec<_>>()
+        );
 
         Ok(heap.into_sorted())
     }
