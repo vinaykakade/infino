@@ -556,7 +556,7 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
     let mut seed = f32::NEG_INFINITY;
     let mut order: Vec<usize> = Vec::new();
     let (mut ids, mut tfs) = ([0u32; BLOCK_LEN], [0u32; BLOCK_LEN]);
-    let mut scores: Vec<f32> = Vec::with_capacity(k + BLOCK_LEN);
+    let mut scores: Vec<f32> = Vec::new();
     let mut block_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
     for c in cursors {
         let n_blocks = c.blocks.len();
@@ -574,6 +574,7 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
                 .total_cmp(&c.blocks[a].block_max_bm25)
         });
         scores.clear();
+        scores.reserve(need * BLOCK_LEN);
         for &b in &order[..need] {
             let n = c.decode_block_into(b, &mut ids, &mut tfs);
             score_postings(
