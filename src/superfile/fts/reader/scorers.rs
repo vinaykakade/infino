@@ -590,6 +590,11 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
     seed
 }
 
+/// A non-essential union term whose estimated docs in a window are at most
+/// this many times the essential terms' is accumulated in that window
+/// rather than probed.
+const PROMOTE_DENSITY: f32 = 0.5;
+
 /// How many times fewer postings the optional terms must have over a
 /// required block's range than the block itself, for the must-led walk to
 /// collect theirs and score only the required docs among them.
@@ -3344,6 +3349,25 @@ impl FtsReader {
                     c.skip_to(window_end);
                 }
                 continue;
+            }
+            // Promotion, the converse: a non-essential term holding few more
+            // docs in this window than the essentials is accumulated with them
+            // rather than probed at nearly every candidate, accumulating a
+            // posting costing a fraction of a probe. Terms stay in term-max
+            // order, so a doc's score is summed in the same order either way,
+            // and the suffix bounds of the terms still probed are unchanged.
+            let mut f_win = f_win;
+            if prune && !sole && f_win == f_essential {
+                let essential_docs: f32 = win_docs_est[..f_essential].iter().sum();
+                while f_win < n
+                    && !cursors[f_win].predecoded
+                    && win_docs_est[f_win] <= PROMOTE_DENSITY * essential_docs
+                {
+                    // A probe may have left the cursor's buffers on another
+                    // block: put it back into iteration at the window.
+                    cursors[f_win].reseek(base);
+                    f_win += 1;
+                }
             }
             for (ci, c) in cursors.iter_mut().enumerate().take(f_win) {
                 let mut checked_block = usize::MAX;
