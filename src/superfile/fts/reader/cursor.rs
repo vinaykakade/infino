@@ -961,7 +961,6 @@ impl TermCursor {
         (hdr, block.block_byte_offset..block.block_byte_end)
     }
 
-    #[inline]
     /// Decode block `b` into `ids` and `tfs` without moving the cursor, and
     /// return its doc count. For a term on the long form only.
     pub(super) fn decode_block_into(
@@ -981,6 +980,7 @@ impl TermCursor {
         )
     }
 
+    #[inline]
     fn current_header(&mut self) -> BlockHeader {
         let b = self.current_block;
         if let Some((cached, hdr)) = self.header_cache
