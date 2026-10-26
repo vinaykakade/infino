@@ -538,6 +538,58 @@ pub(super) fn pruning_bar(bar: f32, terms: usize) -> f32 {
     }
 }
 
+/// `k` from which a multi-term union starts its bar at [`union_seed`]: at a
+/// smaller `k` the bar rises within the first windows anyway.
+pub(super) const UNION_SEED_MIN_K: usize = 512;
+
+/// Block tables longer than this are not scanned for a seed: a term that
+/// common scores too low per doc to raise the bar, and the scan is linear.
+const UNION_SEED_MAX_BLOCKS: usize = 4096;
+
+/// A lower bound on a union's `k`-th best score, before its walk starts: for
+/// each term with at least `k` docs, the `k`-th best of its own scores over its
+/// highest-bound blocks, the largest of these, one ulp down. A doc's union
+/// score is at least its score for any one term, so `k` docs score at least
+/// that; one ulp down keeps a doc tied at the bound. `NEG_INFINITY` when no
+/// term qualifies.
+pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) -> f32 {
+    let mut seed = f32::NEG_INFINITY;
+    let mut order: Vec<usize> = Vec::new();
+    let (mut ids, mut tfs) = ([0u32; BLOCK_LEN], [0u32; BLOCK_LEN]);
+    let mut docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
+    let mut scores: Vec<f32> = Vec::with_capacity(k + BLOCK_LEN);
+    let mut block_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+    for c in cursors {
+        let n_blocks = c.blocks.len();
+        if c.predecoded || c.df < k as u64 || n_blocks > UNION_SEED_MAX_BLOCKS {
+            continue;
+        }
+        // The highest-bound blocks, enough to hold `k` docs (every block but
+        // the last holds `BLOCK_LEN`), selected rather than sorted.
+        let need = (k.div_ceil(BLOCK_LEN) + 1).min(n_blocks);
+        order.clear();
+        order.extend(0..n_blocks);
+        order.select_nth_unstable_by(need - 1, |&a, &b| {
+            c.blocks[b]
+                .block_max_bm25
+                .total_cmp(&c.blocks[a].block_max_bm25)
+        });
+        scores.clear();
+        for &b in &order[..need] {
+            let n = c.decode_block_into(b, &mut ids, &mut tfs);
+            docs.clear();
+            docs.extend_from_slice(&ids[..n]);
+            score_postings(c.idf_weight, &docs, &tfs[..n], dl_norm, &mut block_scores);
+            scores.extend_from_slice(&block_scores);
+        }
+        if scores.len() >= k {
+            let (_, &mut kth, _) = scores.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+            seed = seed.max(kth.next_down());
+        }
+    }
+    seed
+}
+
 /// How many times fewer postings the optional terms must have over a
 /// required block's range than the block itself, for the must-led walk to
 /// collect theirs and score only the required docs among them.
@@ -3600,6 +3652,10 @@ impl FtsReader {
                     }
                     Err(RareLedFallback::Walk) => {}
                 }
+            }
+            if k >= UNION_SEED_MIN_K && filter.is_none() && no_floor {
+                let dl_norm_k1 = self.columns[column_id as usize].dl_norm_k1();
+                floor = floor.max(union_seed(&cursors, k, dl_norm_k1));
             }
             self.run_windowed_maxscore(column_id, cursors, k, filter, floor, 0, u32::MAX)
         }
