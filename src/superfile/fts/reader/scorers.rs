@@ -1415,7 +1415,7 @@ const WIDE_WINDOW_MIN_K: usize = 512;
 /// Fewest essential terms at which a union window runs to its cap: the
 /// nearest of that many terms' block boundaries is never far, so ending
 /// there makes windows short and each pays a bound per term.
-const WIDE_WINDOW_MIN_ESSENTIALS: usize = 4;
+const WIDE_WINDOW_MIN_ESSENTIALS: usize = 3;
 
 /// Smallest `k` at which the windowed MaxScore kernel collects into a
 /// buffer rather than a heap.
