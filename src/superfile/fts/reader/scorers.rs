@@ -3071,6 +3071,7 @@ impl FtsReader {
         let mut win_ub = vec![0.0_f32; n];
         let mut win_docs_est = vec![0.0_f32; n];
         let mut partial_win = vec![0.0_f32; n + 1];
+        let mut cand_bound: Vec<f32> = Vec::new();
         // Sum of every term's UB — the reference for the essential-side
         // block-max skip below.
         let total_term_ub = partial_max[0];
@@ -3577,6 +3578,33 @@ impl FtsReader {
             // touch a shrinking survivor set. While filling, every doc must be
             // admitted, so score all non-essentials over every candidate.
             if heap_full {
+                // Each candidate bounded by the non-essential terms' block
+                // maxima at its own doc, which a window holding several of
+                // their blocks keeps tighter than their maxima over the window:
+                // a candidate that cannot reach the bar is dropped before any
+                // probe.
+                retain_survivors(
+                    &mut win_docs,
+                    &mut win_scores,
+                    pb(threshold) - partial_win[f_win],
+                );
+                if !win_docs.is_empty() {
+                    cand_bound.clear();
+                    cand_bound.resize(win_docs.len(), 0.0);
+                    for c in non_ess.iter() {
+                        c.add_block_max_at(&win_docs, &mut cand_bound);
+                    }
+                    let bar = pb(threshold);
+                    let mut w = 0usize;
+                    for i in 0..win_docs.len() {
+                        let keep = win_scores[i] + cand_bound[i] > bar;
+                        win_docs[w] = win_docs[i];
+                        win_scores[w] = win_scores[i];
+                        w += usize::from(keep);
+                    }
+                    win_docs.truncate(w);
+                    win_scores.truncate(w);
+                }
                 complete_survivors(
                     non_ess,
                     &partial_win[f_win..],

@@ -1664,6 +1664,30 @@ impl TermCursor {
         }
     }
 
+    /// Add to each of `bounds` this term's largest possible score at the
+    /// matching doc of `docs` (ascending): the maximum of the block that would
+    /// hold it, nothing past the term's last block, by block metadata alone.
+    /// A term held whole adds its term maximum everywhere.
+    pub(super) fn add_block_max_at(&self, docs: &[u32], bounds: &mut [f32]) {
+        let blocks = &self.blocks[..];
+        if self.predecoded || blocks.is_empty() {
+            bounds.iter_mut().for_each(|b| *b += self.term_max_bm25);
+            return;
+        }
+        let Some(&first) = docs.first() else {
+            return;
+        };
+        let mut b = blocks.partition_point(|m| m.last_doc_id < first);
+        for (&d, bound) in docs.iter().zip(bounds) {
+            while b < blocks.len() && blocks[b].last_doc_id < d {
+                b += 1;
+            }
+            if let Some(m) = blocks.get(b) {
+                *bound += m.block_max_bm25;
+            }
+        }
+    }
+
     /// Shallow-advance the inspect-block pointer to the block that
     /// would contain `target`. Does NOT decode and does NOT touch the
     /// doc cursor (`current_block`, `pos`, decoded buffers stay put);
