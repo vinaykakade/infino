@@ -673,8 +673,13 @@ impl Collector for TopKBuffer {
         true
     }
     fn into_sorted(mut self) -> Vec<(FtsDocId, f32)> {
-        self.buf.sort_unstable_by(|a, b| b.cmp(a));
+        // Up to `slack` entries past the best `k` may be held: select the
+        // best `k` first, so the sort orders only those.
+        if self.buf.len() > self.k && self.k > 0 {
+            self.buf.select_nth_unstable_by(self.k - 1, |a, b| b.cmp(a));
+        }
         self.buf.truncate(self.k);
+        self.buf.sort_unstable_by(|a, b| b.cmp(a));
         self.buf
             .into_iter()
             .map(|key| {
