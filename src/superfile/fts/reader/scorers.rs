@@ -538,6 +538,20 @@ pub(super) fn pruning_bar(bar: f32, terms: usize) -> f32 {
     }
 }
 
+/// Highest tf [`tf_floor`] tries: a posting at or past it is always scored.
+const TF_FLOOR_MAX: u32 = 64;
+
+/// The smallest tf at which a posting of a term weighted `idf_weight`, scored
+/// at the column's smallest norm `min_norm` (where a tf scores highest) and
+/// with `others` added, beats `bar`: no posting below it can, whatever its
+/// doc's norm, as each step of the score rounds monotonically. Capped at
+/// [`TF_FLOOR_MAX`].
+fn tf_floor(idf_weight: f32, min_norm: f32, others: f32, bar: f32) -> u32 {
+    (1..TF_FLOOR_MAX)
+        .find(|&tf| bm25::score_with_dl_norm_k1(idf_weight, tf, min_norm) + others > bar)
+        .unwrap_or(TF_FLOOR_MAX)
+}
+
 /// `k` from which a multi-term union starts its bar at [`union_seed`]: at a
 /// smaller `k` the bar rises within the first windows anyway.
 pub(super) const UNION_SEED_MIN_K: usize = 64;
@@ -3055,6 +3069,7 @@ impl FtsReader {
         let mut survivors = [0u16; BLOCK_LEN + 8];
         let mut n_survivors: usize;
         let mut leader_scores = [0.0f32; BLOCK_LEN];
+        let min_norm = dl_norm_k1.min_norm();
         // Compacted per-window candidate list (doc + essential score), reused;
         // the drain fills it, the SIMD filter compacts it to survivors.
         let mut win_docs: Vec<u32> = Vec::with_capacity(OR_WINDOW as usize);
@@ -3123,12 +3138,20 @@ impl FtsReader {
                 if batched {
                     let c = &cursors[0];
                     let (from, to) = (c.pos, c.block_n);
+                    // A posting below this tf cannot clear the bar even at the
+                    // shortest doc's norm, where a tf scores highest: eight such
+                    // postings are passed over with no norm read and no score.
+                    let tf_floor = tf_floor(c.idf_weight, min_norm, block_others_ub, pb(threshold));
                     let mut i = from;
                     while i + 8 <= to {
-                        let dids: [u32; 8] = c.block_doc_ids[i..i + 8]
+                        let tfs: [u32; 8] = c.block_tfs[i..i + 8]
                             .try_into()
                             .expect("invariant: an 8-wide slice");
-                        let tfs: [u32; 8] = c.block_tfs[i..i + 8]
+                        if tfs.iter().all(|&t| t < tf_floor) {
+                            i += 8;
+                            continue;
+                        }
+                        let dids: [u32; 8] = c.block_doc_ids[i..i + 8]
                             .try_into()
                             .expect("invariant: an 8-wide slice");
                         let lanes =

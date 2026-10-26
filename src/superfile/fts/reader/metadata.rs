@@ -285,6 +285,19 @@ impl NormTable {
         worst
     }
 
+    /// The smallest `dl_norm_k1` any doc of the column has: the norm of the
+    /// shortest occupied length, at which a tf scores highest. 0 for an
+    /// empty column, which bounds nothing below any norm.
+    pub(super) fn min_norm(&self) -> f32 {
+        let (lo, hi) = self.occupied;
+        match self.bytes.is_empty() {
+            true => 0.0,
+            false => self.lut[usize::from(lo)..=usize::from(hi)]
+                .iter()
+                .fold(f32::INFINITY, |a, &x| a.min(x)),
+        }
+    }
+
     /// `dl_norm_k1` for a doc (length quantized): one per-doc byte load
     /// plus one L1 decode-table lookup. Hot path — keep it inlined.
     #[inline(always)]
