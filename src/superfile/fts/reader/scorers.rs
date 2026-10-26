@@ -2972,7 +2972,7 @@ impl FtsReader {
         // heap's sift per admission is a fifth of the kernel; a buffer cut by
         // selection costs an append instead. At a small `k` the bar must rise
         // on every admission, which only the heap does.
-        match k >= BUFFERED_TOPK_MIN_K {
+        match k >= 64 {
             true => self.run_windowed_maxscore_with::<TopKBuffer>(
                 column_id,
                 cursors,
