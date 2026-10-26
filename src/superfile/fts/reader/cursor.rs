@@ -478,6 +478,11 @@ pub(crate) struct TermCursor {
     /// without expanding the block's doc ids. Lets the probe reuse the
     /// decoded tfs across a run of candidates landing in the same block.
     pub(super) tf_decoded_block: usize,
+    /// The block whose doc ids alone a probe decoded into `block_doc_ids`
+    /// ([`NO_BLOCK`] = none): its tfs are decoded only once a probe hits it,
+    /// and `decoded_block` stays unset until they are, so no reader takes
+    /// `block_tfs` for this block's before then.
+    ids_block: usize,
     /// The whole posting list is already in `block_doc_ids[..block_n]` /
     /// `block_tfs[..block_n]` and `blocks` has exactly one entry with no
     /// bytes behind it: the df=1 inline form and the short form
@@ -607,6 +612,7 @@ fn rank_by_bitmap(ids: &[u32], targets: &[u32], out: &mut [u32]) -> bool {
 
 /// A balanced probe answered by [`rank_by_bitmap`]: each target's tf from
 /// `tfs`, or 0 when the block does not hold it.
+#[cfg(test)]
 fn probe_by_bitmap(ids: &[u32], tfs: &[u32], targets: &[u32], out: &mut [u32]) -> bool {
     if !rank_by_bitmap(ids, targets, out) {
         return false;
@@ -752,6 +758,7 @@ impl TermCursor {
             purpose,
             decoded_block: NO_BLOCK,
             tf_decoded_block: NO_BLOCK,
+            ids_block: NO_BLOCK,
             predecoded: false,
             header_cache: None,
             lazy_bit: NOT_LAZY,
@@ -850,6 +857,7 @@ impl TermCursor {
             purpose,
             decoded_block: 0,
             tf_decoded_block: 0,
+            ids_block: NO_BLOCK,
             predecoded: true,
             header_cache: None,
             lazy_bit: NOT_LAZY,
@@ -924,6 +932,7 @@ impl TermCursor {
             purpose,
             decoded_block: 0,
             tf_decoded_block: 0,
+            ids_block: NO_BLOCK,
             predecoded: true,
             header_cache: None,
             lazy_bit: NOT_LAZY,
@@ -997,6 +1006,7 @@ impl TermCursor {
     pub(super) fn decode_current_block(&mut self) {
         debug_assert!(!self.predecoded, "a pre-decoded cursor has no block bytes");
         self.lazy_bit = NOT_LAZY;
+        self.ids_block = NO_BLOCK;
         let block = self.blocks[self.current_block];
         // Borrow in place rather than clone an owned `Bytes` (disjoint from the
         // `&mut self.block_*` decode targets, which are separate fields).
@@ -1488,12 +1498,19 @@ impl TermCursor {
                 }
                 continue;
             }
-            if self.decoded_block != self.current_block || self.is_lazy() {
-                self.decode_current_block();
+            if (self.decoded_block != self.current_block || self.is_lazy())
+                && self.ids_block != self.current_block
+            {
+                self.decode_current_ids();
             }
             let n = self.block_n;
             let ids = &self.block_doc_ids[..n];
             let mut p = self.pos.min(n);
+            let k_start = k;
+            // Each target's answer is first its posting's index plus one, 0
+            // when the block does not hold it; the block's tfs are decoded
+            // and read only once a target hits.
+            //
             // Targets in this block about as dense as its postings (a
             // balanced pair): rank them all against the block's remaining
             // postings by bitmap, no target waiting on another; when their
@@ -1504,40 +1521,76 @@ impl TermCursor {
             // for sparse targets, where it skips long stretches of postings.
             let k_end = k + docs[k..].partition_point(|&d| d <= last);
             if (k_end - k) * BALANCED_PROBE_RATIO >= n - p {
-                let tfs = &self.block_tfs[..n];
-                if p < n
-                    && probe_by_bitmap(&ids[p..], &tfs[p..], &docs[k..k_end], &mut out[k..k_end])
-                {
+                if p < n && rank_by_bitmap(&ids[p..], &docs[k..k_end], &mut out[k..k_end]) {
+                    let offset = p as u32;
+                    for o in &mut out[k..k_end] {
+                        *o += offset * u32::from(*o != 0);
+                    }
                     // A later probe may bring more targets in this block: leave
                     // the cursor at the first posting not below the last target,
                     // as the merge would.
                     let last_target = docs[k_end - 1];
                     p += ids[p..].partition_point(|&x| x < last_target);
-                    k = k_end;
-                    self.pos = p.min(n.saturating_sub(1));
-                    continue;
+                } else {
+                    while k < k_end && p < n {
+                        let (t, x) = (docs[k], ids[p]);
+                        out[k] = if t == x { p as u32 + 1 } else { 0 };
+                        k += usize::from(t <= x);
+                        p += usize::from(x <= t);
+                    }
+                    out[k..k_end].fill(0);
                 }
-                while k < k_end && p < n {
-                    let (t, x) = (docs[k], ids[p]);
-                    out[k] = if t == x { tfs[p] } else { 0 };
-                    k += usize::from(t <= x);
-                    p += usize::from(x <= t);
-                }
-                out[k..k_end].fill(0);
                 k = k_end;
-                self.pos = p.min(n.saturating_sub(1));
-                continue;
-            }
-            while k < n_docs && docs[k] <= last {
-                let t = docs[k];
-                p = seek_sorted::<true>(ids, p, t);
-                out[k] = match p < n && ids[p] == t {
-                    true => self.block_tfs[p],
-                    false => 0,
-                };
-                k += 1;
+            } else {
+                while k < n_docs && docs[k] <= last {
+                    let t = docs[k];
+                    p = seek_sorted::<true>(ids, p, t);
+                    out[k] = match p < n && ids[p] == t {
+                        true => p as u32 + 1,
+                        false => 0,
+                    };
+                    k += 1;
+                }
             }
             self.pos = p.min(n.saturating_sub(1));
+            self.tfs_at_ranks(&mut out[k_start..k]);
+        }
+    }
+
+    /// Decode the current block's doc ids alone, for a probe: its tfs wait
+    /// for [`Self::tfs_at_ranks`].
+    fn decode_current_ids(&mut self) {
+        self.lazy_bit = NOT_LAZY;
+        let block = self.blocks[self.current_block];
+        let hdr = self.current_header();
+        let bytes = &self.bytes[block.block_byte_offset..block.block_byte_end];
+        self.block_n = decode_block_doc_ids(bytes, &hdr, &mut self.block_doc_ids);
+        self.pos = 0;
+        self.decoded_block = NO_BLOCK;
+        self.ids_block = self.current_block;
+    }
+
+    /// Turn a probe's answers in the current block, each a posting's index
+    /// plus one or 0, into that posting's tf or 0, decoding the block's tfs
+    /// only when some answer is a hit.
+    fn tfs_at_ranks(&mut self, out: &mut [u32]) {
+        if out.iter().all(|&r| r == 0) {
+            return;
+        }
+        if self.tf_decoded_block != self.current_block {
+            let block = self.blocks[self.current_block];
+            let hdr = self.current_header();
+            let bytes = &self.bytes[block.block_byte_offset..block.block_byte_end];
+            decode_block_tfs(bytes, &hdr, &mut self.block_tfs);
+            self.tf_decoded_block = self.current_block;
+        }
+        if self.ids_block == self.current_block {
+            self.decoded_block = self.current_block;
+        }
+        for o in out {
+            if *o != 0 {
+                *o = self.block_tfs[*o as usize - 1];
+            }
         }
     }
 
