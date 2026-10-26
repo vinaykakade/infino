@@ -540,7 +540,7 @@ pub(super) fn pruning_bar(bar: f32, terms: usize) -> f32 {
 
 /// `k` from which a multi-term union starts its bar at [`union_seed`]: at a
 /// smaller `k` the bar rises within the first windows anyway.
-pub(super) const UNION_SEED_MIN_K: usize = 512;
+pub(super) const UNION_SEED_MIN_K: usize = 64;
 
 /// Block tables longer than this are not scanned for a seed: a term that
 /// common scores too low per doc to raise the bar, and the scan is linear.
