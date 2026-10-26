@@ -5606,6 +5606,58 @@ mod tests {
         }
     }
 
+    /// A union at a `k` the seed serves ranks as the unpruned exhaustive walk
+    /// does: the seeded bar never drops a doc of the top `k`. One shape where
+    /// the seed is tight — a common term with a rare one, so the union's `k`-th
+    /// best is the common term's own — and one with a stopword and overlapping
+    /// terms, where it sits well below.
+    #[tokio::test]
+    async fn seeded_large_k_union_agrees_with_the_exhaustive_walk() {
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for i in 0..6_000u32 {
+            let mut text = String::new();
+            for (word, per_mille) in [("stop", 950u64), ("mid", 400), ("rare", 180), ("few", 8)] {
+                if next() % 1000 < per_mille {
+                    for _ in 0..1 + next() % 3 {
+                        text.push_str(word);
+                        text.push(' ');
+                    }
+                }
+            }
+            text.push_str(&"pad ".repeat((next() % 30) as usize));
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        for terms in [&["mid", "few"][..], &["stop", "mid", "rare"]] {
+            for k in [UNION_SEED_MIN_K, 1_000, 2_000] {
+                let got = r
+                    .search("body", terms, k, BoolMode::Or)
+                    .await
+                    .expect("search");
+                let want = r
+                    .search_with_algo_for_bench("body", terms, k, OrAlgo::Exhaustive)
+                    .await
+                    .expect("exhaustive");
+                assert_eq!(got.len(), want.len(), "{terms:?} k {k}");
+                for ((dg, sg), (dw, sw)) in got.iter().zip(&want) {
+                    assert!(
+                        (sg - sw).abs() < 1e-4,
+                        "{terms:?} k {k}: {dg:?} {sg} vs {dw:?} {sw}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn search_with_algo_empty_and_zero_k_short_circuit() {
         let (blob, json) = build_blob();
