@@ -1664,6 +1664,18 @@ impl TermCursor {
         }
     }
 
+    /// The doc just past the block that would hold `target`, by metadata
+    /// alone (it moves only the inspect-block pointer, as
+    /// [`Self::shallow_advance_block_to`] does); `u32::MAX` past the last
+    /// block.
+    pub(super) fn block_end_at(&mut self, target: u32) -> u32 {
+        self.shallow_advance_block_to(target);
+        match self.blocks.get(self.inspect_block) {
+            Some(b) => b.last_doc_id.saturating_add(1),
+            None => u32::MAX,
+        }
+    }
+
     /// Shallow-advance the inspect-block pointer to the block that
     /// would contain `target`. Does NOT decode and does NOT touch the
     /// doc cursor (`current_block`, `pos`, decoded buffers stay put);

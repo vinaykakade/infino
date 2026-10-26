@@ -3421,8 +3421,35 @@ impl FtsReader {
                 f_essential
             };
             if f_win == 0 {
+                // A window that holds no competitive doc. The skip runs on past
+                // it, a range at a time to the nearest essential block boundary,
+                // while every term's maximum over the range still cannot beat
+                // the bar: a doc there scores at most that sum. Block metadata
+                // alone decides it, with none of a window's bookkeeping.
+                let bar = pb(threshold);
+                let mut end = window_end;
+                while end < doc_id_end {
+                    let next = cursors
+                        .iter_mut()
+                        .take(f_essential)
+                        .map(|c| c.block_end_at(end))
+                        .min()
+                        .unwrap_or(u32::MAX)
+                        .min(doc_id_end);
+                    if next <= end {
+                        break;
+                    }
+                    let ub: f32 = cursors
+                        .iter_mut()
+                        .map(|c| c.block_max_in_range(end, next - 1))
+                        .sum();
+                    if ub > bar {
+                        break;
+                    }
+                    end = next;
+                }
                 for c in cursors.iter_mut().take(f_essential) {
-                    c.skip_to(window_end);
+                    c.skip_to(end);
                 }
                 continue;
             }
