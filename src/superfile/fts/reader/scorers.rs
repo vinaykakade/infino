@@ -1251,6 +1251,10 @@ fn accumulate_one(
 /// same bits. A lazily held block, whose buffer shows a single doc, adds
 /// that one posting.
 #[inline(always)]
+thread_local! {
+    static DIAG_ACC: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn accumulate_segment(
     c: &mut TermCursor,
     base: u32,
@@ -1269,6 +1273,7 @@ fn accumulate_segment(
         true => n,
         false => pos + ids[pos..].partition_point(|&d| d < window_end),
     };
+    DIAG_ACC.with(|x| x.set(x.get() + (to - pos) as u64));
     let tfs = &c.block_tfs[..n];
     let mut i = pos;
     #[cfg(target_arch = "x86_64")]
@@ -3070,6 +3075,10 @@ impl FtsReader {
         // Sum of every term's UB — the reference for the essential-side
         // block-max skip below.
         let total_term_ub = partial_max[0];
+        let diag_floor = threshold;
+        let (mut d_win, mut d_ess, mut d_fwin) = (0u64, 0u64, 0u64);
+        let mut d_acc = vec![0u64; n];
+        super::cursor::DIAG_PROBES.with(|c| c.set(0));
 
         loop {
             // Continuous partition: recompute the essential set from the live
@@ -3484,9 +3493,14 @@ impl FtsReader {
                             continue;
                         }
                     }
+                    let before = DIAG_ACC.with(|x| x.get());
                     accumulate_segment(c, base, window_end, &mut scores, &mut present, dl_norm_k1);
+                    d_acc[ci] += DIAG_ACC.with(|x| x.get()) - before;
                 }
             }
+            d_win += 1;
+            d_ess += f_essential as u64;
+            d_fwin += f_win as u64;
 
             // Drain the presence bitmask into a compacted, ascending
             // `(doc, essential-score)` list (dropping negated docs), then run
@@ -3596,6 +3610,13 @@ impl FtsReader {
             }
         }
 
+        eprintln!(
+            "NDIAG k={k} floor={diag_floor} final={threshold} windows={d_win} ess_avg={:.2} fwin_avg={:.2} acc={d_acc:?} df={:?} probes={}",
+            d_ess as f64 / d_win.max(1) as f64,
+            d_fwin as f64 / d_win.max(1) as f64,
+            cursors.iter().map(|c| c.df).collect::<Vec<_>>(),
+            super::cursor::DIAG_PROBES.with(|c| c.get())
+        );
         Ok(heap.into_sorted())
     }
 

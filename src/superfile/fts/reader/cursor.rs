@@ -347,6 +347,10 @@ impl BlockTableCache {
     }
 }
 
+thread_local! {
+    pub(super) static DIAG_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Per-term per-block metadata, parsed once at `TermCursor` construction.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BlockMeta {
@@ -1402,6 +1406,7 @@ impl TermCursor {
     /// the batch it covers. Same contract as the single probe: docs only
     /// ascend across calls, and a cursor probed this way is not iterated.
     pub(super) fn probe_tfs(&mut self, docs: &[u32], out: &mut [u32]) {
+        DIAG_PROBES.with(|c| c.set(c.get() + docs.len() as u64));
         debug_assert_eq!(docs.len(), out.len());
         if self.predecoded {
             let ids = &self.block_doc_ids[..self.block_n];
