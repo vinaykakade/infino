@@ -3710,12 +3710,14 @@ impl FtsReader {
         // block. One kernel therefore covers both the sparse-selective and the
         // uniform-common regimes with no cross-over routing to tune.
         let no_floor = floor_eff == f32::NEG_INFINITY;
-        if cursors.len() == 2
-            && k <= WAND_BMW_2TERM_MAX_K
-            && filter.is_none()
-            && no_floor
-            && two_term_has_rare_anchor(&cursors)
-        {
+        // A term with fewer than `k` documents is split off at any `k`: the
+        // rare-led walk scores each of its documents in full, the other terms
+        // are ranked alone, and the two are merged (`rare_split`). The general
+        // walk would instead score nearly every document of the other terms,
+        // as a top `k` made mostly of one-term documents keeps the bar low.
+        let rare_under_k = cursors.iter().any(|c| c.df < k as u64);
+        let wand_pair = k <= WAND_BMW_2TERM_MAX_K && two_term_has_rare_anchor(&cursors);
+        if cursors.len() == 2 && filter.is_none() && no_floor && (wand_pair || rare_under_k) {
             match self.rare_led_pair(column_id, &cursors, k) {
                 Ok(hits) => Ok(hits),
                 Err(RareLedFallback::Seed(seed)) => {
@@ -3724,13 +3726,16 @@ impl FtsReader {
                 Err(RareLedFallback::Split { rare, hits }) => {
                     self.rare_split(column_id, cursors, rare, hits, k)
                 }
-                Err(RareLedFallback::Walk) => self.run_wand_bmw(column_id, cursors, k),
+                Err(RareLedFallback::Walk) if wand_pair => self.run_wand_bmw(column_id, cursors, k),
+                Err(RareLedFallback::Walk) => {
+                    self.run_windowed_maxscore(column_id, cursors, k, None, floor_eff, 0, u32::MAX)
+                }
             }
         } else {
             let mut floor = floor_eff;
             if cursors.len() > 2
                 && cursors.len() - 1 <= MAX_SHOULDS_LED
-                && k <= WAND_BMW_2TERM_MAX_K
+                && (k <= WAND_BMW_2TERM_MAX_K || rare_under_k)
                 && filter.is_none()
                 && no_floor
             {
@@ -3811,9 +3816,12 @@ impl FtsReader {
             return Err(RareLedFallback::Walk);
         }
         let others: Vec<TermCursor> = order[1..].iter().map(|&i| cursors[i].clone()).collect();
-        if others
-            .iter()
-            .any(|c| c.df < rare.df.saturating_mul(WAND_BMW_2TERM_DF_RATIO))
+        // A lead with fewer than `k` documents is cheap to walk however common
+        // the others are; otherwise they must be much commoner to be worth it.
+        if rare.df >= k as u64
+            && others
+                .iter()
+                .any(|c| c.df < rare.df.saturating_mul(WAND_BMW_2TERM_DF_RATIO))
         {
             return Err(RareLedFallback::Walk);
         }
@@ -5729,6 +5737,57 @@ mod tests {
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         for terms in [&["mid", "few"][..], &["stop", "mid", "rare"]] {
             for k in [UNION_SEED_MIN_K, 1_000, 2_000] {
+                let got = r
+                    .search("body", terms, k, BoolMode::Or)
+                    .await
+                    .expect("search");
+                let want = r
+                    .search_with_algo_for_bench("body", terms, k, OrAlgo::Exhaustive)
+                    .await
+                    .expect("exhaustive");
+                assert_eq!(got.len(), want.len(), "{terms:?} k {k}");
+                for ((dg, sg), (dw, sw)) in got.iter().zip(&want) {
+                    assert!(
+                        (sg - sw).abs() < 1e-4,
+                        "{terms:?} k {k}: {dg:?} {sg} vs {dw:?} {sw}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A union with a term holding fewer than `k` documents, at a `k` far
+    /// past the small-`k` routes: the rare term is split off and its
+    /// documents merged with the other terms ranked alone, which must rank as
+    /// the exhaustive walk does, for a pair and for three terms.
+    #[tokio::test]
+    async fn a_union_with_a_term_under_k_documents_agrees_with_the_exhaustive_walk() {
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for i in 0..6_000u32 {
+            let mut text = String::new();
+            for (word, per_mille) in [("stop", 900u64), ("mid", 300), ("rare", 8)] {
+                if next() % 1000 < per_mille {
+                    for _ in 0..1 + next() % 3 {
+                        text.push_str(word);
+                        text.push(' ');
+                    }
+                }
+            }
+            text.push_str(&"pad ".repeat((next() % 30) as usize));
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        for terms in [&["rare", "stop"][..], &["rare", "mid", "stop"]] {
+            for k in [WAND_BMW_2TERM_MAX_K + 1, 1_000] {
                 let got = r
                     .search("body", terms, k, BoolMode::Or)
                     .await
