@@ -1412,6 +1412,11 @@ unsafe fn accumulate_run_avx512(
 /// at the nearest essential block boundary.
 const WIDE_WINDOW_MIN_K: usize = 512;
 
+/// Fewest essential terms at which a union window runs to its cap: the
+/// nearest of that many terms' block boundaries is never far, so ending
+/// there makes windows short and each pays a bound per term.
+const WIDE_WINDOW_MIN_ESSENTIALS: usize = 4;
+
 /// Smallest `k` at which the windowed MaxScore kernel collects into a
 /// buffer rather than a heap.
 pub(super) const BUFFERED_TOPK_MIN_K: usize = 512;
@@ -3347,11 +3352,12 @@ impl FtsReader {
             // At a large `k` the bar rises slowly and a block boundary buys
             // little pruning, while each window pays its bounds and drain: the
             // window runs to the cap.
-            let window_end = if sole || k >= WIDE_WINDOW_MIN_K {
-                cap_end
-            } else {
-                block_bound.min(cap_end)
-            };
+            let window_end =
+                if sole || k >= WIDE_WINDOW_MIN_K || f_essential >= WIDE_WINDOW_MIN_ESSENTIALS {
+                    cap_end
+                } else {
+                    block_bound.min(cap_end)
+                };
 
             // Accumulate the essential terms' contributions into the window
             // (SIMD OR-sum; scalar tail). Identical to the windowed-union body,
