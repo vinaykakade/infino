@@ -956,8 +956,9 @@ pub fn decode_block_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut 
         // whatever the word holds: a step writes past the word's last bit into
         // slack the next word or the copy out overwrites, so the only branch
         // is the step count, not one exit per set bit, which the predictor
-        // misses once a word.
-        let mut out = [0u32; BLOCK_LEN + 64];
+        // misses once a word. The last step overruns the block's docs by at
+        // most `EXPAND_STEP - 1` slots.
+        let mut out = [0u32; BLOCK_LEN + EXPAND_STEP];
         let mut j = 0usize;
         for (wi, chunk) in words.chunks_exact(8).enumerate() {
             let mut word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));

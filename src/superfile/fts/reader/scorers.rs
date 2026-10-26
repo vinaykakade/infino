@@ -556,7 +556,6 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
     let mut seed = f32::NEG_INFINITY;
     let mut order: Vec<usize> = Vec::new();
     let (mut ids, mut tfs) = ([0u32; BLOCK_LEN], [0u32; BLOCK_LEN]);
-    let mut docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     let mut scores: Vec<f32> = Vec::with_capacity(k + BLOCK_LEN);
     let mut block_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
     for c in cursors {
@@ -577,9 +576,13 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
         scores.clear();
         for &b in &order[..need] {
             let n = c.decode_block_into(b, &mut ids, &mut tfs);
-            docs.clear();
-            docs.extend_from_slice(&ids[..n]);
-            score_postings(c.idf_weight, &docs, &tfs[..n], dl_norm, &mut block_scores);
+            score_postings(
+                c.idf_weight,
+                &ids[..n],
+                &tfs[..n],
+                dl_norm,
+                &mut block_scores,
+            );
             scores.extend_from_slice(&block_scores);
         }
         if scores.len() >= k {
@@ -661,6 +664,10 @@ fn must_lead_should_walk<C: Collector>(
     // the general must+should walk does, so a score is the same bits on
     // either path.
     let m = shoulds.len();
+    // The block batch probes in query order at a `k` from which a top-k
+    // buffer collects (see below), `identity` being that order.
+    let query_order = k >= BUFFERED_TOPK_MIN_K;
+    let identity: Vec<usize> = (0..m).collect();
     let mut order: Vec<usize> = (0..m).collect();
     order.sort_unstable_by(|&a, &b| {
         shoulds[b]
@@ -894,24 +901,28 @@ fn must_lead_should_walk<C: Collector>(
             // At a smaller `k` strongest first collapses the bound on what is
             // still unprobed fastest and drops docs sooner; their contributions
             // are then kept per term and summed in query order at the end.
-            if k >= BUFFERED_TOPK_MIN_K {
-                // The optional terms in query order, each probed over the docs
-                // still alive and added into their running sums in place: a sum is
-                // then the score itself, the same bits the general walk adds, and
-                // the docs that cannot reach the bar with the remaining terms at
-                // their block maxima are dropped between terms.
-                if pruning {
-                    win_suffix[m] = 0.0;
-                    for si in (0..m).rev() {
-                        win_suffix[si] = win_suffix[si + 1] + win[si];
-                    }
+            // Either way `win_suffix[r]` bounds the terms from the `r`-th probed
+            // on, and the scored docs end in `probe_docs` and `partial`.
+            let probed = match query_order {
+                true => &identity,
+                false => &order,
+            };
+            if pruning {
+                win_suffix[m] = 0.0;
+                for r in (0..m).rev() {
+                    win_suffix[r] = win_suffix[r + 1] + win[probed[r]];
                 }
+            }
+            if query_order {
+                // Each term probed over the docs still alive and added into
+                // their running sums in place: a sum is then the score itself,
+                // the same bits the general walk adds, and the docs that cannot
+                // reach the bar with the remaining terms at their block maxima
+                // are dropped between terms.
                 probe_docs.clear();
+                probe_docs.extend_from_slice(&cand_docs);
                 partial.clear();
-                for (&d, &s) in cand_docs.iter().zip(&cand_scores) {
-                    probe_docs.push(d);
-                    partial.push(s);
-                }
+                partial.extend_from_slice(&cand_scores);
                 for si in 0..m {
                     if pruning {
                         retain_survivors(&mut probe_docs, &mut partial, threshold - win_suffix[si]);
@@ -927,22 +938,7 @@ fn must_lead_should_walk<C: Collector>(
                         &mut cand_tfs,
                     );
                 }
-                for (&d, &score) in probe_docs.iter().zip(&partial) {
-                    if threshold > f32::NEG_INFINITY && score <= threshold {
-                        continue;
-                    }
-                    if score > floor_eff {
-                        heap.offer(k, &mut kth, score, d);
-                        threshold = bar(heap, kth);
-                    }
-                }
             } else {
-                if pruning {
-                    win_suffix[m] = 0.0;
-                    for rank in (0..m).rev() {
-                        win_suffix[rank] = win_suffix[rank + 1] + win[order[rank]];
-                    }
-                }
                 alive.clear();
                 for (i, &s) in cand_scores.iter().enumerate() {
                     alive.push(i as u16);
@@ -984,19 +980,24 @@ fn must_lead_should_walk<C: Collector>(
                     alive.clear();
                     alive.extend_from_slice(&alive_next[..w]);
                 }
+                // The survivors' scores re-summed in query order.
+                probe_docs.clear();
+                partial.clear();
                 for &i in &alive {
                     let i = usize::from(i);
-                    let mut score = cand_scores[i];
-                    for si in 0..m {
-                        score += contribs[si * n + i];
-                    }
-                    if threshold > f32::NEG_INFINITY && score <= threshold {
-                        continue;
-                    }
-                    if score > floor_eff {
-                        heap.offer(k, &mut kth, score, cand_docs[i]);
-                        threshold = bar(heap, kth);
-                    }
+                    probe_docs.push(cand_docs[i]);
+                    partial.push(
+                        (0..m).fold(cand_scores[i], |score, si| score + contribs[si * n + i]),
+                    );
+                }
+            }
+            for (&d, &score) in probe_docs.iter().zip(&partial) {
+                if threshold > f32::NEG_INFINITY && score <= threshold {
+                    continue;
+                }
+                if score > floor_eff {
+                    heap.offer(k, &mut kth, score, d);
+                    threshold = bar(heap, kth);
                 }
             }
             continue;
@@ -3440,8 +3441,12 @@ impl FtsReader {
                     && win_docs_est[f_win] <= PROMOTE_DENSITY * essential_docs
                 {
                     // A probe may have left the cursor's buffers on another
-                    // block: put it back into iteration at the window.
-                    cursors[f_win].reseek(base);
+                    // block: put it back into iteration at the window's first
+                    // essential doc. Not at `base`, which is aligned down and
+                    // may reach into the window before: its docs there were
+                    // drained already, and a doc below `min_doc` holds no
+                    // essential term, so it cannot beat the bar.
+                    cursors[f_win].reseek(min_doc);
                     f_win += 1;
                 }
             }
