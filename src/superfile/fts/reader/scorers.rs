@@ -556,9 +556,12 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
     let mut seed = f32::NEG_INFINITY;
     let mut order: Vec<usize> = Vec::new();
     let (mut ids, mut tfs) = ([0u32; BLOCK_LEN], [0u32; BLOCK_LEN]);
-    let mut scores: Vec<f32> = Vec::new();
+    let (mut docs, mut scores): (Vec<u32>, Vec<f32>) = (Vec::new(), Vec::new());
+    let mut kth_of: Vec<f32> = Vec::new();
     let mut block_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
-    for c in cursors {
+    // The term whose own seed is highest, with its docs and scores.
+    let mut lead: Option<(usize, Vec<u32>, Vec<f32>)> = None;
+    for (ci, c) in cursors.iter().enumerate() {
         let n_blocks = c.blocks.len();
         if c.predecoded || c.df < k as u64 || n_blocks > UNION_SEED_MAX_BLOCKS {
             continue;
@@ -573,8 +576,8 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
                 .block_max_bm25
                 .total_cmp(&c.blocks[a].block_max_bm25)
         });
+        docs.clear();
         scores.clear();
-        scores.reserve(need * BLOCK_LEN);
         for &b in &order[..need] {
             let n = c.decode_block_into(b, &mut ids, &mut tfs);
             score_postings(
@@ -584,12 +587,44 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
                 dl_norm,
                 &mut block_scores,
             );
+            docs.extend_from_slice(&ids[..n]);
             scores.extend_from_slice(&block_scores);
         }
         if scores.len() >= k {
-            let (_, &mut kth, _) = scores.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
-            seed = seed.max(kth.next_down());
+            kth_of.clear();
+            kth_of.extend_from_slice(&scores);
+            let (_, &mut kth, _) = kth_of.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+            let kth = kth.next_down();
+            if kth > seed {
+                seed = kth;
+                lead = Some((ci, docs.clone(), scores.clone()));
+            }
         }
+    }
+    // Those docs' scores on every term: any `k` docs of the union bound its
+    // `k`-th best from below, and docs strong in one term are often strong in
+    // the others. Probed on copies, so the walk's cursors are untouched; the
+    // sum's order differs from the walk's, so the bar is lowered for it.
+    if let Some((li, lead_docs, lead_scores)) = lead.filter(|_| cursors.len() > 1) {
+        let mut by_doc: Vec<usize> = (0..lead_docs.len()).collect();
+        by_doc.sort_unstable_by_key(|&i| lead_docs[i]);
+        docs.clear();
+        docs.extend(by_doc.iter().map(|&i| lead_docs[i]));
+        scores.clear();
+        scores.extend(by_doc.iter().map(|&i| lead_scores[i]));
+        let mut probe_tfs: Vec<u32> = Vec::with_capacity(docs.len());
+        for (ci, c) in cursors.iter().enumerate() {
+            if ci == li {
+                continue;
+            }
+            let mut probe = c.clone();
+            probe_tfs.clear();
+            probe_tfs.resize(docs.len(), 0);
+            probe.probe_tfs(&docs, &mut probe_tfs);
+            add_term_scores(c.idf_weight, &docs, &probe_tfs, dl_norm, &mut scores);
+        }
+        let (_, &mut kth, _) = scores.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+        seed = seed.max(pruning_bar(kth, cursors.len()).next_down());
     }
     seed
 }
