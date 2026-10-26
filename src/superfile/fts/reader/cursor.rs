@@ -1226,6 +1226,22 @@ impl TermCursor {
         }
     }
 
+    /// Put a cursor that was only probed back into iteration at its first
+    /// doc at or after `target`: a probe may have left the buffers on another
+    /// block, so the block holding `target` is found from the block table,
+    /// decoded whole, and `pos` set in it. For a term on the long form only.
+    pub(super) fn reseek(&mut self, target: u32) {
+        debug_assert!(!self.predecoded, "a pre-decoded cursor needs no reseek");
+        if !self.advance_current_block_to(target) {
+            return;
+        }
+        if self.current_block > self.inspect_block {
+            self.inspect_block = self.current_block;
+        }
+        self.decode_current_block();
+        self.pos = self.block_doc_ids[..self.block_n].partition_point(|&d| d < target);
+    }
+
     /// Make the buffers hold the whole current block with the cursor still
     /// on its current doc: a block held lazily, or only probed, is decoded
     /// and `pos` brought back to that doc. A no-op when the block is already
