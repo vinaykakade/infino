@@ -630,6 +630,24 @@ fn order_key(doc: u32) -> i32 {
     (doc ^ 0x8000_0000) as i32
 }
 
+/// How many of `ids` (ascending) are below `t`: the index of the first id
+/// not below it, as a partition point would give, counted eight lanes at a
+/// time with no branch on the data.
+#[inline]
+fn rank_below(ids: &[u32], t: u32) -> usize {
+    let key = i32x8::splat(order_key(t));
+    let mut chunks = ids.chunks_exact(8);
+    let mut below = 0usize;
+    for chunk in chunks.by_ref() {
+        let lanes: [u32; 8] = chunk.try_into().expect("invariant: an 8-wide chunk");
+        below += i32x8::from(lanes.map(order_key))
+            .simd_lt(key)
+            .to_bitmask()
+            .count_ones() as usize;
+    }
+    below + chunks.remainder().iter().filter(|&&x| x < t).count()
+}
+
 /// How far ahead [`seek_sorted`] looks before it bisects a packed block
 /// rather than stepping: past this many docs behind the target, a
 /// bisection's ~7 steps beat the walk.
@@ -1071,13 +1089,14 @@ impl TermCursor {
             if self.decoded_block != self.current_block {
                 self.decode_current_block();
             }
-            // A bisection, measured against a scan from the last probe's
-            // position: the driver's docs land far apart in another term's
-            // block, so the scan's steps cost more than the halvings here
-            // (the opposite of the tf probe's dense completion pass).
-            self.block_doc_ids[..self.block_n]
-                .binary_search(&doc)
-                .is_ok()
+            // The driver's docs land far apart in another term's block, so a
+            // scan from the last probe's position costs more than a search
+            // of the whole block. The search counts the block's ids below
+            // `doc` eight lanes at a time: a fixed number of compares with no
+            // branch to mispredict and no load waiting on the one before.
+            let ids = &self.block_doc_ids[..self.block_n];
+            let p = rank_below(ids, doc);
+            p < ids.len() && ids[p] == doc
         }
     }
 
