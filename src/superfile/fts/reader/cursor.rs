@@ -962,6 +962,25 @@ impl TermCursor {
     }
 
     #[inline]
+    /// Decode block `b` into `ids` and `tfs` without moving the cursor, and
+    /// return its doc count. For a term on the long form only.
+    pub(super) fn decode_block_into(
+        &self,
+        b: usize,
+        ids: &mut [u32; BLOCK_LEN],
+        tfs: &mut [u32; BLOCK_LEN],
+    ) -> usize {
+        debug_assert!(!self.predecoded, "a pre-decoded cursor has no block bytes");
+        let block = self.blocks[b];
+        let hdr = self.block_header(b);
+        decode_block(
+            &self.bytes[block.block_byte_offset..block.block_byte_end],
+            &hdr,
+            ids,
+            tfs,
+        )
+    }
+
     fn current_header(&mut self) -> BlockHeader {
         let b = self.current_block;
         if let Some((cached, hdr)) = self.header_cache
