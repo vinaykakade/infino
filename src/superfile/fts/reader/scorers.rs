@@ -1400,6 +1400,14 @@ unsafe fn accumulate_run_avx512(
                 present[word + 1] |= u64::from(mask) >> (64 - bit);
             }
         } else {
+            // Docs this far apart read their norms' buckets from distinct
+            // cache lines: ask for those of the postings two groups on now,
+            // so they arrive by the time those groups are scored.
+            // A prefetch reads nothing and cannot fault; the address is formed
+            // with wrapping arithmetic.
+            for &d in ids.iter().skip(i + PREFETCH_AHEAD).take(8) {
+                _mm_prefetch::<_MM_HINT_T0>(buckets.as_ptr().wrapping_add(d as usize).cast());
+            }
             let contributions = bm25::score_one_term_x8(idf_weight, tf8, dl_norm_k1.get8(dids));
             mark_lanes(scores, present, base, dids, contributions);
         }
@@ -1407,6 +1415,11 @@ unsafe fn accumulate_run_avx512(
     }
     i
 }
+
+/// Postings ahead whose norm buckets a sparse run of the window accumulate
+/// prefetches.
+#[cfg(target_arch = "x86_64")]
+const PREFETCH_AHEAD: usize = 16;
 
 /// Smallest `k` at which a union window runs to its cap rather than ending
 /// at the nearest essential block boundary.
