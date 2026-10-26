@@ -7,6 +7,7 @@
 //! to the `reader/` module — never referenced outside the FTS layer.
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     ops::Range,
     sync::{
@@ -554,6 +555,23 @@ const BALANCED_PROBE_RATIO: usize = 4;
 /// postings of a term dense enough to be probed this way span far less.
 const PROBE_BITMAP_WORDS: usize = 128;
 
+/// The bitmap [`rank_by_bitmap`] marks a block's postings in and the
+/// popcount of the words before each, kept per thread so a call neither
+/// allocates nor clears more than its own span.
+struct RankBitmap {
+    bits: [u64; PROBE_BITMAP_WORDS],
+    prefix: [u32; PROBE_BITMAP_WORDS],
+}
+
+thread_local! {
+    static RANK_BITMAP: RefCell<RankBitmap> = const {
+        RefCell::new(RankBitmap {
+            bits: [0; PROBE_BITMAP_WORDS],
+            prefix: [0; PROBE_BITMAP_WORDS],
+        })
+    };
+}
+
 /// Rank every target against a block's postings at once: mark `ids`
 /// (ascending) in a bitmap over their span, then give each target in
 /// `targets` (ascending) its posting's index plus one when its bit is set,
@@ -570,38 +588,42 @@ fn rank_by_bitmap(ids: &[u32], targets: &[u32], out: &mut [u32]) -> bool {
     if words > PROBE_BITMAP_WORDS {
         return false;
     }
-    // The ids ascend, so a word is complete once they move past it: the word
-    // being filled stays in a register and is stored whole on every id, with
-    // no load of the store before it, which `|=` into memory would wait on.
-    let mut bits = [0u64; PROBE_BITMAP_WORDS];
-    let (mut prev, mut acc) = (usize::MAX, 0u64);
-    for &d in ids {
-        let local = d - base;
-        let wi = (local >> 6) as usize;
-        let bit = 1u64 << (local & 63);
-        acc = if wi == prev { acc | bit } else { bit };
-        bits[wi] = acc;
-        prev = wi;
-    }
-    let mut prefix = [0u32; PROBE_BITMAP_WORDS];
-    let mut acc = 0u32;
-    for (slot, w) in prefix.iter_mut().zip(&bits).take(words) {
-        *slot = acc;
-        acc += w.count_ones();
-    }
-    for (o, &t) in out.iter_mut().zip(targets) {
-        *o = match t.checked_sub(base).filter(|&l| (l as usize) < words * 64) {
-            Some(local) => {
-                let (wi, bit) = ((local >> 6) as usize, local & 63);
-                let word = bits[wi];
-                match (word >> bit) & 1 {
-                    1 => prefix[wi] + (word & ((1u64 << bit) - 1)).count_ones() + 1,
-                    _ => 0,
+    RANK_BITMAP.with_borrow_mut(|RankBitmap { bits, prefix }| {
+        // Only the words the span covers are cleared: a call pays for its
+        // span, not for the widest one the bitmap admits.
+        bits[..words].fill(0);
+        // The ids ascend, so a word is complete once they move past it: the
+        // word being filled stays in a register and is stored whole on every
+        // id, with no load of the store before it, which `|=` into memory
+        // would wait on.
+        let (mut prev, mut acc) = (usize::MAX, 0u64);
+        for &d in ids {
+            let local = d - base;
+            let wi = (local >> 6) as usize;
+            let bit = 1u64 << (local & 63);
+            acc = if wi == prev { acc | bit } else { bit };
+            bits[wi] = acc;
+            prev = wi;
+        }
+        let mut acc = 0u32;
+        for (slot, w) in prefix[..words].iter_mut().zip(&bits[..words]) {
+            *slot = acc;
+            acc += w.count_ones();
+        }
+        for (o, &t) in out.iter_mut().zip(targets) {
+            *o = match t.checked_sub(base).filter(|&l| (l as usize) < words * 64) {
+                Some(local) => {
+                    let (wi, bit) = ((local >> 6) as usize, local & 63);
+                    let word = bits[wi];
+                    match (word >> bit) & 1 {
+                        1 => prefix[wi] + (word & ((1u64 << bit) - 1)).count_ones() + 1,
+                        _ => 0,
+                    }
                 }
-            }
-            None => 0,
-        };
-    }
+                None => 0,
+            };
+        }
+    });
     true
 }
 
