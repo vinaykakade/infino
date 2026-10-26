@@ -553,7 +553,7 @@ const BALANCED_PROBE_RATIO: usize = 4;
 
 /// Doc span, in 64-doc words, the bitmap probe covers at most: one block's
 /// postings of a term dense enough to be probed this way span far less.
-const PROBE_BITMAP_WORDS: usize = 128;
+const PROBE_BITMAP_WORDS: usize = 512;
 
 /// The bitmap [`rank_by_bitmap`] marks a block's postings in and the
 /// popcount of the words before each, kept per thread so a call neither
