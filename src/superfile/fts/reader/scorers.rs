@@ -213,6 +213,7 @@ pub(super) fn score_noness_batched(
     dl_norm: &NormTable,
     tfs: &mut Vec<u32>,
 ) {
+    diag(2, docs.len() as u64);
     tfs.clear();
     tfs.resize(docs.len(), 0);
     c.probe_tfs(docs, tfs);
@@ -518,6 +519,9 @@ fn must_lead_should_count(
     }
     count
 }
+
+pub(crate) static DIAG: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+fn diag(i: usize, n: u64) { DIAG[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed); }
 
 /// Relative error, in units of `f32::EPSILON` per summed term, by which two
 /// sums of the same non-negative terms in different orders can differ: each
@@ -1225,6 +1229,7 @@ fn accumulate_segment(
         scores[local] += bm25::score_with_dl_norm_k1(c.idf_weight, tfs[j], dl_norm_k1.get(d));
         present[local >> 6] |= 1u64 << (local & 63);
     }
+    diag(0, (to - pos) as u64);
     c.advance_by(to - pos);
 }
 
@@ -2346,6 +2351,7 @@ impl FtsReader {
             // dominator queries (wide-UB) and for similar-UB queries
             // after the heap fills with multi-term hits.
             if f_essential == 1 {
+                diag(4, 1);
                 if cursors[0].is_exhausted() || cursors[0].current_doc_id() >= doc_id_end {
                     break;
                 }
@@ -3259,6 +3265,7 @@ impl FtsReader {
             // postings are far apart and the stopword's blocks between them
             // mostly sit under the bar.
             let base = min_doc & !63;
+            diag(3, 1);
             let cap_end = base.saturating_add(OR_WINDOW).min(doc_id_end);
             let sole = second_doc >= cap_end;
             // At a large `k` the bar rises slowly and a block boundary buys
@@ -3459,6 +3466,7 @@ impl FtsReader {
                     {
                         continue;
                     }
+                    diag(1, 1);
                     win_docs.push(doc);
                     win_scores.push(score);
                 }
@@ -3506,6 +3514,10 @@ impl FtsReader {
             }
         }
 
+        if std::env::var_os("INFINO_DIAG").is_some() {
+            let v: Vec<u64> = DIAG.iter().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed)).collect();
+            eprintln!("DIAG k={k} n={n} acc={} drained={} probed={} windows={} f1blocks={}", v[0], v[1], v[2], v[3], v[4]);
+        }
         Ok(heap.into_sorted())
     }
 
