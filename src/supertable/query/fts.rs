@@ -99,13 +99,13 @@ use uuid::Uuid;
 /// [`OR_WINDOW_MIN_TERMS`]: the same boundary below which the windowed
 /// union kernel isn't worth its bookkeeping, so the two thresholds
 /// cannot drift apart.
-const RANGED_KERNEL_POOL_MIN_TERMS: usize = OR_WINDOW_MIN_TERMS;
+const RANGED_KERNEL_POOL_MIN_TERMS: usize = usize::MAX;
 
 /// Fewest summed term document frequencies for which the un-ranged
 /// clause kernel runs on the reader pool instead of inline. Measured
 /// masses split bimodal — cheap matches stay under 4,000, real scans
 /// start past 60,000 — so this sits in the gap.
-const UNRANGED_KERNEL_POOL_MIN_MASS: u64 = 20_000;
+const UNRANGED_KERNEL_POOL_MIN_MASS: u64 = u64::MAX;
 
 pub use crate::superfile::fts::reader::BoolMode;
 #[cfg(feature = "detailed-tracing")]
