@@ -3710,12 +3710,14 @@ impl FtsReader {
         // block. One kernel therefore covers both the sparse-selective and the
         // uniform-common regimes with no cross-over routing to tune.
         let no_floor = floor_eff == f32::NEG_INFINITY;
-        if cursors.len() == 2
-            && k <= WAND_BMW_2TERM_MAX_K
-            && filter.is_none()
-            && no_floor
-            && two_term_has_rare_anchor(&cursors)
-        {
+        // A term with fewer than `k` documents: every one of them is in the
+        // answer's running, all fully scored by the rare-led walk, and the
+        // other terms ranked alone fill the rest (`rare_split`), at any `k`.
+        // Otherwise the general walk would score every document of the other
+        // terms, as a top `k` of mostly one-term docs keeps the bar low.
+        let rare_under_k = cursors.iter().any(|c| c.df < k as u64);
+        let wand_pair = k <= WAND_BMW_2TERM_MAX_K && two_term_has_rare_anchor(&cursors);
+        if cursors.len() == 2 && filter.is_none() && no_floor && (wand_pair || rare_under_k) {
             match self.rare_led_pair(column_id, &cursors, k) {
                 Ok(hits) => Ok(hits),
                 Err(RareLedFallback::Seed(seed)) => {
@@ -3724,13 +3726,16 @@ impl FtsReader {
                 Err(RareLedFallback::Split { rare, hits }) => {
                     self.rare_split(column_id, cursors, rare, hits, k)
                 }
-                Err(RareLedFallback::Walk) => self.run_wand_bmw(column_id, cursors, k),
+                Err(RareLedFallback::Walk) if wand_pair => self.run_wand_bmw(column_id, cursors, k),
+                Err(RareLedFallback::Walk) => {
+                    self.run_windowed_maxscore(column_id, cursors, k, None, floor_eff, 0, u32::MAX)
+                }
             }
         } else {
             let mut floor = floor_eff;
             if cursors.len() > 2
                 && cursors.len() - 1 <= MAX_SHOULDS_LED
-                && k <= WAND_BMW_2TERM_MAX_K
+                && (k <= WAND_BMW_2TERM_MAX_K || rare_under_k)
                 && filter.is_none()
                 && no_floor
             {
@@ -3811,9 +3816,12 @@ impl FtsReader {
             return Err(RareLedFallback::Walk);
         }
         let others: Vec<TermCursor> = order[1..].iter().map(|&i| cursors[i].clone()).collect();
-        if others
-            .iter()
-            .any(|c| c.df < rare.df.saturating_mul(WAND_BMW_2TERM_DF_RATIO))
+        // A lead with fewer than `k` documents is cheap to walk however common
+        // the others are; otherwise they must be much commoner to be worth it.
+        if rare.df >= k as u64
+            && others
+                .iter()
+                .any(|c| c.df < rare.df.saturating_mul(WAND_BMW_2TERM_DF_RATIO))
         {
             return Err(RareLedFallback::Walk);
         }
