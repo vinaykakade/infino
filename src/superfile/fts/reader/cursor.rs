@@ -307,7 +307,7 @@ impl TermMeta {
 /// [`BLOCK_TABLE_CACHE_MAX_BLOCKS`] in all.
 #[derive(Debug, Default)]
 pub(crate) struct BlockTableCache {
-    tables: Mutex<HashMap<(u64, u32), (Arc<[BlockMeta]>, f32)>>,
+    tables: Mutex<HashMap<(u64, u32), (Arc<[BlockMeta]>, Arc<BlockBounds>, f32)>>,
     blocks: AtomicUsize,
 }
 
@@ -325,7 +325,7 @@ impl BlockTableCache {
         self.blocks.load(AtomicOrdering::Relaxed)
     }
 
-    fn get(&self, key: (u64, u32)) -> Option<(Arc<[BlockMeta]>, f32)> {
+    fn get(&self, key: (u64, u32)) -> Option<(Arc<[BlockMeta]>, Arc<BlockBounds>, f32)> {
         self.tables
             .lock()
             .expect("block table cache lock")
@@ -333,7 +333,13 @@ impl BlockTableCache {
             .cloned()
     }
 
-    fn put(&self, key: (u64, u32), table: &Arc<[BlockMeta]>, term_max: f32) {
+    fn put(
+        &self,
+        key: (u64, u32),
+        table: &Arc<[BlockMeta]>,
+        bounds: &Arc<BlockBounds>,
+        term_max: f32,
+    ) {
         let n = table.len();
         if n < BLOCK_TABLE_CACHE_MIN_BLOCKS
             || self.blocks.load(AtomicOrdering::Relaxed) + n > BLOCK_TABLE_CACHE_MAX_BLOCKS
@@ -341,10 +347,46 @@ impl BlockTableCache {
             return;
         }
         let mut tables = self.tables.lock().expect("block table cache lock");
-        if tables.insert(key, (Arc::clone(table), term_max)).is_none() {
+        if tables
+            .insert(key, (Arc::clone(table), Arc::clone(bounds), term_max))
+            .is_none()
+        {
             self.blocks.fetch_add(n, AtomicOrdering::Relaxed);
         }
     }
+}
+
+/// A term's blocks' last doc ids and bound maxima as two flat columns, in
+/// step with its [`BlockMeta`] table: the bound over a doc range is then a
+/// search of one column and a maximum over a run of the other.
+#[derive(Debug)]
+pub(super) struct BlockBounds {
+    lasts: Box<[u32]>,
+    maxes: Box<[f32]>,
+}
+
+impl BlockBounds {
+    fn of(blocks: &[BlockMeta]) -> Self {
+        Self {
+            lasts: blocks.iter().map(|b| b.last_doc_id).collect(),
+            maxes: blocks.iter().map(|b| b.block_max_bm25).collect(),
+        }
+    }
+}
+
+/// The largest of `xs`, eight lanes at a time (a running `f32::max` does not
+/// vectorize, as it cannot be reassociated); 0 when empty. The maxima are
+/// never negative.
+fn max_of(xs: &[f32]) -> f32 {
+    let mut lanes = [0.0f32; 8];
+    let mut chunks = xs.chunks_exact(8);
+    for chunk in chunks.by_ref() {
+        for (l, &x) in lanes.iter_mut().zip(chunk) {
+            *l = if x > *l { x } else { *l };
+        }
+    }
+    let tail = chunks.remainder().iter().fold(0.0f32, |a, &x| a.max(x));
+    lanes.iter().fold(tail, |a, &x| a.max(x))
 }
 
 /// Per-term per-block metadata, parsed once at `TermCursor` construction.
@@ -425,6 +467,7 @@ pub(crate) struct TermCursor {
     /// build and `Arc`-shared, so cloning a cursor for another doc-id
     /// sub-range costs the ~1 KiB decode buffers, never a re-parse.
     pub(super) blocks: Arc<[BlockMeta]>,
+    bounds: Arc<BlockBounds>,
     /// Decoded buffers for the current block. Reused across decodes.
     pub(super) block_doc_ids: Vec<u32>,
     pub(super) block_tfs: Vec<u32>,
@@ -709,7 +752,7 @@ impl TermCursor {
         // common-term queries.
         let key = cached.map(|(_, offset)| (offset, bounds.scale_bits()));
         let hit = cached.zip(key).and_then(|((cache, _), key)| cache.get(key));
-        let (blocks, term_max_bm25) = match hit {
+        let (blocks, block_bounds, term_max_bm25) = match hit {
             Some(hit) => hit,
             None => {
                 let mut term_max_bm25: f32 = 0.0;
@@ -730,10 +773,11 @@ impl TermCursor {
                         }
                     })
                     .collect();
+                let block_bounds = Arc::new(BlockBounds::of(&blocks));
                 if let (Some((cache, _)), Some(key)) = (cached, key) {
-                    cache.put(key, &blocks, term_max_bm25);
+                    cache.put(key, &blocks, &block_bounds, term_max_bm25);
                 }
-                (blocks, term_max_bm25)
+                (blocks, block_bounds, term_max_bm25)
             }
         };
 
@@ -742,6 +786,7 @@ impl TermCursor {
             term_max_bm25,
             df: term_meta.df,
             blocks,
+            bounds: block_bounds,
             block_doc_ids: vec![0u32; BLOCK_LEN],
             block_tfs: vec![0u32; BLOCK_LEN],
             block_n: 0,
@@ -839,6 +884,7 @@ impl TermCursor {
             idf_weight,
             term_max_bm25: block_max_bm25,
             df: n as u64,
+            bounds: Arc::new(BlockBounds::of(&blocks)),
             blocks,
             block_doc_ids,
             block_tfs,
@@ -910,6 +956,7 @@ impl TermCursor {
             idf_weight,
             term_max_bm25: block_max_bm25,
             df: 1,
+            bounds: Arc::new(BlockBounds::of(&blocks)),
             blocks,
             block_doc_ids,
             block_tfs,
@@ -1731,36 +1778,23 @@ impl TermCursor {
         // the first block with last_doc_id >= range_start, which is
         // exactly the first block that can overlap the range.
         self.shallow_advance_block_to(range_start);
-        let mut max: f32 = 0.0;
-        let mut i = self.inspect_block;
-        while i < self.blocks.len() {
-            // Block i starts at the doc right after the previous block's
-            // last_doc_id (or doc 0 if i == 0). Once block_start exceeds
-            // range_end the rest of the blocks lie strictly past the
-            // range; stop walking.
-            let block_start = if i == 0 {
-                0u32
-            } else {
-                self.blocks[i - 1].last_doc_id.saturating_add(1)
-            };
-            if block_start > range_end {
-                break;
-            }
-            let m = self.blocks[i].block_max_bm25;
-            if m > max {
-                max = m;
-            }
-            i += 1;
-        }
         let first = self.inspect_block;
-        if i == first {
-            return (max, 0.0);
-        }
-        let span_start = match first {
+        let lasts = &self.bounds.lasts[..];
+        let n = lasts.len();
+        let first_start = match first {
             0 => 0u32,
-            _ => self.blocks[first - 1].last_doc_id.saturating_add(1),
+            _ => lasts[first - 1].saturating_add(1),
         };
-        let span = f64::from(self.blocks[i - 1].last_doc_id) - f64::from(span_start) + 1.0;
+        if first >= n || first_start > range_end {
+            return (0.0, 0.0);
+        }
+        // Block `j` after `first` overlaps the range exactly when the block
+        // before it ends below `range_end`: one search of the last doc ids
+        // finds the run, and its maxima are read as one slice.
+        let i = first + 1 + lasts[first..n - 1].partition_point(|&l| l < range_end);
+        let max = max_of(&self.bounds.maxes[first..i]);
+        let span_start = first_start;
+        let span = f64::from(lasts[i - 1]) - f64::from(span_start) + 1.0;
         let range = f64::from(range_end.max(range_start)) - f64::from(range_start) + 1.0;
         let docs = (i - first) as f64 * BLOCK_LEN as f64 * (range / span).clamp(0.0, 1.0);
         (max, docs as f32)
