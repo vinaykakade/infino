@@ -5785,6 +5785,58 @@ mod tests {
         }
     }
 
+    /// A union whose middle is a long run of windows that cannot hold a
+    /// top-k doc: docs strong in two terms open the corpus and fill the
+    /// top-k, long docs holding the terms at most once fill the middle, and
+    /// docs stronger in all three close it. The terms hold equal shares of
+    /// the docs, so two stay essential and the middle is walked by windows.
+    /// Its dead windows are skipped as one run, which must stop where the
+    /// closing docs make the bound rise again, so the top-k matches the
+    /// exhaustive walk.
+    #[tokio::test]
+    async fn a_run_of_dead_union_windows_is_skipped_up_to_the_strong_docs() {
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        let strong = "alpha alpha beta beta pad pad pad pad pad";
+        let stronger = "alpha alpha alpha beta beta beta gamma gamma gamma";
+        let pad = "pad ".repeat(60);
+        for i in 0..20_000u32 {
+            let weak;
+            let text = match i {
+                0..40 => strong,
+                19_990.. => stronger,
+                _ => {
+                    // The terms at different densities, as a real union's are.
+                    weak = format!(
+                        "{} {} {} {pad}",
+                        if i % 2 == 0 { "alpha" } else { "" },
+                        if i / 2 % 2 == 0 { "beta" } else { "" },
+                        if i / 4 % 2 == 0 { "gamma" } else { "" },
+                    );
+                    weak.as_str()
+                }
+            };
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let terms = ["alpha", "beta", "gamma"];
+        for k in [10, 30] {
+            let got = r
+                .search("body", &terms, k, BoolMode::Or)
+                .await
+                .expect("search");
+            let want = r
+                .search_with_algo_for_bench("body", &terms, k, OrAlgo::Exhaustive)
+                .await
+                .expect("exhaustive");
+            assert_eq!(got.len(), want.len(), "k {k}");
+            for ((dg, sg), (dw, sw)) in got.iter().zip(&want) {
+                assert!((sg - sw).abs() < 1e-4, "k {k}: {dg:?} {sg} vs {dw:?} {sw}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn search_with_algo_empty_and_zero_k_short_circuit() {
         let (blob, json) = build_blob();
