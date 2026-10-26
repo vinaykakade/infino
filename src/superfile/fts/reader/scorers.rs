@@ -3508,6 +3508,7 @@ impl FtsReader {
             }
 
             // Collect the fully-scored candidates (ascending doc order).
+            diag(5, win_docs.len() as u64);
             for (idx, &doc) in win_docs.iter().enumerate() {
                 let score = win_scores[idx];
                 heap.offer(k, &mut threshold, score, doc);
@@ -3516,7 +3517,7 @@ impl FtsReader {
 
         if std::env::var_os("INFINO_DIAG").is_some() {
             let v: Vec<u64> = DIAG.iter().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed)).collect();
-            eprintln!("DIAG k={k} n={n} acc={} drained={} probed={} windows={} f1blocks={}", v[0], v[1], v[2], v[3], v[4]);
+            eprintln!("DIAG k={k} n={n} acc={} drained={} probed={} windows={} f1blocks={} offered={}", v[0], v[1], v[2], v[3], v[4], v[5]);
         }
         Ok(heap.into_sorted())
     }
