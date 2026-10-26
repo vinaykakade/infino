@@ -347,6 +347,14 @@ impl BlockTableCache {
     }
 }
 
+thread_local! {
+    /// dense, bitmap, merge, seek targets; bitmap refusals; their span words summed
+    pub(crate) static DIAG_PATH: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
+}
+fn diag_add(i: usize, n: u64) {
+    DIAG_PATH.with(|c| { let mut a = c.get(); a[i] += n; c.set(a); });
+}
+
 /// Per-term per-block metadata, parsed once at `TermCursor` construction.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BlockMeta {
@@ -568,6 +576,8 @@ fn rank_by_bitmap(ids: &[u32], targets: &[u32], out: &mut [u32]) -> bool {
     let base = first & !63;
     let words = ((last - base) / 64) as usize + 1;
     if words > PROBE_BITMAP_WORDS {
+        diag_add(4, 1);
+        diag_add(5, words as u64);
         return false;
     }
     // The ids ascend, so a word is complete once they move past it: the word
@@ -1428,6 +1438,7 @@ impl TermCursor {
                 // count the presence words once. A lone target counts only
                 // the words before it, cheaper than building the table.
                 let in_block = docs[k..].partition_point(|&d| d <= last);
+                diag_add(0, in_block as u64);
                 if hdr.encoding != ENCODING_RUN
                     && (in_block >= BITSET_PREFIX_MIN_TARGETS
                         || self.scratch.prefix_block == self.current_block)
@@ -1508,6 +1519,7 @@ impl TermCursor {
                 if p < n
                     && probe_by_bitmap(&ids[p..], &tfs[p..], &docs[k..k_end], &mut out[k..k_end])
                 {
+                    diag_add(1, (k_end - k) as u64);
                     // A later probe may bring more targets in this block: leave
                     // the cursor at the first posting not below the last target,
                     // as the merge would.
@@ -1517,6 +1529,7 @@ impl TermCursor {
                     self.pos = p.min(n.saturating_sub(1));
                     continue;
                 }
+                diag_add(2, (k_end - k) as u64);
                 while k < k_end && p < n {
                     let (t, x) = (docs[k], ids[p]);
                     out[k] = if t == x { tfs[p] } else { 0 };
@@ -1528,6 +1541,7 @@ impl TermCursor {
                 self.pos = p.min(n.saturating_sub(1));
                 continue;
             }
+            diag_add(3, (docs[k..].partition_point(|&d| d <= last)) as u64);
             while k < n_docs && docs[k] <= last {
                 let t = docs[k];
                 p = seek_sorted::<true>(ids, p, t);

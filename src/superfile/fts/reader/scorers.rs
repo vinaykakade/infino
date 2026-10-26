@@ -3596,6 +3596,8 @@ impl FtsReader {
             }
         }
 
+        let a = super::cursor::DIAG_PATH.with(|c| c.replace([0; 6]));
+        eprintln!("PDIAG k={k} dense={} bitmap={} merge={} seek={} refusals={} avg_words={}", a[0], a[1], a[2], a[3], a[4], a[5] / a[4].max(1));
         Ok(heap.into_sorted())
     }
 
