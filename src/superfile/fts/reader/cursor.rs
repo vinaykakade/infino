@@ -1071,13 +1071,18 @@ impl TermCursor {
             if self.decoded_block != self.current_block {
                 self.decode_current_block();
             }
-            // A bisection, measured against a scan from the last probe's
-            // position: the driver's docs land far apart in another term's
-            // block, so the scan's steps cost more than the halvings here
-            // (the opposite of the tf probe's dense completion pass).
-            self.block_doc_ids[..self.block_n]
-                .binary_search(&doc)
-                .is_ok()
+            // Probes arrive ascending, so the seek starts from the last
+            // probe's position when that is not past `doc`: a doc near the
+            // last one is a few steps away, a far one is a gallop then a
+            // bisection, either no dearer than bisecting the whole block.
+            let ids = &self.block_doc_ids[..self.block_n];
+            let from = match ids.get(self.pos) {
+                Some(&x) if x <= doc => self.pos,
+                _ => 0,
+            };
+            let p = seek_sorted::<true>(ids, from, doc);
+            self.pos = p.min(self.block_n.saturating_sub(1));
+            p < ids.len() && ids[p] == doc
         }
     }
 
