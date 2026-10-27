@@ -2362,7 +2362,7 @@ fn or_count_prefers_heap(terms: usize, total_df: u64, max_doc: u32) -> bool {
 /// full-corpus alloc + popcount would dominate on a sparse one.
 fn or_count_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
     let words = max_doc as usize / 64 + 1;
-    with_fold_bitsets(words, |union, _| {
+    with_fold_bitset(words, |union| {
         let mut scratch = [0u32; BLOCK_LEN];
         for c in &cursors {
             or_cursor_into_bitset(union, c, &mut scratch);
@@ -2393,9 +2393,18 @@ thread_local! {
     };
 }
 
-/// Most words of fold bitsets a thread keeps between queries: a corpus past
-/// it allocates its bitsets per count rather than hold them.
+/// Most words of fold bitsets a thread keeps between queries. A thread keeps
+/// only what the largest superfile it counted needed — an eighth of a byte
+/// per doc — so this bounds the rare outsized one: 64M docs, 8 MiB a bitset,
+/// covers a default-sized superfile of docs down to about 16 bytes each. A
+/// superfile past it allocates its bitsets per count instead.
 const FOLD_BITSETS_KEEP_WORDS: usize = 1 << 20;
+
+/// Run `f` over one all-zero doc-space bitset of `words` words, which it must
+/// leave all zero, as [`with_fold_bitsets`] does for two.
+pub(super) fn with_fold_bitset<R>(words: usize, f: impl FnOnce(&mut [u64]) -> R) -> R {
+    with_fold_sets(words, false, |a, _| f(a))
+}
 
 /// Run `f` over two all-zero doc-space bitsets of `words` words, which it
 /// must leave all zero (a fold reads its result with
@@ -2403,8 +2412,16 @@ const FOLD_BITSETS_KEEP_WORDS: usize = 1 << 20;
 /// allocates nor clears a corpus-sized bitset before it starts; a count that
 /// panicked part-way leaves them marked, and the next clears them first.
 pub(super) fn with_fold_bitsets<R>(words: usize, f: impl FnOnce(&mut [u64], &mut [u64]) -> R) -> R {
+    with_fold_sets(words, true, f)
+}
+
+/// The per-thread bitsets behind [`with_fold_bitset`] and
+/// [`with_fold_bitsets`]; the second is empty, and never grown, unless
+/// `both`.
+fn with_fold_sets<R>(words: usize, both: bool, f: impl FnOnce(&mut [u64], &mut [u64]) -> R) -> R {
     if words > FOLD_BITSETS_KEEP_WORDS {
-        return f(&mut vec![0u64; words], &mut vec![0u64; words]);
+        let mut b = if both { vec![0u64; words] } else { Vec::new() };
+        return f(&mut vec![0u64; words], &mut b);
     }
     FOLD_BITSETS.with_borrow_mut(|fb| {
         if fb.dirty {
@@ -2413,10 +2430,13 @@ pub(super) fn with_fold_bitsets<R>(words: usize, f: impl FnOnce(&mut [u64], &mut
         }
         if fb.a.len() < words {
             fb.a.resize(words, 0);
+        }
+        if both && fb.b.len() < words {
             fb.b.resize(words, 0);
         }
         fb.dirty = true;
-        let out = f(&mut fb.a[..words], &mut fb.b[..words]);
+        let b: &mut [u64] = if both { &mut fb.b[..words] } else { &mut [] };
+        let out = f(&mut fb.a[..words], b);
         debug_assert!(
             fb.a.iter().chain(&fb.b).all(|&w| w == 0),
             "a fold must leave its bitsets clear"

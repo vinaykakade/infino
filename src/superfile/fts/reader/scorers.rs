@@ -2919,12 +2919,21 @@ impl FtsReader {
         if let [c] = cursors.as_mut_slice() {
             // Every doc of the term is asked about, so the negated terms are
             // folded once into a bitset over its span and each doc is one bit
-            // test, rather than a search in a negated block per doc. A row-set
-            // filter keeps its own test.
+            // test, rather than a search in a negated block per doc. The fold
+            // clears a word per 64 docs of the span and reads every negated
+            // block, so it is taken only where the term has at least as many
+            // docs as either: past that, its own probes would cost as much. A
+            // row-set filter keeps its own test.
+            let last = c.blocks.last().map_or(0, |b| b.last_doc_id);
+            let words = last as usize / 64 + 1;
             let excluded: Option<Vec<u64>> = match filter.as_deref() {
-                Some(f) if f.allow.is_none() && !f.cursors.is_empty() => {
-                    let last = c.blocks.last().map_or(0, |b| b.last_doc_id);
-                    let mut ex = vec![0u64; last as usize / 64 + 1];
+                Some(f)
+                    if f.allow.is_none()
+                        && !f.cursors.is_empty()
+                        && c.df >= words as u64
+                        && c.df >= f.cursors.iter().map(|nc| nc.blocks.len() as u64).sum() =>
+                {
+                    let mut ex = vec![0u64; words];
                     let mut scratch = [0u32; BLOCK_LEN];
                     for nc in &f.cursors {
                         or_cursor_into_bitset(&mut ex, nc, &mut scratch);
