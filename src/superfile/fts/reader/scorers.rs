@@ -3043,15 +3043,24 @@ impl FtsReader {
             }
             let base = min_doc & !(OR_WINDOW - 1);
             let window_end = base.saturating_add(OR_WINDOW);
+            // The most any doc of the window can score: per cursor, the
+            // largest block max among the blocks it adds from here.
+            let mut window_bound = 0.0f32;
             for c in &mut cursors {
+                let mut cursor_bound = 0.0f32;
                 while !c.is_exhausted() {
                     let d = c.current_doc_id();
                     if d >= window_end {
                         break;
                     }
+                    cursor_bound = cursor_bound.max(c.current_block_max_bm25());
                     accumulate_segment(c, base, window_end, &mut scores, &mut present, dl_norm_k1);
                 }
+                window_bound += cursor_bound;
             }
+            // When no doc of the window can beat the k-th best, every word
+            // is counted and cleared without a look at its scores.
+            let hopeless = heap.len() >= k && window_bound <= pruning_bar(threshold, cursors.len());
             for (word_idx, word) in present.iter_mut().enumerate() {
                 let mut bits = mem::take(word);
                 if bits == 0 {
@@ -3063,7 +3072,7 @@ impl FtsReader {
                     // no hit: count it (done above) and clear its slots
                     // without visiting a document.
                     let slots = &mut scores[word_idx << 6..(word_idx + 1) << 6];
-                    if heap.len() >= k && !word_beats(slots, threshold) {
+                    if heap.len() >= k && (hopeless || !word_beats(slots, threshold)) {
                         slots.fill(0.0);
                         continue;
                     }
