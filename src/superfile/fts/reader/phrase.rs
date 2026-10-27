@@ -29,7 +29,7 @@ use crate::superfile::{
 thread_local! {
     /// Phrase candidates this thread rejected by adjacency signature, so a
     /// test can tell the filter fired rather than only that results agree.
-    pub(super) static SIG_REJECTS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static SIG_REJECTS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// One member term of a [`PhraseCursor`]: its posting cursor, its
@@ -621,17 +621,14 @@ impl PhraseCursor {
         if self.adjacent_sigs.is_empty() || self.cands.is_empty() {
             return;
         }
-        let (members, locs) = (&mut self.members, &self.cand_locs);
+        let (members, locs, pairs) = (&mut self.members, &self.cand_locs, &self.adjacent_sigs);
         self.kept.clear();
-        for c in 0..self.cands.len() {
-            let possible = self.adjacent_sigs.iter().all(|&(i, bit)| {
-                let (b, p) = locs[i][c];
+        self.kept.extend((0..self.cands.len() as u32).filter(|&c| {
+            pairs.iter().all(|&(i, bit)| {
+                let (b, p) = locs[i][c as usize];
                 members[i].located_sig(b as usize, p as usize) & bit != 0
-            });
-            if possible {
-                self.kept.push(c as u32);
-            }
-        }
+            })
+        }));
         if self.kept.len() == self.cands.len() {
             return;
         }
@@ -854,6 +851,7 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::{
         fts::{
+            analysis::{Stemmer, Stopwords, chain_tokenizer},
             builder::FtsBuilder,
             reader::{FtsReader, QueryIdf, core::ClauseLists, cursor::CursorUse},
             tokenize::Phrase,
@@ -1512,6 +1510,231 @@ mod tests {
             let expected_docs: Vec<u32> = expected.iter().map(|&(d, _)| d).collect();
             assert_eq!(docs_seen, expected_docs, "unscored {terms:?}");
         }
+    }
+
+    /// Docs in the signature corpus: both common words span many blocks.
+    const SIG_DOCS: u32 = 4_000;
+
+    /// The signature corpus: `american` and `south` each in about a third
+    /// of the docs, mostly apart, sometimes as the phrase; `delta` in a few
+    /// dozen (a short-form term); `unique` once (an inline term).
+    fn signature_corpus() -> Vec<Vec<&'static str>> {
+        const FILLER: [&str; 8] = [
+            "river", "city", "state", "wind", "road", "north", "lake", "hill",
+        ];
+        let mut x: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut rng = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let mut docs: Vec<Vec<&str>> = (0..SIG_DOCS)
+            .map(|_| {
+                let len = 3 + rng(30) as usize;
+                let mut d: Vec<&str> = (0..len)
+                    .map(|_| match rng(20) {
+                        0..=1 => "american",
+                        2..=3 => "south",
+                        r => FILLER[r as usize % FILLER.len()],
+                    })
+                    .collect();
+                if rng(25) == 0 {
+                    let at = rng(d.len() as u64) as usize;
+                    d.splice(at..at, ["american", "south"]);
+                }
+                if rng(80) == 0 {
+                    let at = rng(d.len() as u64) as usize;
+                    d.insert(at, "delta");
+                }
+                d
+            })
+            .collect();
+        docs[17].extend(["american", "unique", "south"]);
+        docs
+    }
+
+    /// `docs` built positional, its signatures written unless `omit`, the
+    /// accumulator spilled from the first doc when `spill`.
+    fn open_signature_index(docs: &[Vec<&str>], omit: bool, spill: bool) -> FtsReader {
+        let mut b = FtsBuilder::new();
+        b.omit_signatures = omit;
+        if spill {
+            b.set_spill_threshold_bytes(1);
+        }
+        b.register_column("title".into(), true).expect("register");
+        for (i, d) in docs.iter().enumerate() {
+            b.add_doc(0, i as u32, &d.join(" ")).expect("add doc");
+        }
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// The phrase's `(doc, tf)` through the scored walk and its docs
+    /// through the unscored one, each checked against `expected`.
+    async fn walk_phrase(r: &FtsReader, terms: &[&str], expected: &[(u32, u32)]) {
+        let norms = r.columns[0].dl_norm_k1();
+        let mut scored = phrase_cursor(r, terms, CursorUse::Score).await;
+        let mut seen = Vec::new();
+        while !scored.is_exhausted() {
+            seen.push((scored.current_doc_id(), scored.current_tf));
+            let next = scored.current_doc_id() + 1;
+            scored
+                .seek_match(next, f32::NEG_INFINITY, Some(norms))
+                .expect("seek");
+        }
+        assert_eq!(seen, expected, "scored {terms:?}");
+        let mut matched = phrase_cursor(r, terms, CursorUse::Match).await;
+        let mut docs_seen = Vec::new();
+        while !matched.is_exhausted() {
+            docs_seen.push(matched.current_doc_id());
+            let next = matched.current_doc_id() + 1;
+            matched.skip_to(next).expect("skip");
+        }
+        let expected_docs: Vec<u32> = expected.iter().map(|&(d, _)| d).collect();
+        assert_eq!(docs_seen, expected_docs, "unscored {terms:?}");
+    }
+
+    /// The phrase's ranked top `k` hits, scores as bits, and its match
+    /// count.
+    async fn ranked(r: &FtsReader, terms: &[&str], k: usize) -> (Vec<(u32, u32)>, u64) {
+        let phrases = phrase(terms);
+        let (hits, count) = r
+            .search_excluding_with_count(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                k,
+            )
+            .await
+            .expect("ranked phrase search");
+        let hits = hits.iter().map(|&(d, s)| (d.get(), s.to_bits())).collect();
+        (hits, count)
+    }
+
+    /// Candidates rejected by signature on this thread while `f` runs.
+    async fn sig_rejects(f: impl Future<Output = ()>) -> u64 {
+        SIG_REJECTS.with(|n| n.set(0));
+        f.await;
+        SIG_REJECTS.with(|n| n.get())
+    }
+
+    /// Phrases over common words spanning many blocks, with rare, short-form
+    /// and inline members, a repeated word and three-word phrases: matches,
+    /// tfs, ranked scores to the bit and counts are what a text scan and an
+    /// index without signatures give, built in RAM or spilled — and the
+    /// signatures do reject most of the docs that hold the words apart.
+    #[tokio::test]
+    async fn adjacency_signatures_reject_candidates_and_change_no_result() {
+        let docs = signature_corpus();
+        let signed = open_signature_index(&docs, false, false);
+        let spilled = open_signature_index(&docs, false, true);
+        let unsigned = open_signature_index(&docs, true, false);
+        let expected_of = |terms: &[&str]| -> Vec<(u32, u32)> {
+            docs.iter()
+                .enumerate()
+                .filter_map(|(i, d)| {
+                    let tf = d.windows(terms.len()).filter(|w| *w == terms).count() as u32;
+                    (tf > 0).then_some((i as u32, tf))
+                })
+                .collect()
+        };
+        let phrases: [&[&str]; 9] = [
+            &["american", "south"],
+            &["south", "american"],
+            &["american", "south", "river"],
+            &["river", "american", "south"],
+            &["american", "american"],
+            &["delta", "south"],
+            &["american", "delta"],
+            &["american", "unique", "south"],
+            &["unique", "south"],
+        ];
+        for terms in phrases {
+            let expected = expected_of(terms);
+            assert!(!expected.is_empty(), "{terms:?} occurs");
+            for r in [&signed, &spilled, &unsigned] {
+                walk_phrase(r, terms, &expected).await;
+            }
+            let want = ranked(&unsigned, terms, 50).await;
+            assert_eq!(want.1, expected.len() as u64, "count {terms:?}");
+            assert_eq!(ranked(&signed, terms, 50).await, want, "ranked {terms:?}");
+            assert_eq!(ranked(&spilled, terms, 50).await, want, "spilled {terms:?}");
+        }
+
+        // The filter fires: of the docs holding both words but not the
+        // phrase, most are rejected by signature (one whose `american` is
+        // followed only by other words keeps `south`'s bit only by a hash
+        // collision); without signatures, none are.
+        let terms: &[&str] = &["american", "south"];
+        let expected = expected_of(terms);
+        let apart = docs
+            .iter()
+            .filter(|d| d.contains(&"american") && d.contains(&"south"))
+            .count()
+            - expected.len();
+        assert!(apart > 1_000, "premise: many docs hold the words apart");
+        for r in [&signed, &spilled] {
+            // The scored and the unscored walk each reject at least half.
+            let rejected = sig_rejects(walk_phrase(r, terms, &expected)).await;
+            assert!(
+                rejected >= apart as u64,
+                "rejected {rejected} of 2 x {apart}"
+            );
+        }
+        assert_eq!(
+            sig_rejects(walk_phrase(&unsigned, terms, &expected)).await,
+            0
+        );
+    }
+
+    /// Members a removed stopword holds apart are not checked by signature:
+    /// what follows the first in a match is the hole, never the second, so
+    /// a check there would reject every match. Only the adjacent pair is.
+    #[tokio::test]
+    async fn a_stopword_gap_is_not_checked_by_signature() {
+        let docs = ["x the y z", "x y z", "x a y", "y x the z", "x the y w"];
+        let mut b = FtsBuilder::new();
+        b.register_column_with_tokenizer(
+            "title".into(),
+            true,
+            chain_tokenizer(Stopwords::English, Stemmer::None),
+            bm25::Bm25Params::STANDARD,
+        )
+        .expect("register");
+        for (i, text) in docs.iter().enumerate() {
+            b.add_doc(0, i as u32, text).expect("add doc");
+        }
+        let json = r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true,"stopwords":"english"}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let search = async |terms: &[&str], offsets: Vec<u32>| {
+            let phrases = vec![Phrase {
+                terms: terms.iter().map(|t| t.to_string()).collect(),
+                offsets,
+            }];
+            let hits = r
+                .search_excluding(
+                    "title",
+                    ClauseLists {
+                        should_phrases: &phrases,
+                        ..ClauseLists::default()
+                    },
+                    10,
+                    f32::NEG_INFINITY,
+                )
+                .await
+                .expect("phrase search");
+            let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
+            ids.sort_unstable();
+            ids
+        };
+        // "x the y": x and y two apart, nothing at the hole.
+        assert_eq!(search(&["x", "y"], vec![0, 2]).await, [0, 2, 4]);
+        // "x the y z": the gap pair is skipped, the adjacent pair checked.
+        assert_eq!(search(&["x", "y", "z"], vec![0, 2, 3]).await, [0]);
     }
 
     /// A phrase built to match, not rank, carries no idf and a 0 bound:

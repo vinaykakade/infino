@@ -868,6 +868,9 @@ pub(crate) fn positions_from_run_values(values: &[u32], out: &mut Vec<u32>) -> O
 mod tests {
     use super::*;
 
+    /// [`next_bit`] of `american`, `south`, `the`, the empty term and `x`.
+    const PINNED_BITS: [u8; 5] = [1, 4, 32, 4, 2];
+
     /// The decoded form of a term's runs reads, and re-encodes, exactly as
     /// the LEB128 form does, whatever order the postings' runs sit in.
     #[test]
@@ -1417,6 +1420,169 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The bit a term hashes to is written into every blob and read by
+    /// every later reader: it must never change.
+    #[test]
+    fn next_bit_is_pinned() {
+        let got: Vec<u8> = ["american", "south", "the", "", "x"]
+            .iter()
+            .map(|t| next_bit(t.as_bytes()))
+            .collect();
+        assert_eq!(got, PINNED_BITS);
+        assert!(got.iter().all(|b| b.count_ones() == 1), "one bit each");
+    }
+
+    /// Follower masks of `positions` with token `k`'s bit `1 << k`.
+    fn masks(positions: &[u32]) -> Vec<u8> {
+        let bits: Vec<u8> = (0..positions.len()).map(|k| 1u8 << k).collect();
+        let mut out = vec![0xAA; 3];
+        follower_masks(positions.len(), |k| positions[k], &bits, &mut out);
+        out
+    }
+
+    #[test]
+    fn follower_masks_name_the_tokens_one_position_on() {
+        // A hole at position 2 (a dropped word): the token before it has no
+        // follower, and the last token never does.
+        assert_eq!(masks(&[0, 1, 3, 4]), [0b10, 0, 0b1000, 0]);
+        // Two tokens stacked at one position both follow the one before,
+        // and are both followed by the next.
+        assert_eq!(masks(&[0, 1, 1, 2]), [0b110, 0b1000, 0b1000, 0]);
+        // Far apart: nobody follows anybody.
+        assert_eq!(masks(&[0, 5, 9]), [0, 0, 0]);
+        assert_eq!(masks(&[]), [0u8; 0]);
+        assert_eq!(masks(&[7]), [0]);
+        // Positions that go backwards leave the order unknown: every mask
+        // is the one that rules nothing out.
+        assert_eq!(masks(&[0, 2, 1]), [SIG_UNKNOWN; 3]);
+    }
+
+    /// Encode with `sigs` and fresh scratch, behind a few bytes of
+    /// unrelated prefix; returns the group's start.
+    fn signed_group(
+        out: &mut Vec<u8>,
+        tfs: &[u32],
+        vals: &[u32],
+        sigs: &[u8],
+        allow: bool,
+    ) -> usize {
+        out.clear();
+        out.extend_from_slice(&[0xEE; 5]);
+        let start = out.len();
+        encode_group(out, tfs, vals, sigs, allow, &mut PackScratch::default());
+        start
+    }
+
+    #[test]
+    fn signed_groups_round_trip_and_expose_each_pairs_signature() {
+        // A long group (packed, as every long-form group is) and a short
+        // one small enough that LEB128 wins.
+        let long_tfs: Vec<u32> = (0..128u32).map(|d| 1 + d % 3).collect();
+        let mut long_vals = Vec::new();
+        for (d, &tf) in long_tfs.iter().enumerate() {
+            long_vals.push(9 * d as u32 + 1);
+            long_vals.extend((1..tf).map(|g| g + 1));
+        }
+        let long_sigs: Vec<u8> = (0..128u32).map(|d| (d * 37) as u8).collect();
+        let cases: [(&[u32], &[u32], &[u8], bool, u8); 3] = [
+            (
+                &long_tfs,
+                &long_vals,
+                &long_sigs,
+                false,
+                GROUP_PACKED_FIXED_SIG,
+            ),
+            (
+                &[1, 2],
+                &[3, 4, 1],
+                &[0, SIG_UNKNOWN],
+                true,
+                GROUP_LEB128_SIG,
+            ),
+            (
+                &long_tfs,
+                &long_vals,
+                &long_sigs,
+                true,
+                GROUP_PACKED_FIXED_SIG,
+            ),
+        ];
+        let mut out = Vec::new();
+        for (tfs, vals, sigs, allow, header) in cases {
+            let start = signed_group(&mut out, tfs, vals, sigs, allow);
+            assert_eq!(out[start], header);
+            assert_eq!(group_signatures_at(&out, start), Some(start + 1));
+            assert_eq!(&out[start + 1..start + 1 + sigs.len()], sigs);
+            let mut index = GroupIndex::default();
+            let mut at = start;
+            index.locate(&out, &mut at, tfs).expect("locates");
+            assert_eq!(at, out.len(), "header {header}: whole group consumed");
+            let mut got = Vec::new();
+            for (pair, &tf) in tfs.iter().enumerate() {
+                index.run_positions(&out, pair, tf, &mut got).expect("run");
+                assert_eq!(index.pair_sig(&out, pair), sigs[pair], "pair {pair}");
+            }
+            assert_eq!(got, positions_of(tfs, vals), "header {header}");
+            // A group cut anywhere, the signatures included, is refused.
+            for cut in start..out.len() {
+                assert!(
+                    GroupIndex::default()
+                        .locate(&out[..cut], &mut start.clone(), tfs)
+                        .is_none(),
+                    "header {header} cut {cut}"
+                );
+            }
+        }
+
+        // Signatures that are all unknown rule nothing out and are not
+        // written: the group takes the layout an older blob has.
+        for (allow, header) in [(false, GROUP_PACKED_FIXED), (true, GROUP_LEB128)] {
+            let tfs = [1u32, 1];
+            let start = signed_group(&mut out, &tfs, &[2, 5], &[SIG_UNKNOWN; 2], allow);
+            assert_eq!(out[start], header);
+            assert_eq!(group_signatures_at(&out, start), None);
+            let mut index = GroupIndex::default();
+            index
+                .locate(&out, &mut start.clone(), &tfs)
+                .expect("locates");
+            assert_eq!(index.pair_sig(&out, 1), SIG_UNKNOWN);
+            assert_eq!(decode_all(&out[start..], 0, &tfs), Some(vec![2, 5]));
+        }
+    }
+
+    #[test]
+    fn groups_without_signatures_read_as_unknown() {
+        // Every header an older blob writes: positions as before, and each
+        // pair's signature the one that never rejects.
+        let tfs = [2u32, 1, 3];
+        let vals = [4u32, 1, 9, 0, 2, 2];
+        for (packed, allow) in [
+            (GROUP_PACKED, false),
+            (GROUP_PACKED_FIXED, false),
+            (GROUP_PACKED_FIXED, true),
+        ] {
+            let mut out = Vec::new();
+            encode_group_as(
+                &mut out,
+                &tfs,
+                &vals,
+                None,
+                allow,
+                &mut PackScratch::default(),
+                packed,
+            );
+            assert!(out[0] <= GROUP_PACKED_FIXED, "an unsigned header");
+            assert_eq!(group_signatures_at(&out, 0), None);
+            let mut index = GroupIndex::default();
+            index.locate(&out, &mut 0, &tfs).expect("locates");
+            for pair in 0..tfs.len() {
+                assert_eq!(index.pair_sig(&out, pair), SIG_UNKNOWN);
+            }
+            assert_eq!(decode_all(&out, 0, &tfs), Some(positions_of(&tfs, &vals)));
+        }
+        assert_eq!(group_signatures_at(&[], 0), None, "past the bytes");
     }
 
     #[test]

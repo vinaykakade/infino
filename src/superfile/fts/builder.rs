@@ -4765,9 +4765,15 @@ fn sort_partition_to_file<const N: usize>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use tempfile::tempdir;
 
     use super::*;
+    use crate::superfile::fts::{
+        analysis::{Stemmer, Stopwords, chain_tokenizer},
+        reader::FtsReader,
+    };
 
     /// The radix path (n >= `RADIX_SORT_MIN_TRIPLES`) must deliver
     /// `(lex_rank, doc_id)` order even when a term's docs arrive out of
@@ -5654,6 +5660,57 @@ mod tests {
     }
 
     /// Build a one-column blob from `docs`, positional or not.
+    /// Each posting's signature is the OR of the bits of the tokens one
+    /// position after its occurrences — none past a removed stopword's
+    /// hole or after the doc's last token — whether the doc is added to
+    /// the in-RAM accumulator or straight to the spilled one.
+    #[test]
+    fn signatures_name_each_terms_followers_in_ram_and_spilled() {
+        let docs = ["x the y x z", "y x", "z z x", "x"];
+        let bit = |t: &str| next_bit(t.as_bytes());
+        // Doc 0's positions: x 0, the hole at 1, y 2, x 3, z 4.
+        let want: BTreeMap<(Vec<u8>, u32), u8> = [
+            ("x", 0, bit("z")),
+            ("y", 0, bit("x")),
+            ("z", 0, 0),
+            ("x", 1, 0),
+            ("y", 1, bit("x")),
+            ("x", 2, 0),
+            ("z", 2, bit("z") | bit("x")),
+            ("x", 3, 0),
+        ]
+        .into_iter()
+        .map(|(t, d, sig)| ((t.as_bytes().to_vec(), d), sig))
+        .collect();
+        let json = r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true,"stopwords":"english"}]"#;
+        for spill in [false, true] {
+            let mut b = FtsBuilder::new();
+            b.register_column_with_tokenizer(
+                "title".into(),
+                true,
+                chain_tokenizer(Stopwords::English, Stemmer::None),
+                bm25::Bm25Params::STANDARD,
+            )
+            .expect("register");
+            if spill {
+                // The first doc crosses it: the rest are added spilled.
+                b.set_spill_threshold_bytes(1);
+            }
+            for (i, text) in docs.iter().enumerate() {
+                b.add_doc(0, i as u32, text).expect("add doc");
+            }
+            let r = FtsReader::open(bytes::Bytes::from(b.finish().expect("finish")), json)
+                .expect("open");
+            let mut got = BTreeMap::new();
+            r.for_each_term_posting(0, |term, doc, _, _, sig| {
+                got.insert((term.to_vec(), doc), sig);
+                Ok(())
+            })
+            .expect("walk");
+            assert_eq!(got, want, "spill {spill}");
+        }
+    }
+
     fn build_title_blob(docs: &[String], positional: bool) -> bytes::Bytes {
         let mut b = FtsBuilder::new();
         b.register_column("title".into(), positional)
