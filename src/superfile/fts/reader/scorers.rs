@@ -545,7 +545,7 @@ pub(super) const UNION_SEED_MIN_K: usize = 64;
 
 /// Block tables longer than this are not scanned for a seed: a term that
 /// common scores too low per doc to raise the bar, and the scan is linear.
-const UNION_SEED_MAX_BLOCKS: usize = 4096;
+const UNION_SEED_MAX_BLOCKS: usize = 65536;
 
 /// A lower bound on a union's `k`-th best score, before its walk starts: for
 /// each term with at least `k` docs, the `k`-th best of its own scores over its
