@@ -636,10 +636,10 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
 const RANGE_SEED_MIN_K: usize = 512;
 
 /// Docs per range [`FtsReader::range_seed`] chooses among.
-const RANGE_SEED_SPAN: u32 = 1 << 16;
+const RANGE_SEED_SPAN: u32 = 1 << 14;
 
 /// Ranges [`FtsReader::range_seed`] walks.
-const RANGE_SEED_RANGES: usize = 2;
+const RANGE_SEED_RANGES: usize = 1;
 
 /// A non-essential union term whose estimated docs in a window are at most
 /// this many times the essential terms' is accumulated in that window
