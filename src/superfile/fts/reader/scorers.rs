@@ -1496,6 +1496,11 @@ unsafe fn accumulate_run_avx512(
     i
 }
 
+/// Bitset words the negation fold of a counted single-term walk may clear
+/// per doc of the term: a doc's probe is a search in a negated block, which
+/// costs about what clearing a cache line of words does.
+const NEGATION_FOLD_WORDS_PER_DOC: u64 = 8;
+
 /// Most terms a union may have for its windows below [`BUFFERED_TOPK_MIN_K`]
 /// to end at the nearest essential block boundary rather than the score
 /// buffer's width. With two terms that boundary sits a block of one term's
@@ -2946,17 +2951,18 @@ impl FtsReader {
             // Every doc of the term is asked about, so the negated terms are
             // folded once into a bitset over its span and each doc is one bit
             // test, rather than a search in a negated block per doc. The fold
-            // clears a word per 64 docs of the span and reads every negated
-            // block, so it is taken only where the term has at least as many
-            // docs as either: past that, its own probes would cost as much. A
-            // row-set filter keeps its own test.
+            // clears the span's words and reads every negated block, so it is
+            // taken only where the term's own probes would cost more: it has
+            // at least one doc per [`NEGATION_FOLD_WORDS_PER_DOC`] words, and
+            // at least as many docs as there are negated blocks. A row-set
+            // filter keeps its own test.
             let last = c.blocks.last().map_or(0, |b| b.last_doc_id);
             let words = last as usize / 64 + 1;
             let excluded: Option<Vec<u64>> = match filter.as_deref() {
                 Some(f)
                     if f.allow.is_none()
                         && !f.cursors.is_empty()
-                        && c.df >= words as u64
+                        && c.df.saturating_mul(NEGATION_FOLD_WORDS_PER_DOC) >= words as u64
                         && c.df >= f.cursors.iter().map(|nc| nc.blocks.len() as u64).sum() =>
                 {
                     let mut ex = vec![0u64; words];
@@ -5931,6 +5937,56 @@ mod tests {
                         "{terms:?} k {k}: {dg:?} {sg} vs {dw:?} {sw}"
                     );
                 }
+            }
+        }
+    }
+
+    /// A seed one place too high drops the `k`-th doc only where it is the
+    /// best of its block and scores apart from the next better one. Here
+    /// every doc of `x` scores apart (one length, a different tf each), and
+    /// its tfs fall with the doc id, so each posting block holds the next
+    /// `BLOCK_LEN` ranks: at `k` one past a block, the `k`-th doc heads the
+    /// next. A union with a rarer term over its best docs, which splits and
+    /// seeds `x` as a lone term, and `x` searched alone must both rank
+    /// exactly as the exhaustive walk does.
+    #[tokio::test]
+    async fn a_seed_over_distinct_scores_keeps_the_kth_doc() {
+        /// Docs holding `x`, the `i`-th `X_DOCS - i` times; each doc's
+        /// length is fixed so its tf alone orders the scores.
+        const X_DOCS: u32 = 400;
+        const DOC_LEN: u32 = 420;
+        /// `y` is in `x`'s best docs, fewer than `k`: the split merges them
+        /// back over `x` ranked alone, so the union's `k`-th is `x`'s own.
+        const Y_DOCS: u32 = 30;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..3_000u32 {
+            let x = X_DOCS.saturating_sub(i);
+            let y = u32::from(i < Y_DOCS);
+            let text = ["x "].repeat(x as usize).concat()
+                + &["y "].repeat(y as usize).concat()
+                + &["pad "].repeat((DOC_LEN - x - y) as usize).concat();
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        for terms in [&["x", "y"][..], &["x"]] {
+            for k in [UNION_SEED_MIN_K, BLOCK_LEN + 1, 2 * BLOCK_LEN + 1] {
+                let got: Vec<(u32, u32)> = r
+                    .search("body", terms, k, BoolMode::Or)
+                    .await
+                    .expect("search")
+                    .into_iter()
+                    .map(|(d, s)| (d.get(), s.to_bits()))
+                    .collect();
+                let want: Vec<(u32, u32)> = r
+                    .search_with_algo_for_bench("body", terms, k, OrAlgo::Exhaustive)
+                    .await
+                    .expect("exhaustive")
+                    .into_iter()
+                    .map(|(d, s)| (d.get(), s.to_bits()))
+                    .collect();
+                assert_eq!(got, want, "{terms:?} k {k}");
             }
         }
     }
