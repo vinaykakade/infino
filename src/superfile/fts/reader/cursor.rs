@@ -1609,6 +1609,12 @@ impl TermCursor {
             return None;
         }
         let block = self.blocks[self.current_block];
+        // A block at most half full spreads its docs thin over the tiles.
+        let span_bits =
+            (block.block_byte_end - hdr.tfs_size() - block.block_byte_offset - hdr.payload()) * 8;
+        if 2 * hdr.count() < span_bits {
+            return None;
+        }
         Some((
             hdr.base,
             block.block_byte_offset + hdr.payload()..block.block_byte_end - hdr.tfs_size(),
