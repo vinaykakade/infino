@@ -632,6 +632,15 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
     seed
 }
 
+/// Smallest `k` a union is seeded at from its own walk over a few ranges.
+const RANGE_SEED_MIN_K: usize = 512;
+
+/// Docs per range [`FtsReader::range_seed`] chooses among.
+const RANGE_SEED_SPAN: u32 = 1 << 16;
+
+/// Ranges [`FtsReader::range_seed`] walks.
+const RANGE_SEED_RANGES: usize = 2;
+
 /// A non-essential union term whose estimated docs in a window are at most
 /// this many times the essential terms' is accumulated in that window
 /// rather than probed.
@@ -3796,9 +3805,67 @@ impl FtsReader {
             if k >= UNION_SEED_MIN_K && filter.is_none() && no_floor {
                 let dl_norm_k1 = self.columns[column_id as usize].dl_norm_k1();
                 floor = floor.max(union_seed(&cursors, k, dl_norm_k1));
+                if k >= RANGE_SEED_MIN_K && cursors.len() > 1 {
+                    floor = floor.max(self.range_seed(column_id, &cursors, k)?);
+                }
             }
             self.run_windowed_maxscore(column_id, cursors, k, filter, floor, 0, u32::MAX)
         }
+    }
+
+    /// A lower bound on a union's `k`-th best from the union itself, run
+    /// over the few doc ranges its terms' block maxima sum highest in: where
+    /// docs holding several terms gather, so their scores, unlike any one
+    /// term's, come near the final `k`-th. Any `k` docs of the union bound its
+    /// `k`-th from below, and the ranges are walked on copies by the same
+    /// kernel, so the scores are the walk's own bits. One ulp down keeps a
+    /// doc tied at the bound. `NEG_INFINITY` when they hold fewer than `k`.
+    fn range_seed(
+        &self,
+        column_id: u32,
+        cursors: &[TermCursor],
+        k: usize,
+    ) -> Result<f32, FtsError> {
+        let n_ranges = (self.n_docs as usize)
+            .div_ceil(RANGE_SEED_SPAN as usize)
+            .max(1);
+        let mut bound = vec![0.0f32; n_ranges];
+        let mut best = vec![0.0f32; n_ranges];
+        for c in cursors {
+            best.fill(0.0);
+            for b in c.blocks.iter() {
+                let r = ((b.last_doc_id / RANGE_SEED_SPAN) as usize).min(n_ranges - 1);
+                best[r] = best[r].max(b.block_max_bm25);
+            }
+            for (t, &m) in bound.iter_mut().zip(&best) {
+                *t += m;
+            }
+        }
+        let mut order: Vec<usize> = (0..n_ranges).collect();
+        let take = RANGE_SEED_RANGES.min(n_ranges);
+        order.select_nth_unstable_by(take - 1, |&a, &b| bound[b].total_cmp(&bound[a]));
+        let mut scores: Vec<f32> = Vec::new();
+        for &r in &order[..take] {
+            let start = r as u32 * RANGE_SEED_SPAN;
+            let end = start.saturating_add(RANGE_SEED_SPAN);
+            let hits = self.run_windowed_maxscore(
+                column_id,
+                cursors.to_vec(),
+                k,
+                None,
+                f32::NEG_INFINITY,
+                start,
+                end,
+            )?;
+            scores.extend(hits.iter().map(|&(_, score)| score));
+        }
+        Ok(match scores.len() >= k {
+            true => scores
+                .select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a))
+                .1
+                .next_down(),
+            false => f32::NEG_INFINITY,
+        })
     }
 
     /// The top `k` of a union whose rare term (cursor `rare`) holds fewer than
