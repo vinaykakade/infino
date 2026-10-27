@@ -179,6 +179,35 @@ impl ExcludeFilter {
         // decode and a search, never decoding past the block that holds `doc`.
         !self.cursors.iter_mut().any(|c| c.contains(doc))
     }
+
+    /// [`Self::admits`] for every doc of `docs` (ascending, all past the docs
+    /// asked about before), into `admitted`: each negated term answers the
+    /// whole list in one batch membership pass (a merge or a rank per block
+    /// it holds) rather than a search per doc, which is cheaper once most docs
+    /// of a run are asked about, as a walk that must count every match asks.
+    /// `held`, `locs` and `kept` are scratch.
+    pub(super) fn admits_all(
+        &mut self,
+        docs: &[u32],
+        admitted: &mut Vec<bool>,
+        held: &mut Vec<u32>,
+        locs: &mut Vec<(u32, u32)>,
+        kept: &mut Vec<u32>,
+    ) {
+        admitted.clear();
+        admitted.extend(docs.iter().map(|&d| allows(&self.allow, &self.doc_map, d)));
+        for c in &mut self.cursors {
+            held.clear();
+            held.extend_from_slice(docs);
+            c.retain_contained_located(held, locs, kept);
+            for &i in kept.iter() {
+                admitted[i as usize] = false;
+            }
+        }
+        if let Some(&last) = docs.last() {
+            self.last_doc = last;
+        }
+    }
 }
 
 #[cfg(test)]

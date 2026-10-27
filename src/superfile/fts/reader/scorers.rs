@@ -2902,6 +2902,10 @@ impl FtsReader {
         cursors.retain(|c| !c.is_exhausted());
         if let [c] = cursors.as_mut_slice() {
             let mut lane_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+            let (mut admitted, mut held) =
+                (Vec::with_capacity(BLOCK_LEN), Vec::with_capacity(BLOCK_LEN));
+            let (mut locs, mut kept) =
+                (Vec::with_capacity(BLOCK_LEN), Vec::with_capacity(BLOCK_LEN));
             while !c.is_exhausted() {
                 c.hold_whole_block();
                 let (from, to) = (c.pos, c.block_n);
@@ -2931,12 +2935,21 @@ impl FtsReader {
                         }
                     }
                     Some(f) => {
-                        for (&doc, &score) in docs.zip(&lane_scores) {
-                            if !f.admits(doc) {
+                        f.admits_all(
+                            &c.block_doc_ids[from..to],
+                            &mut admitted,
+                            &mut held,
+                            &mut locs,
+                            &mut kept,
+                        );
+                        for ((&doc, &score), &ok) in docs.zip(&lane_scores).zip(&admitted) {
+                            if !ok {
                                 continue;
                             }
                             count += 1;
-                            offer(&mut heap, &mut threshold, doc, score);
+                            if heap.len() < k || score > threshold {
+                                offer(&mut heap, &mut threshold, doc, score);
+                            }
                         }
                     }
                 }
