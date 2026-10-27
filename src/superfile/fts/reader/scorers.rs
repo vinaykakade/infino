@@ -8,10 +8,12 @@
 
 #[cfg(test)]
 use std::cell::{Cell, RefCell};
-use std::{cmp::Ordering, collections::BinaryHeap, mem, slice::from_mut};
+use std::{cmp::Ordering, collections::BinaryHeap, mem, slice::from_mut, sync::Arc};
 
 use wide::f32x8;
 
+#[cfg(target_arch = "x86_64")]
+use super::metadata::{SCORE_TABLE_TFS, ScoreTable};
 use super::{
     core::*,
     cursor::{CursorUse, TermCursor, seek_sorted},
@@ -1335,6 +1337,15 @@ fn accumulate_segment(
         accumulate_one(c, base, scores, present, dl_norm_k1);
         return;
     }
+    let simd = simd_accumulate();
+    if simd
+        && !c
+            .score_table
+            .as_ref()
+            .is_some_and(|t| t.is_for(c.idf_weight, dl_norm_k1))
+    {
+        c.score_table = Some(Arc::new(dl_norm_k1.score_table(c.idf_weight)));
+    }
     let (pos, n) = (c.pos, c.block_n);
     let ids = &c.block_doc_ids[..n];
     let to = match ids[n - 1] < window_end {
@@ -1345,14 +1356,14 @@ fn accumulate_segment(
     let mut i = pos;
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx2")
-        {
+        if simd {
+            let table = c.score_table.as_deref().expect("invariant: built above");
             // SAFETY: both features the kernel enables are present (checked
             // above).
             i += unsafe {
                 accumulate_run_avx512(
                     c.idf_weight,
+                    table,
                     &ids[pos..to],
                     &tfs[pos..to],
                     base,
@@ -1381,6 +1392,21 @@ fn accumulate_segment(
         present[local >> 6] |= 1u64 << (local & 63);
     }
     c.advance_by(to - pos);
+}
+
+/// Whether [`accumulate_run_avx512`] runs here: both features it enables
+/// are detected.
+#[inline(always)]
+fn simd_accumulate() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 /// Slots of the window a run of eight dense postings adds into at a time:
@@ -1413,6 +1439,7 @@ const _: () = assert!((OR_WINDOW as usize).is_multiple_of(ACCUMULATE_TILE));
 #[target_feature(enable = "avx512f,avx2")]
 unsafe fn accumulate_run_avx512(
     idf_weight: f32,
+    table: &ScoreTable,
     ids: &[u32],
     tfs: &[u32],
     base: u32,
@@ -1448,16 +1475,33 @@ unsafe fn accumulate_run_avx512(
             // The compress keeps the eight lanes the mask selects, in order, so
             // the low eight lanes are the eight docs' buckets, each below 256:
             // the gather reads only inside the 256-entry table.
-            let norms = unsafe {
+            // With every frequency in `1..=SCORE_TABLE_TFS` (checked unsigned
+            // on `tf - 1`), the index `(tf - 1) * 256 + bucket` is inside the
+            // score table, and one gather from it gives the contributions.
+            let contributions = unsafe {
                 let bytes = _mm_loadu_si128(buckets.as_ptr().add(dids[0] as usize).cast());
                 let picked = _mm512_maskz_compress_epi32(mask as u16, _mm512_cvtepu8_epi32(bytes));
-                let gathered =
-                    _mm256_i32gather_ps::<4>(lut.as_ptr(), _mm512_castsi512_si256(picked));
-                let mut norms = [0.0f32; 8];
-                _mm256_storeu_ps(norms.as_mut_ptr(), gathered);
-                norms
+                let picked = _mm512_castsi512_si256(picked);
+                let tf_less = _mm256_sub_epi32(
+                    _mm256_loadu_si256(tf8.as_ptr().cast()),
+                    _mm256_set1_epi32(1),
+                );
+                let in_table = _mm256_cmpeq_epi32(
+                    _mm256_min_epu32(tf_less, _mm256_set1_epi32(SCORE_TABLE_TFS as i32 - 1)),
+                    tf_less,
+                );
+                let mut out = [0.0f32; 8];
+                if _mm256_movemask_epi8(in_table) == -1 {
+                    let at = _mm256_or_si256(_mm256_slli_epi32::<8>(tf_less), picked);
+                    let gathered = _mm256_i32gather_ps::<4>(table.scores().as_ptr(), at);
+                    _mm256_storeu_ps(out.as_mut_ptr(), gathered);
+                    out
+                } else {
+                    let gathered = _mm256_i32gather_ps::<4>(lut.as_ptr(), picked);
+                    _mm256_storeu_ps(out.as_mut_ptr(), gathered);
+                    bm25::score_one_term_x8(idf_weight, tf8, out)
+                }
             };
-            let contributions = bm25::score_one_term_x8(idf_weight, tf8, norms);
             // The eight docs land in the 16-slot tile holding the first and,
             // when they cross its end, the next: tiles aligned to 16 slots, so
             // the next run reads either a tile this one wrote whole, which the
@@ -5356,7 +5400,10 @@ mod tests {
                 ids.push(d);
                 d += 1 + (next() % max_gap) as u32;
             }
-            let tfs: Vec<u32> = ids.iter().map(|_| 1 + (next() % 20) as u32).collect();
+            // Half the trials keep every frequency inside the score table,
+            // half mix in larger ones that fall back to the divide.
+            let tf_span = [SCORE_TABLE_TFS as u64, 20][(trial / 4) % 2];
+            let tfs: Vec<u32> = ids.iter().map(|_| 1 + (next() % tf_span) as u32).collect();
             let start: Vec<f32> = (0..OR_WINDOW)
                 .map(|_| (next() % 1000) as f32 / 97.0)
                 .collect();
@@ -5364,9 +5411,19 @@ mod tests {
             let mut simd_present = [0u64; OR_WINDOW_WORDS];
             let mut scalar_present = [0u64; OR_WINDOW_WORDS];
             let idf = 1.7f32;
+            let table = norms.score_table(idf);
             // SAFETY: avx512f is present (checked above).
             let used = unsafe {
-                accumulate_run_avx512(idf, &ids, &tfs, base, &mut simd, &mut simd_present, norms)
+                accumulate_run_avx512(
+                    idf,
+                    &table,
+                    &ids,
+                    &tfs,
+                    base,
+                    &mut simd,
+                    &mut simd_present,
+                    norms,
+                )
             };
             assert!(
                 used <= ids.len() && used.is_multiple_of(8),

@@ -21,7 +21,7 @@ use wide::i32x8;
 use super::{
     bounds::BoundDecoder,
     core::{TermIdf, read_u32_le, read_u64_le},
-    metadata::ColumnMeta,
+    metadata::{ColumnMeta, ScoreTable},
 };
 use crate::superfile::{
     ReadError,
@@ -508,6 +508,9 @@ pub(crate) struct TermCursor {
     eager_blocks: u8,
     /// The batch probes' buffers, reused across blocks.
     scratch: ProbeScratch,
+    /// The term's exact scores by frequency and length bucket, built on
+    /// first use by a union's window kernel and shared by clones.
+    pub(super) score_table: Option<Arc<ScoreTable>>,
 }
 
 /// `decoded_block`, `tf_decoded_block` and a prefix table's block when no
@@ -759,6 +762,7 @@ impl TermCursor {
             dense_streak: 0,
             eager_blocks: 0,
             scratch: ProbeScratch::default(),
+            score_table: None,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -857,6 +861,7 @@ impl TermCursor {
             dense_streak: 0,
             eager_blocks: 0,
             scratch: ProbeScratch::default(),
+            score_table: None,
         })
     }
 
@@ -931,6 +936,7 @@ impl TermCursor {
             dense_streak: 0,
             eager_blocks: 0,
             scratch: ProbeScratch::default(),
+            score_table: None,
         })
     }
 

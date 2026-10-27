@@ -159,7 +159,50 @@ impl ColumnLengthStats {
     }
 }
 
+/// Term frequencies a [`ScoreTable`] holds scores for; most postings'
+/// frequency is at most this.
+pub(super) const SCORE_TABLE_TFS: usize = 4;
+
+/// One term's BM25 contribution at each frequency in
+/// `1..=SCORE_TABLE_TFS` and each length bucket, at `(tf - 1) * 256 +
+/// bucket`. Each entry is what [`bm25::score_with_dl_norm_k1`] gives for
+/// it, so a lookup scores a posting to the same bits with one load, in
+/// place of a norm lookup and a divide.
+pub(crate) struct ScoreTable {
+    /// The idf weight's bits and the norm table it was built for.
+    key: (u32, usize),
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    scores: Box<[f32; SCORE_TABLE_TFS * 256]>,
+}
+
+impl ScoreTable {
+    /// The table's entries, for a SIMD gather.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub(super) fn scores(&self) -> &[f32; SCORE_TABLE_TFS * 256] {
+        &self.scores
+    }
+
+    /// Whether it scores for `idf_weight` against `norms`.
+    pub(super) fn is_for(&self, idf_weight: f32, norms: &NormTable) -> bool {
+        self.key == (idf_weight.to_bits(), Arc::as_ptr(&norms.lut) as usize)
+    }
+}
+
 impl NormTable {
+    /// The [`ScoreTable`] of a term scored at `idf_weight` against these
+    /// norms.
+    pub(super) fn score_table(&self, idf_weight: f32) -> ScoreTable {
+        let mut scores = Box::new([0.0f32; SCORE_TABLE_TFS * 256]);
+        for (i, s) in scores.iter_mut().enumerate() {
+            *s = bm25::score_with_dl_norm_k1(idf_weight, (i / 256 + 1) as u32, self.lut[i % 256]);
+        }
+        ScoreTable {
+            key: (idf_weight.to_bits(), Arc::as_ptr(&self.lut) as usize),
+            scores,
+        }
+    }
+
     /// Build from a column's per-doc lengths, returning the table
     /// alongside the totals the pass produced.
     ///
