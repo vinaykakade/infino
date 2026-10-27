@@ -1474,6 +1474,15 @@ unsafe fn accumulate_run_avx512(
     i
 }
 
+/// Most live essential terms at which a union window below
+/// [`BUFFERED_TOPK_MIN_K`] ends at the nearest essential block boundary
+/// rather than the score buffer's width. With one or two essentials that
+/// boundary sits a whole block of a term's postings away, so ending there
+/// costs little and lets the bar rise per block on a small `k`; with more,
+/// the nearest of their boundaries is close and each window would pay its
+/// bounds and drain for a sliver of doc ids.
+const BLOCK_WINDOW_MAX_ESSENTIALS: usize = 2;
+
 /// Smallest `k` at which the windowed MaxScore kernel collects into a
 /// buffer rather than a heap.
 pub(super) const BUFFERED_TOPK_MIN_K: usize = 512;
@@ -3399,9 +3408,12 @@ impl FtsReader {
 
             // Candidates come from the essential terms only; the first two
             // essential docs place the window and tell whether one term holds
-            // it alone.
+            // it alone. The same scan finds the nearest essential block
+            // boundary from block metadata, with no decode.
             let mut min_doc = u32::MAX;
             let mut second_doc = u32::MAX;
+            let mut block_bound = doc_id_end;
+            let mut live = 0usize;
             for c in cursors.iter().take(f_essential) {
                 if !c.is_exhausted() {
                     let d = c.current_doc_id();
@@ -3411,17 +3423,18 @@ impl FtsReader {
                     } else if d < second_doc {
                         second_doc = d;
                     }
+                    block_bound = block_bound.min(c.current_block_last_doc_id().saturating_add(1));
+                    live += 1;
                 }
             }
             if min_doc == u32::MAX || min_doc >= doc_id_end {
                 break;
             }
             // 64-align the base for the presence bitmask and run the window to
-            // the score buffer's width. Ending it at the nearest essential
-            // block boundary instead, so the bar updates per block, costs more
-            // than it prunes: with two or more essential terms that boundary is
-            // never far, and every window pays a bound per term and a drain.
-            // The bounds stay sound over the wider range, as each term's is the
+            // the score buffer's width, or, for a small `k` over at most
+            // [`BLOCK_WINDOW_MAX_ESSENTIALS`] essentials, to the nearest
+            // essential block boundary so the bar updates per block. The
+            // bounds stay sound over the wider range, as each term's is the
             // largest of its block maxima across it.
             //
             // When every other essential term's next doc lies past the window,
@@ -3432,8 +3445,14 @@ impl FtsReader {
             // rare term's postings are far apart and the stopword's blocks
             // between them mostly sit under the bar.
             let base = min_doc & !63;
-            let window_end = base.saturating_add(OR_WINDOW).min(doc_id_end);
-            let sole = second_doc >= window_end;
+            let cap_end = base.saturating_add(OR_WINDOW).min(doc_id_end);
+            let sole = second_doc >= cap_end;
+            let window_end =
+                if sole || k >= BUFFERED_TOPK_MIN_K || live > BLOCK_WINDOW_MAX_ESSENTIALS {
+                    cap_end
+                } else {
+                    block_bound.min(cap_end)
+                };
 
             // Accumulate the essential terms' contributions into the window
             // (SIMD OR-sum; scalar tail). Identical to the windowed-union body,
