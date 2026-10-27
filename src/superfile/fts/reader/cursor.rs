@@ -554,6 +554,10 @@ const BALANCED_PROBE_RATIO: usize = 4;
 /// postings of a term dense enough to be probed this way span far less.
 const PROBE_BITMAP_WORDS: usize = 128;
 
+/// Doc span, in 64-doc words, of the wider bitmap a block too sparse for
+/// [`PROBE_BITMAP_WORDS`] is ranked with.
+const WIDE_PROBE_BITMAP_WORDS: usize = 512;
+
 /// Rank every target against a block's postings at once: mark `ids`
 /// (ascending) in a bitmap over their span, then give each target in
 /// `targets` (ascending) its posting's index plus one when its bit is set,
@@ -561,19 +565,30 @@ const PROBE_BITMAP_WORDS: usize = 128;
 /// popcounts per word), so no target waits on another, unlike a merge where
 /// every step depends on the last comparison. Returns `false`, writing
 /// nothing, when the span is too wide for the bitmap.
+///
+/// A block whose span the usual bitmap cannot cover (a sparse stretch of a
+/// term holding many targets) gets a wider one, cleared only for it: such
+/// blocks are few, and a merge over hundreds of targets costs more.
 fn rank_by_bitmap(ids: &[u32], targets: &[u32], out: &mut [u32]) -> bool {
+    rank_by_bitmap_in::<PROBE_BITMAP_WORDS>(ids, targets, out)
+        || rank_by_bitmap_in::<WIDE_PROBE_BITMAP_WORDS>(ids, targets, out)
+}
+
+/// [`rank_by_bitmap`] over a bitmap of `W` 64-doc words.
+#[inline(always)]
+fn rank_by_bitmap_in<const W: usize>(ids: &[u32], targets: &[u32], out: &mut [u32]) -> bool {
     let (Some(&first), Some(&last)) = (ids.first(), ids.last()) else {
         return false;
     };
     let base = first & !63;
     let words = ((last - base) / 64) as usize + 1;
-    if words > PROBE_BITMAP_WORDS {
+    if words > W {
         return false;
     }
     // The ids ascend, so a word is complete once they move past it: the word
     // being filled stays in a register and is stored whole on every id, with
     // no load of the store before it, which `|=` into memory would wait on.
-    let mut bits = [0u64; PROBE_BITMAP_WORDS];
+    let mut bits = [0u64; W];
     let (mut prev, mut acc) = (usize::MAX, 0u64);
     for &d in ids {
         let local = d - base;
@@ -583,7 +598,7 @@ fn rank_by_bitmap(ids: &[u32], targets: &[u32], out: &mut [u32]) -> bool {
         bits[wi] = acc;
         prev = wi;
     }
-    let mut prefix = [0u32; PROBE_BITMAP_WORDS];
+    let mut prefix = [0u32; W];
     let mut acc = 0u32;
     for (slot, w) in prefix.iter_mut().zip(&bits).take(words) {
         *slot = acc;
@@ -2092,16 +2107,20 @@ mod tests {
     }
 
     #[test]
-    fn rank_by_bitmap_refuses_an_empty_block_or_a_span_past_the_bitmap() {
+    fn rank_by_bitmap_refuses_an_empty_block_or_a_span_past_the_wider_bitmap() {
         let mut out = [7u32; 2];
         assert!(!rank_by_bitmap(&[], &[1, 2], &mut out));
-        // Ids one bit past the bitmap's span apart: refused.
-        let span = (PROBE_BITMAP_WORDS * 64) as u32;
+        // Ids one bit past the wider bitmap's span apart: refused.
+        let span = (WIDE_PROBE_BITMAP_WORDS * 64) as u32;
         assert!(!rank_by_bitmap(&[0, span], &[0, span], &mut out));
         assert_eq!(out, [7, 7], "nothing written on a refusal");
-        // One bit less fits, and ranks both ends.
+        // One bit less fits, and ranks both ends; so does a span past the
+        // usual bitmap's, which the wider one takes.
         assert!(rank_by_bitmap(&[0, span - 1], &[0, span - 1], &mut out));
         assert_eq!(out, [1, 2]);
+        let narrow = (PROBE_BITMAP_WORDS * 64) as u32;
+        assert!(rank_by_bitmap(&[0, narrow], &[1, narrow], &mut out));
+        assert_eq!(out, [0, 2]);
     }
 
     /// The per-block BM25 upper bound stored in the skip table must be a
