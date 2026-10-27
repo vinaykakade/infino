@@ -1360,12 +1360,6 @@ impl FtsReader {
         let bounds = BoundDecoder::new(col_meta, idf_t, local_idf);
         let dl_norm_k1 = col_meta.dl_norm_k1();
 
-        // Stack-resident decode scratch for the seed below: `BLOCK_LEN` is a
-        // compile-time const and these never cross an await, so they stay off
-        // the heap.
-        let mut buf_d = [0u32; BLOCK_LEN];
-        let mut buf_t = [0u32; BLOCK_LEN];
-
         let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
         // Every long-form term carries a coarse block-max table.
         let coarse_enabled = term_meta.has_coarse;
@@ -1386,73 +1380,55 @@ impl FtsReader {
         // is bit-identical to the un-seeded walk. Only applied without a
         // negation filter (so the seed's admitted set matches the final one)
         // and on lists long enough to have waste to prune.
-        let seed_threshold: f32 = if coarse_enabled
-            && filter.is_none()
-            && term_meta.num_blocks >= seed::MIN_BLOCKS
-        {
-            let num_coarse = term_meta.num_blocks.div_ceil(coarse_span);
-            // Seed depth scales with k: a fixed handful of blocks gives a
-            // tight k-th only at small k; at k=100/1000 the top-k spreads
-            // across more blocks, so decode more to raise the threshold.
-            let m_want = seed_blocks_for(k);
-            // Gather enough top spans to contain the top `m_want` blocks
-            // (over-cover: worst case each is in its own span).
-            let mut spans: Vec<(f32, usize)> = (0..num_coarse)
-                .map(|g| (bounds.bound(term_meta.coarse_slot(postings, g)), g))
-                .collect();
-            let s = m_want.max(seed::TOP_SPANS).min(spans.len());
-            spans.select_nth_unstable_by(s.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
-            // Candidate blocks from those spans, then the top blocks by
-            // block-max across them.
-            let mut cand: Vec<(f32, usize)> = Vec::with_capacity(s * coarse_span);
-            for &(_, g) in &spans[..s] {
-                let start = g * coarse_span;
-                let end = (start + coarse_span).min(term_meta.num_blocks);
-                for bi in start..end {
-                    let (_, raw) = term_meta.skip_entry(postings, bi);
-                    cand.push((bounds.bound(raw), bi));
-                }
-            }
-            let m = m_want.min(cand.len());
-            cand.select_nth_unstable_by(m.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
-            // Decode those blocks, score, keep a k-sized seed heap. Clamp the
-            // preallocation to the corpus size: `k` is caller-controlled and may
-            // be `usize::MAX` (an unbounded "return everything" request), which
-            // would overflow `with_capacity`. The heap never holds more than the
-            // docs in scope anyway.
-            let mut seed_heap: BinaryHeap<TopKEntry> =
-                BinaryHeap::with_capacity(top_k_initial_capacity(k, u64::from(self.n_docs), None));
-            for &(_, bi) in &cand[..m] {
-                let range = term_meta.block_range_in_term(postings, bi, None);
-                let bytes = &postings[range.start..range.end];
-                let hdr = BlockHeader::parse(bytes, term_meta.prev_last_doc_id(postings, bi));
-                let n = decode_block(bytes, &hdr, &mut buf_d, &mut buf_t);
-                for j in 0..n {
-                    let score =
-                        bm25::score_with_dl_norm_k1(idf_weight, buf_t[j], dl_norm_k1.get(buf_d[j]));
-                    if score <= floor_eff {
-                        continue;
-                    }
-                    if seed_heap.len() < k {
-                        seed_heap.push(TopKEntry(score, FtsDocId::new(buf_d[j])));
-                    } else if let Some(mut worst) = seed_heap.peek_mut()
-                        && score > worst.0
-                    {
-                        *worst = TopKEntry(score, FtsDocId::new(buf_d[j]));
+        let seed_threshold: f32 =
+            if coarse_enabled && filter.is_none() && term_meta.num_blocks >= seed::MIN_BLOCKS {
+                let num_coarse = term_meta.num_blocks.div_ceil(coarse_span);
+                // Seed depth scales with k: a fixed handful of blocks gives a
+                // tight k-th only at small k; at k=100/1000 the top-k spreads
+                // across more blocks, so decode more to raise the threshold.
+                let m_want = seed_blocks_for(k);
+                // Gather enough top spans to contain the top `m_want` blocks
+                // (over-cover: worst case each is in its own span).
+                let mut spans: Vec<(f32, usize)> = (0..num_coarse)
+                    .map(|g| (bounds.bound(term_meta.coarse_slot(postings, g)), g))
+                    .collect();
+                let s = m_want.max(seed::TOP_SPANS).min(spans.len());
+                spans.select_nth_unstable_by(s.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
+                // Candidate blocks from those spans, then the top blocks by
+                // block-max across them.
+                let mut cand: Vec<(f32, usize)> = Vec::with_capacity(s * coarse_span);
+                for &(_, g) in &spans[..s] {
+                    let start = g * coarse_span;
+                    let end = (start + coarse_span).min(term_meta.num_blocks);
+                    for bi in start..end {
+                        let (_, raw) = term_meta.skip_entry(postings, bi);
+                        cand.push((bounds.bound(raw), bi));
                     }
                 }
-            }
-            // Only a *full* seed heap gives a valid k-th lower bound.
-            match seed_heap.len() >= k {
-                true => seed_heap
-                    .peek()
-                    .map(|TopKEntry(s, _)| *s)
-                    .unwrap_or(f32::NEG_INFINITY),
-                false => f32::NEG_INFINITY,
-            }
-        } else {
-            f32::NEG_INFINITY
-        };
+                let m = m_want.min(cand.len());
+                cand.select_nth_unstable_by(m.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
+                // Decode those blocks, score each whole, and take the k-th best of
+                // those scores: a heap at a small `k`, a buffer cut by selection
+                // at a large one, where a sift per admission would cost more than
+                // the walk the seed saves. Clamp the preallocation to the corpus
+                // size: `k` is caller-controlled and may be `usize::MAX`.
+                let seed = SeedBlocks {
+                    blocks: &cand[..m],
+                    term_meta: &term_meta,
+                    postings,
+                    idf_weight,
+                    dl_norm_k1,
+                    k,
+                    floor_eff,
+                };
+                let cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
+                match k >= BUFFERED_TOPK_MIN_K {
+                    true => seed.kth(<TopKBuffer as Collector>::with_capacity(k, cap)),
+                    false => seed.kth(<BinaryHeap<TopKEntry> as Collector>::with_capacity(k, cap)),
+                }
+            } else {
+                f32::NEG_INFINITY
+            };
 
         let capacity = k.min(term_meta.num_blocks * BLOCK_LEN).max(1);
         let walk = SingleTermWalk {
@@ -1773,6 +1749,50 @@ impl FtsReader {
             }
         }
         Ok(cursors)
+    }
+}
+
+/// The blocks a single-term walk's seed decodes, and what scores them.
+struct SeedBlocks<'a> {
+    blocks: &'a [(f32, usize)],
+    term_meta: &'a TermMeta,
+    postings: &'a [u8],
+    idf_weight: f32,
+    dl_norm_k1: &'a NormTable,
+    k: usize,
+    floor_eff: f32,
+}
+
+impl SeedBlocks<'_> {
+    /// The `k`-th best score over the blocks' docs, scored eight at a time
+    /// into `coll`, or `NEG_INFINITY` when they hold fewer than `k` docs
+    /// above the floor: only a full `k` bounds the walk's `k`-th from below.
+    fn kth<C: Collector>(&self, mut coll: C) -> f32 {
+        let (mut buf_d, mut buf_t) = ([0u32; BLOCK_LEN], [0u32; BLOCK_LEN]);
+        let mut scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+        let mut bar = f32::NEG_INFINITY;
+        for &(_, bi) in self.blocks {
+            let range = self.term_meta.block_range_in_term(self.postings, bi, None);
+            let bytes = &self.postings[range.start..range.end];
+            let hdr = BlockHeader::parse(bytes, self.term_meta.prev_last_doc_id(self.postings, bi));
+            let n = decode_block(bytes, &hdr, &mut buf_d, &mut buf_t);
+            score_postings(
+                self.idf_weight,
+                &buf_d[..n],
+                &buf_t[..n],
+                self.dl_norm_k1,
+                &mut scores,
+            );
+            for (&doc, &score) in buf_d[..n].iter().zip(&scores) {
+                if score > self.floor_eff {
+                    coll.offer(self.k, &mut bar, score, doc);
+                }
+            }
+        }
+        match coll.into_sorted().get(self.k.wrapping_sub(1)) {
+            Some(&(_, kth)) => kth,
+            None => f32::NEG_INFINITY,
+        }
     }
 }
 
