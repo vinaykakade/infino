@@ -2362,13 +2362,12 @@ fn or_count_prefers_heap(terms: usize, total_df: u64, max_doc: u32) -> bool {
 /// full-corpus alloc + popcount would dominate on a sparse one.
 fn or_count_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
     let words = max_doc as usize / 64 + 1;
-    with_fold_bitsets(words, |union, _| {
-        let mut scratch = [0u32; BLOCK_LEN];
-        for c in &cursors {
-            or_cursor_into_bitset(union, c, &mut scratch);
-        }
-        popcount_and_clear(union)
-    })
+    let mut union = vec![0u64; words];
+    let mut scratch = [0u32; BLOCK_LEN];
+    for c in &cursors {
+        or_cursor_into_bitset(&mut union, c, &mut scratch);
+    }
+    union.iter().map(|w| w.count_ones() as u64).sum()
 }
 
 /// The set bits of `words`, which are left all zero.
