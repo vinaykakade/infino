@@ -527,6 +527,15 @@ struct ProbeScratch {
     /// counting every word before it.
     prefix: Vec<u32>,
     prefix_block: usize,
+    /// Membership probes asked of packed block `probed_block` so far; the
+    /// block's doc span is marked in `members` (bit 0 at `members_base`)
+    /// once they reach [`MEMBER_BITMAP_MIN_PROBES`], for block
+    /// `members_block`.
+    probes: u32,
+    probed_block: usize,
+    members: Vec<u64>,
+    members_base: u32,
+    members_block: usize,
 }
 
 impl Default for ProbeScratch {
@@ -535,9 +544,21 @@ impl Default for ProbeScratch {
             ranks: Vec::new(),
             prefix: Vec::new(),
             prefix_block: NO_BLOCK,
+            probes: 0,
+            probed_block: NO_BLOCK,
+            members: Vec::new(),
+            members_base: 0,
+            members_block: NO_BLOCK,
         }
     }
 }
+
+/// Membership probes into one packed block from which it is marked in a
+/// bitmap rather than bisected: a few probes do not repay the marking.
+const MEMBER_BITMAP_MIN_PROBES: u32 = 4;
+
+/// Widest doc span, in 64-doc words, a packed block is marked over.
+const MEMBER_BITMAP_MAX_WORDS: usize = 1024;
 
 /// Targets in one bitset block at or above which the batch probe ranks them
 /// from a table of prefix popcounts built for the block.
@@ -1071,14 +1092,45 @@ impl TermCursor {
             if self.decoded_block != self.current_block {
                 self.decode_current_block();
             }
-            // A bisection, measured against a scan from the last probe's
-            // position: the driver's docs land far apart in another term's
-            // block, so the scan's steps cost more than the halvings here
-            // (the opposite of the tf probe's dense completion pass).
-            self.block_doc_ids[..self.block_n]
-                .binary_search(&doc)
-                .is_ok()
+            self.packed_contains(doc)
         }
+    }
+
+    /// [`Self::contains`] on the decoded packed current block. A bisection,
+    /// measured against a scan from the last probe's position: the driver's
+    /// docs land far apart in another term's block, so the scan's steps cost
+    /// more than the halvings. A block asked about again and again (a
+    /// negation checked at most of a common term's docs) has its doc span
+    /// marked in a bitmap once, and each later probe is one bit test.
+    fn packed_contains(&mut self, doc: u32) -> bool {
+        let block = self.current_block;
+        let ids = &self.block_doc_ids[..self.block_n];
+        let sc = &mut self.scratch;
+        if sc.members_block != block {
+            if sc.probed_block != block {
+                sc.probed_block = block;
+                sc.probes = 0;
+            }
+            sc.probes += 1;
+            let (first, last) = (ids[0], ids[ids.len() - 1]);
+            let base = first & !63;
+            let words = ((last - base) / 64) as usize + 1;
+            if sc.probes < MEMBER_BITMAP_MIN_PROBES || words > MEMBER_BITMAP_MAX_WORDS {
+                return ids.binary_search(&doc).is_ok();
+            }
+            sc.members.clear();
+            sc.members.resize(words, 0);
+            for &d in ids {
+                let local = d - base;
+                sc.members[(local >> 6) as usize] |= 1u64 << (local & 63);
+            }
+            sc.members_base = base;
+            sc.members_block = block;
+        }
+        let local = doc.wrapping_sub(sc.members_base);
+        sc.members
+            .get((local >> 6) as usize)
+            .is_some_and(|w| (w >> (local & 63)) & 1 == 1)
     }
 
     /// Keep, in place, the docs of the ascending list `docs` that this term
