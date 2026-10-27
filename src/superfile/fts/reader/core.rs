@@ -2718,6 +2718,31 @@ fn check_version(version: u32) -> Result<(), FtsError> {
 #[cfg(test)]
 mod tests {
 
+    /// A fold that panics part-way leaves its per-thread bitsets marked, and
+    /// the next fold on the thread still starts from all zero, for one
+    /// bitset or two and whatever size each asks for.
+    #[test]
+    fn a_fold_after_a_panicked_one_starts_from_clear_bitsets() {
+        const WORDS: usize = 64;
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            with_fold_bitsets(WORDS, |a, b| {
+                a.fill(u64::MAX);
+                b.fill(u64::MAX);
+                panic!("a fold fails part-way");
+            })
+        }));
+        assert!(panicked.is_err());
+        with_fold_bitset(WORDS / 2, |a| {
+            assert!(a.iter().all(|&w| w == 0), "the first bitset is cleared");
+        });
+        with_fold_bitsets(WORDS, |a, b| {
+            assert!(
+                a.iter().chain(b.iter()).all(|&w| w == 0),
+                "both bitsets are cleared at their full size"
+            );
+        });
+    }
+
     /// What the writer stores for a column's norms must be exactly what the
     /// reader used to derive from its lengths. The scorer indexes the buckets
     /// and divides by the totals, so a writer that disagreed with the old
@@ -2894,6 +2919,7 @@ mod tests {
     }
     use std::{
         collections::{HashMap, HashSet},
+        panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Mutex,
             atomic::{AtomicBool, Ordering},

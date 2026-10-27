@@ -20,7 +20,7 @@ use super::{
     metadata::NormTable,
     options::BoolMode,
     phrase::AnyCursor,
-    scorers::{BUFFERED_TOPK_MIN_K, score_postings},
+    scorers::{BUFFERED_TOPK_MIN_K, kth_scored, score_postings},
     sink::{Collector, LiveFloor, TopKBuffer, TopKEntry, and_heap_push, drain_top_k_desc},
     work::{
         MatchWork, atom_cursor_bytes, atom_planned_ranges, term_cursor_bytes, term_cursor_ranges,
@@ -141,12 +141,13 @@ mod seed {
     pub const MAX_BLOCKS_SEED: usize = 2048;
 }
 
-/// Seed-block count for top-k `k`: about `0.6·k`, clamped. The best
-/// blocks often hold more than one top-k doc each, so half a block per doc
-/// already puts the seed's k-th close to the final one; the blocks past that
-/// cost more to decode than the walk saves (measured: a block per doc, or a
-/// quarter of one, both decode more in total than half). Saturating so a
-/// merge caller's huge `k` clamps to the cap rather than overflowing.
+/// Seed-block count for top-k `k`: `(k + k/4) / 2`, a little over half a
+/// block per top-k doc, clamped. The best blocks often hold more than one
+/// top-k doc each, so about half a block per doc already puts the seed's
+/// k-th close to the final one; the blocks past that cost more to decode
+/// than the walk saves (measured: a block per doc, or a quarter of one, both
+/// decode more in total than half). Saturating so a merge caller's huge `k`
+/// clamps to the cap rather than overflowing.
 pub(super) fn seed_blocks_for(k: usize) -> usize {
     (k.saturating_add(k / 4) / 2).clamp(seed::MIN_BLOCKS_SEED, seed::MAX_BLOCKS_SEED)
 }
@@ -1774,32 +1775,23 @@ impl SeedBlocks<'_> {
     /// The `k`-th best score over the blocks' docs, scored eight at a time
     /// into `coll`, or `NEG_INFINITY` when they hold fewer than `k` docs
     /// above the floor: only a full `k` bounds the walk's `k`-th from below.
-    fn kth<C: Collector>(&self, mut coll: C) -> f32 {
-        let (mut buf_d, mut buf_t) = ([0u32; BLOCK_LEN], [0u32; BLOCK_LEN]);
-        let mut scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
-        let mut bar = f32::NEG_INFINITY;
-        for &(_, bi) in self.blocks {
-            let range = self.term_meta.block_range_in_term(self.postings, bi, None);
-            let bytes = &self.postings[range.start..range.end];
-            let hdr = BlockHeader::parse(bytes, self.term_meta.prev_last_doc_id(self.postings, bi));
-            let n = decode_block(bytes, &hdr, &mut buf_d, &mut buf_t);
-            score_postings(
-                self.idf_weight,
-                &buf_d[..n],
-                &buf_t[..n],
-                self.dl_norm_k1,
-                &mut scores,
-            );
-            for (&doc, &score) in buf_d[..n].iter().zip(&scores) {
-                if score > self.floor_eff {
-                    coll.offer(self.k, &mut bar, score, doc);
-                }
-            }
-        }
-        match coll.into_sorted().get(self.k.wrapping_sub(1)) {
-            Some(&(_, kth)) => kth,
-            None => f32::NEG_INFINITY,
-        }
+    fn kth<C: Collector>(&self, coll: C) -> f32 {
+        let mut blocks = self.blocks.iter();
+        kth_scored(
+            coll,
+            self.k,
+            self.floor_eff,
+            self.idf_weight,
+            self.dl_norm_k1,
+            |buf_d, buf_t| {
+                let &(_, bi) = blocks.next()?;
+                let range = self.term_meta.block_range_in_term(self.postings, bi, None);
+                let bytes = &self.postings[range.start..range.end];
+                let hdr =
+                    BlockHeader::parse(bytes, self.term_meta.prev_last_doc_id(self.postings, bi));
+                Some(decode_block(bytes, &hdr, buf_d, buf_t))
+            },
+        )
     }
 }
 

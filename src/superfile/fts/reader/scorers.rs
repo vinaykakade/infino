@@ -546,6 +546,36 @@ pub(super) fn pruning_bar(bar: f32, terms: usize) -> f32 {
     }
 }
 
+/// The `k`-th best score over the docs `decode` yields block by block — it
+/// fills the two buffers and returns how many docs, `None` when done —
+/// scored eight at a time into `coll`, counting only docs above `floor`.
+/// `NEG_INFINITY` when they hold fewer than `k` such docs: only a full `k`
+/// bounds a walk's `k`-th from below.
+pub(super) fn kth_scored<C: Collector>(
+    mut coll: C,
+    k: usize,
+    floor: f32,
+    idf_weight: f32,
+    dl_norm: &NormTable,
+    mut decode: impl FnMut(&mut [u32; BLOCK_LEN], &mut [u32; BLOCK_LEN]) -> Option<usize>,
+) -> f32 {
+    let (mut ids, mut tfs) = ([0u32; BLOCK_LEN], [0u32; BLOCK_LEN]);
+    let mut scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+    let mut bar = f32::NEG_INFINITY;
+    while let Some(n) = decode(&mut ids, &mut tfs) {
+        score_postings(idf_weight, &ids[..n], &tfs[..n], dl_norm, &mut scores);
+        for (&doc, &score) in ids[..n].iter().zip(&scores) {
+            if score > floor {
+                coll.offer(k, &mut bar, score, doc);
+            }
+        }
+    }
+    match coll.into_sorted().get(k.wrapping_sub(1)) {
+        Some(&(_, kth)) => kth,
+        None => f32::NEG_INFINITY,
+    }
+}
+
 /// `k` from which a multi-term union starts its bar at [`union_seed`]: at a
 /// smaller `k` the bar rises within the first windows anyway.
 pub(super) const UNION_SEED_MIN_K: usize = 64;
@@ -569,8 +599,8 @@ const UNION_SEED_MAX_BLOCKS: usize = 4096;
 /// term qualifies.
 ///
 /// A lone term (what a split leaves of a union) is seeded as the single-term
-/// walk seeds one: from about a block per top-k doc, however long its list,
-/// as its top `k` spreads across that many blocks and fewer give a loose bar.
+/// walk seeds one, from the [`seed_blocks_for`] best blocks however long its
+/// list.
 pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) -> f32 {
     let lone = cursors.len() == 1;
     let mut seed = f32::NEG_INFINITY;
@@ -622,22 +652,19 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
                 })
             }
             true => {
-                let mut best = <TopKBuffer as Collector>::with_capacity(k, k);
-                let mut bar = f32::NEG_INFINITY;
-                for &b in &order[..need] {
-                    let n = c.decode_block_into(b, &mut ids, &mut tfs);
-                    score_postings(
-                        c.idf_weight,
-                        &ids[..n],
-                        &tfs[..n],
-                        dl_norm,
-                        &mut block_scores,
-                    );
-                    for (&doc, &score) in ids[..n].iter().zip(&block_scores) {
-                        best.offer(k, &mut bar, score, doc);
-                    }
-                }
-                best.into_sorted().get(k - 1).map(|&(_, kth)| kth)
+                // The blocks hold at most `need` × `BLOCK_LEN` docs, which
+                // bounds the buffer however large `k` is.
+                let cap = k.min(need.saturating_mul(BLOCK_LEN));
+                let mut blocks = order[..need].iter();
+                let kth = kth_scored(
+                    <TopKBuffer as Collector>::with_capacity(k, cap),
+                    k,
+                    f32::NEG_INFINITY,
+                    c.idf_weight,
+                    dl_norm,
+                    |ids, tfs| blocks.next().map(|&b| c.decode_block_into(b, ids, tfs)),
+                );
+                (kth > f32::NEG_INFINITY).then_some(kth)
             }
         };
         if let Some(kth) = kth {
@@ -1260,7 +1287,9 @@ fn mark_lanes<const N: usize>(
 }
 
 /// Whether any of `scores` is above `threshold`, compared lane-wise eight at
-/// a time so it vectorizes (a running `max` over floats does not).
+/// a time so it vectorizes; a running `max` over floats does not, as
+/// `f32::max` cannot be reassociated.
+#[inline(always)]
 fn any_beats(scores: &[f32], threshold: f32) -> bool {
     let mut hit = [0u32; 8];
     let mut chunks = scores.chunks_exact(8);
@@ -1273,22 +1302,15 @@ fn any_beats(scores: &[f32], threshold: f32) -> bool {
 }
 
 /// Whether any of one presence word's 64 window slots scores above
-/// `threshold`. Compared lane-wise eight at a time so it vectorizes; a
-/// running `max` over floats does not, as `f32::max` cannot be reassociated.
-/// Slots hold non-negative scores and the bar is never negative, so this is
-/// exactly "the word's best slot beats the bar".
+/// `threshold`: [`any_beats`] over a length fixed at compile time, so the
+/// lanes unroll with no tail. Slots hold non-negative scores and the bar is
+/// never negative, so this is exactly "the word's best slot beats the bar".
 #[inline(always)]
 fn word_beats(slots: &[f32], threshold: f32) -> bool {
     let slots: &[f32; 64] = slots
         .try_into()
         .expect("invariant: a presence word spans 64 slots");
-    let mut hit = [0u32; 8];
-    for chunk in slots.chunks_exact(8) {
-        for (h, &x) in hit.iter_mut().zip(chunk) {
-            *h |= u32::from(x > threshold);
-        }
-    }
-    hit.iter().fold(0, |a, &h| a | h) != 0
+    any_beats(slots, threshold)
 }
 
 /// Add `c`'s current posting into a union window whose slot 0 is doc
@@ -1483,8 +1505,11 @@ unsafe fn accumulate_run_avx512(
 /// bounds and drain for a sliver of doc ids.
 const BLOCK_WINDOW_MAX_ESSENTIALS: usize = 2;
 
-/// Smallest `k` at which the windowed MaxScore kernel collects into a
-/// buffer rather than a heap.
+/// Smallest `k` at which a top-k walk collects into a buffer rather than a
+/// heap. It marks where a `k` is large in general: the bar rises slowly
+/// there, so the choices that pay only for a fast-rising bar — a union window
+/// ending at a block boundary ([`BLOCK_WINDOW_MAX_ESSENTIALS`]), the must-led
+/// walk probing its strongest optional term first — stop below it.
 pub(super) const BUFFERED_TOPK_MIN_K: usize = 512;
 
 /// Most optional terms the required-term walk takes; a wider list keeps
@@ -3795,14 +3820,17 @@ impl FtsReader {
         Ok(drain_top_k_desc(heap))
     }
 
-    /// Multi-term OR dispatch. At a small `k`, with no negation and no floor,
-    /// a union with a rare term first tries the rare-led walks
+    /// Multi-term OR dispatch. With no negation and no floor, a union with a
+    /// rare term — much rarer than the others at a small `k`, or under `k`
+    /// documents at any `k` — first tries the rare-led walks
     /// ([`Self::rare_led_pair`] for two terms, [`Self::rare_led`] for more):
     /// they rank the rare term's documents directly and either finish, hand
     /// back a seed for the bar, or hand the rest to [`Self::rare_split`]. A
     /// 2-term pair the rare-led walk declines goes to WAND+BMW
-    /// ([`Self::run_wand_bmw`]). Everything else runs the windowed MaxScore
-    /// kernel ([`Self::run_windowed_maxscore`]).
+    /// ([`Self::run_wand_bmw`]) where its df ratio and `k` qualify it.
+    /// Everything else runs the windowed MaxScore kernel
+    /// ([`Self::run_windowed_maxscore`]), its bar started at the
+    /// [`union_seed`] when nothing filters or floors it.
     ///
     /// The per-candidate MaxScore+BMM ([`Self::run_max_score_bmm`]), the plain
     /// windowed OR-sum ([`Self::run_windowed_union`]), and the exhaustive walk
@@ -3848,14 +3876,14 @@ impl FtsReader {
             match self.rare_led_pair(column_id, &cursors, k) {
                 Ok(hits) => Ok(hits),
                 Err(RareLedFallback::Seed(seed)) => {
-                    self.run_windowed_maxscore(column_id, cursors, k, None, seed, 0, u32::MAX)
+                    self.run_seeded_union(column_id, cursors, k, seed)
                 }
                 Err(RareLedFallback::Split { rare, hits }) => {
                     self.rare_split(column_id, cursors, rare, hits, k)
                 }
                 Err(RareLedFallback::Walk) if wand_pair => self.run_wand_bmw(column_id, cursors, k),
                 Err(RareLedFallback::Walk) => {
-                    self.run_windowed_maxscore(column_id, cursors, k, None, floor_eff, 0, u32::MAX)
+                    self.run_seeded_union(column_id, cursors, k, f32::NEG_INFINITY)
                 }
             }
         } else {
@@ -3875,12 +3903,31 @@ impl FtsReader {
                     Err(RareLedFallback::Walk) => {}
                 }
             }
-            if k >= UNION_SEED_MIN_K && filter.is_none() && no_floor {
-                let dl_norm_k1 = self.columns[column_id as usize].dl_norm_k1();
-                floor = floor.max(union_seed(&cursors, k, dl_norm_k1));
+            match filter.is_none() && no_floor {
+                true => self.run_seeded_union(column_id, cursors, k, floor),
+                false => {
+                    self.run_windowed_maxscore(column_id, cursors, k, filter, floor, 0, u32::MAX)
+                }
             }
-            self.run_windowed_maxscore(column_id, cursors, k, filter, floor, 0, u32::MAX)
         }
+    }
+
+    /// The windowed MaxScore walk of a union nothing filters, its bar
+    /// started at the larger of `bar` (a rare-led seed, or `NEG_INFINITY`)
+    /// and, from [`UNION_SEED_MIN_K`], the [`union_seed`]. Both are lower
+    /// bounds on the true `k`-th best, so neither prunes a top-`k` doc.
+    fn run_seeded_union(
+        &self,
+        column_id: u32,
+        cursors: Vec<TermCursor>,
+        k: usize,
+        mut bar: f32,
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
+        if k >= UNION_SEED_MIN_K {
+            let dl_norm_k1 = self.columns[column_id as usize].dl_norm_k1();
+            bar = bar.max(union_seed(&cursors, k, dl_norm_k1));
+        }
+        self.run_windowed_maxscore(column_id, cursors, k, None, bar, 0, u32::MAX)
     }
 
     /// The top `k` of a union whose rare term (cursor `rare`) holds fewer than
@@ -5832,10 +5879,12 @@ mod tests {
     }
 
     /// A union at a `k` the seed serves ranks as the unpruned exhaustive walk
-    /// does: the seeded bar never drops a doc of the top `k`. One shape where
-    /// the seed is tight — a common term with a rare one, so the union's `k`-th
-    /// best is the common term's own — and one with a stopword and overlapping
-    /// terms, where it sits well below.
+    /// does, doc for doc: the seeded bar never drops a doc of the top `k`. One
+    /// shape where the seed is tight — a common term with a less common one,
+    /// so the union's `k`-th best is mostly the common term's own — and one
+    /// with a stopword and overlapping terms, where it sits well below. At
+    /// `k` = 2,000 the less common term holds fewer than `k` docs, so the pair
+    /// is split instead and the lone common term is seeded.
     #[tokio::test]
     async fn seeded_large_k_union_agrees_with_the_exhaustive_walk() {
         let mut b = FtsBuilder::new();
@@ -5862,7 +5911,7 @@ mod tests {
         }
         let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-        for terms in [&["mid", "few"][..], &["stop", "mid", "rare"]] {
+        for terms in [&["mid", "rare"][..], &["stop", "mid", "rare"]] {
             for k in [UNION_SEED_MIN_K, 1_000, 2_000] {
                 let got = r
                     .search("body", terms, k, BoolMode::Or)
@@ -5874,6 +5923,7 @@ mod tests {
                     .expect("exhaustive");
                 assert_eq!(got.len(), want.len(), "{terms:?} k {k}");
                 for ((dg, sg), (dw, sw)) in got.iter().zip(&want) {
+                    assert_eq!(dg.get(), dw.get(), "{terms:?} k {k}: {sg} vs {sw}");
                     assert!(
                         (sg - sw).abs() < 1e-4,
                         "{terms:?} k {k}: {dg:?} {sg} vs {dw:?} {sw}"
@@ -5886,7 +5936,7 @@ mod tests {
     /// A union with a term holding fewer than `k` documents, at a `k` far
     /// past the small-`k` routes: the rare term is split off and its
     /// documents merged with the other terms ranked alone, which must rank as
-    /// the exhaustive walk does, for a pair and for three terms.
+    /// the exhaustive walk does, doc for doc, for a pair and for three terms.
     #[tokio::test]
     async fn a_union_with_a_term_under_k_documents_agrees_with_the_exhaustive_walk() {
         let mut b = FtsBuilder::new();
@@ -5925,6 +5975,7 @@ mod tests {
                     .expect("exhaustive");
                 assert_eq!(got.len(), want.len(), "{terms:?} k {k}");
                 for ((dg, sg), (dw, sw)) in got.iter().zip(&want) {
+                    assert_eq!(dg.get(), dw.get(), "{terms:?} k {k}: {sg} vs {sw}");
                     assert!(
                         (sg - sw).abs() < 1e-4,
                         "{terms:?} k {k}: {dg:?} {sg} vs {dw:?} {sw}"

@@ -199,7 +199,9 @@ where
 /// a spawned task runs `f` inline, as no runtime worker waits under it and
 /// the hop to a pool thread and back would only add a wake-up to the
 /// caller's latency. A spawned task still hands `f` to the pool, so no
-/// runtime worker ever blocks under the compute.
+/// runtime worker ever blocks under the compute. Futures joined under one
+/// `block_on` share its thread, so their kernels run one after another
+/// there; a caller wanting them in parallel spawns them.
 pub(crate) async fn run_on_pool_unless_blocking<R, F>(
     pool: Option<&ThreadPool>,
     what: &'static str,

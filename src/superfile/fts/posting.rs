@@ -82,7 +82,10 @@ use bitpacking::{BitPacker, BitPacker4x};
 use wide::u32x8;
 
 use crate::{
-    superfile::bits::{ExceptionPlan, PackScratch, expand_bitset, plan_exceptions},
+    superfile::bits::{
+        EXPAND_SLACK, ExceptionPlan, PackScratch, expand_bitset, expand_bitset_scalar,
+        plan_exceptions,
+    },
     utils::varint::{CONTINUATION_BIT, push_varint, read_varint, varint_len},
 };
 
@@ -891,9 +894,6 @@ pub fn dense_tf_at(bytes: &[u8], hdr: &BlockHeader, rank: usize) -> u32 {
     (v & ((1u64 << width) - 1)) as u32 + u32::from(hdr.tf_bias)
 }
 
-/// Set bits a bitset block's expansion writes per step.
-const EXPAND_STEP: usize = 8;
-
 /// Decode only the doc ids of a block into `dest_doc_ids`, skipping the
 /// tf half. Returns the block's doc count. The unranked count kernels
 /// never read a tf, so they take this instead of [`decode_block`].
@@ -949,37 +949,19 @@ pub fn decode_block_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut 
         //      any block is decoded, so a corrupted bitmap — which could carry
         //      extra set bits — is rejected at open and never reaches here.
         // The `debug_assert_eq!(j, count)` below is the test/debug tripwire that
-        // fires if a future builder change ever breaks invariant 1. This bound
-        // depends on invariant 2: if a path is ever added that decodes blocks
-        // before validating their CRC, a `j < BLOCK_LEN` bound becomes mandatory.
-        // Each word's set bits are written a step of `EXPAND_STEP` at a time,
-        // whatever the word holds: a step writes past the word's last bit into
-        // slack the next word or the copy out overwrites, so the only branch
-        // is the step count, not one exit per set bit, which the predictor
-        // misses once a word. The last step overruns the block's docs by at
-        // most `EXPAND_STEP - 1` slots.
-        if let Some(j) = expand_bitset(words, hdr.base, dest_doc_ids) {
-            debug_assert_eq!(j, count, "bitset set-bit count must equal doc_count");
-            return count;
-        }
-        let mut out = [0u32; BLOCK_LEN + EXPAND_STEP];
-        let mut j = 0usize;
-        for (wi, chunk) in words.chunks_exact(8).enumerate() {
-            let mut word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
-            let at = hdr.base.wrapping_add(wi as u32 * 64);
-            let n = word.count_ones() as usize;
-            let mut done = 0usize;
-            while done < n {
-                for slot in &mut out[j + done..j + done + EXPAND_STEP] {
-                    *slot = at.wrapping_add(word.trailing_zeros());
-                    word &= word.wrapping_sub(1);
-                }
-                done += EXPAND_STEP;
+        // fires if a future builder change ever breaks invariant 1. Both
+        // expansions bound their writes themselves (a corrupt block panics
+        // rather than overruns), so invariant 2 keeps that panic unreachable.
+        let j = match expand_bitset(words, hdr.base, dest_doc_ids) {
+            Some(j) => j,
+            None => {
+                let mut out = [0u32; BLOCK_LEN + EXPAND_SLACK];
+                let j = expand_bitset_scalar(words, hdr.base, &mut out);
+                dest_doc_ids[..count].copy_from_slice(&out[..count]);
+                j
             }
-            j += n;
-        }
+        };
         debug_assert_eq!(j, count, "bitset set-bit count must equal doc_count");
-        dest_doc_ids[..count].copy_from_slice(&out[..count]);
         return count;
     }
 
