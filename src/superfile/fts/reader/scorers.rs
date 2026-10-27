@@ -267,27 +267,26 @@ pub(super) fn score_postings(
     out: &mut Vec<f32>,
 ) {
     debug_assert_eq!(docs.len(), tfs.len());
+    // Sized once and written in place: appending eight scores at a time paid
+    // a capacity check and a copy per group.
     out.clear();
-    let mut i = 0usize;
-    while i + 8 <= docs.len() {
-        let dids: [u32; 8] = docs[i..i + 8]
-            .try_into()
-            .expect("invariant: an 8-wide slice");
-        let tf8: [u32; 8] = tfs[i..i + 8]
-            .try_into()
-            .expect("invariant: an 8-wide slice");
-        out.extend_from_slice(&bm25::score_one_term_x8(
+    out.resize(docs.len(), 0.0);
+    let groups = docs.chunks_exact(8).zip(tfs.chunks_exact(8));
+    for ((d8, t8), o8) in groups.zip(out.chunks_exact_mut(8)) {
+        let dids: [u32; 8] = d8.try_into().expect("invariant: an 8-wide chunk");
+        let tf8: [u32; 8] = t8.try_into().expect("invariant: an 8-wide chunk");
+        o8.copy_from_slice(&bm25::score_one_term_x8(
             idf_weight,
             tf8,
             dl_norm.get8(dids),
         ));
-        i += 8;
     }
-    for (&d, &tf) in docs[i..].iter().zip(&tfs[i..]) {
-        out.push(match tf {
+    let i = docs.len() / 8 * 8;
+    for ((&d, &tf), o) in docs[i..].iter().zip(&tfs[i..]).zip(&mut out[i..]) {
+        *o = match tf {
             0 => 0.0,
             _ => bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm.get(d)),
-        });
+        };
     }
 }
 
