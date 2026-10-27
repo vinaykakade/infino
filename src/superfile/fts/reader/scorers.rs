@@ -1494,10 +1494,14 @@ unsafe fn accumulate_run_avx512(
             }
             let (word, bit) = (first >> 6, first & 63);
             present[word] |= u64::from(mask) << bit;
-            // A mask starting past bit 48 reaches into the next word, which
-            // exists: the run ends inside the window.
-            if bit > 48 {
-                present[word + 1] |= u64::from(mask) >> (64 - bit);
+            // A mask starting past bit 48 may reach into the next word; when
+            // it does, that word holds one of the run's docs, so it exists.
+            let spill = match bit {
+                0 => 0,
+                _ => u64::from(mask) >> (64 - bit),
+            };
+            if spill != 0 {
+                present[word + 1] |= spill;
             }
         } else {
             let contributions = bm25::score_one_term_x8(idf_weight, tf8, dl_norm_k1.get8(dids));
