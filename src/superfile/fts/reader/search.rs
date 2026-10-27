@@ -147,7 +147,7 @@ mod seed {
 /// doc; decoding past that is pure cost, so target just enough (the `k/4`
 /// slack absorbs blocks that hold more than one top doc). Saturating so a
 /// merge caller's huge `k` clamps to the cap rather than overflowing.
-fn seed_blocks_for(k: usize) -> usize {
+pub(super) fn seed_blocks_for(k: usize) -> usize {
     k.saturating_add(k / 4)
         .clamp(seed::MIN_BLOCKS_SEED, seed::MAX_BLOCKS_SEED)
 }
