@@ -79,6 +79,34 @@ pub(super) struct PhraseMember {
 /// Sentinel for [`PhraseMember::group_block`]: no block located.
 const NO_BLOCK_CACHED: usize = usize::MAX;
 
+/// Candidates a signature check sees before it is judged: from then on,
+/// one that has rejected fewer than one in [`SIG_KEEP_RATIO`] of them is
+/// dropped for the rest of the walk. A common word's signature is often saturated (it is
+/// followed by most words somewhere in a long doc), and reading it then
+/// costs a load per candidate and rejects nothing.
+const SIG_TRIAL: u64 = 2048;
+/// See [`SIG_TRIAL`].
+const SIG_KEEP_RATIO: u64 = 16;
+
+/// One adjacency-signature check of a [`PhraseCursor`]: a candidate whose
+/// signature for `member` lacks `bit` cannot hold the phrase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SigCheck {
+    member: usize,
+    bit: u8,
+    /// Candidates checked and rejected so far.
+    checked: u64,
+    rejected: u64,
+}
+
+impl SigCheck {
+    /// Whether the check is still worth a load per candidate: untried
+    /// yet, or rejecting at least one candidate in [`SIG_KEEP_RATIO`].
+    fn earns_its_load(&self) -> bool {
+        self.checked < SIG_TRIAL || self.rejected * SIG_KEEP_RATIO >= self.checked
+    }
+}
+
 impl PhraseMember {
     /// The member's positions at its cursor's current doc, decoded
     /// into `pos_scratch`. The cursor must be positioned on a doc
@@ -329,14 +357,15 @@ pub(super) struct PhraseCursor {
     cand_locs: Vec<Vec<(u32, u32)>>,
     /// Scratch: which candidates a member's filter kept.
     kept: Vec<u32>,
-    /// `(m, bit)` per query position of member `m` whose successor sits
+    /// One check per query position of a member `m` whose successor sits
     /// one position after it: a candidate whose signature for member `m`
     /// lacks `bit`, the successor's
     /// [`next_bit`](crate::superfile::fts::positions::next_bit), cannot
     /// hold the phrase. Positions whose gap a removed stopword widened are
     /// absent: what follows them in a match is the hole, not the successor.
-    /// So are inline members, which carry no signature.
-    adjacent_sigs: Vec<(usize, u8)>,
+    /// So are inline members, which carry no signature. A check that
+    /// seldom rejects is dropped (see [`SIG_TRIAL`]).
+    adjacent_sigs: Vec<SigCheck>,
     /// Where the next block refill starts: one past the last block
     /// batched. `None` once the driver's last block is batched.
     refill_from: Option<u32>,
@@ -436,10 +465,15 @@ impl PhraseCursor {
             .collect();
         // Each query-adjacent pair checks its first member's signature for
         // the second's bit; a repeated term's pairs are checked once.
-        let mut adjacent_sigs: Vec<(usize, u8)> = (0..member_at.len() - 1)
+        let mut adjacent_sigs: Vec<SigCheck> = (0..member_at.len() - 1)
             .filter(|&q| offsets[q + 1] == offsets[q] + 1)
-            .map(|q| (member_at[q], next_bits[member_at[q + 1]]))
-            .filter(|&(m, _)| members[m].inline_position.is_none())
+            .map(|q| SigCheck {
+                member: member_at[q],
+                bit: next_bits[member_at[q + 1]],
+                checked: 0,
+                rejected: 0,
+            })
+            .filter(|check| members[check.member].inline_position.is_none())
             .collect();
         adjacent_sigs.sort_unstable();
         adjacent_sigs.dedup();
@@ -758,14 +792,19 @@ impl PhraseCursor {
         if self.adjacent_sigs.is_empty() || self.cands.is_empty() {
             return;
         }
-        let (members, locs, pairs) = (&mut self.members, &self.cand_locs, &self.adjacent_sigs);
+        let (members, locs, checks) = (&mut self.members, &self.cand_locs, &mut self.adjacent_sigs);
         self.kept.clear();
         self.kept.extend((0..self.cands.len() as u32).filter(|&c| {
-            pairs.iter().all(|&(i, bit)| {
-                let (b, p) = locs[i][c as usize];
-                members[i].located_sig(b as usize, p as usize) & bit != 0
+            checks.iter_mut().all(|check| {
+                let (b, p) = locs[check.member][c as usize];
+                let sig = members[check.member].located_sig(b as usize, p as usize);
+                check.checked += 1;
+                let pass = sig & check.bit != 0;
+                check.rejected += u64::from(!pass);
+                pass
             })
         }));
+        checks.retain(SigCheck::earns_its_load);
         if self.kept.len() == self.cands.len() {
             return;
         }
@@ -1892,6 +1931,21 @@ mod tests {
             sig_rejects(walk_phrase(&unsigned, terms, &expected)).await,
             0
         );
+    }
+
+    #[test]
+    fn a_signature_check_that_seldom_rejects_is_dropped_after_its_trial() {
+        let check = |checked, rejected| SigCheck {
+            member: 0,
+            bit: 1,
+            checked,
+            rejected,
+        };
+        assert!(check(SIG_TRIAL - 1, 0).earns_its_load(), "still on trial");
+        assert!(!check(SIG_TRIAL, 0).earns_its_load(), "never rejects");
+        let floor = SIG_TRIAL / SIG_KEEP_RATIO;
+        assert!(check(SIG_TRIAL, floor).earns_its_load(), "at the ratio");
+        assert!(!check(SIG_TRIAL, floor - 1).earns_its_load(), "below it");
     }
 
     /// Members a removed stopword holds apart are not checked by signature:
