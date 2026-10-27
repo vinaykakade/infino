@@ -82,7 +82,7 @@ use bitpacking::{BitPacker, BitPacker4x};
 use wide::u32x8;
 
 use crate::{
-    superfile::bits::{ExceptionPlan, PackScratch, plan_exceptions},
+    superfile::bits::{ExceptionPlan, PackScratch, expand_bitset, plan_exceptions},
     utils::varint::{CONTINUATION_BIT, push_varint, read_varint, varint_len},
 };
 
@@ -958,13 +958,7 @@ pub fn decode_block_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut 
         // is the step count, not one exit per set bit, which the predictor
         // misses once a word. The last step overruns the block's docs by at
         // most `EXPAND_STEP - 1` slots.
-        #[cfg(target_arch = "x86_64")]
-        if std::arch::is_x86_feature_detected!("avx512f") {
-            // SAFETY: AVX-512F is present (checked above), the one
-            // precondition of the expansion; it bounds its own stores.
-            let j = unsafe {
-                crate::superfile::bits::expand_bitset_avx512(words, hdr.base, dest_doc_ids)
-            };
+        if let Some(j) = expand_bitset(words, hdr.base, dest_doc_ids) {
             debug_assert_eq!(j, count, "bitset set-bit count must equal doc_count");
             return count;
         }
