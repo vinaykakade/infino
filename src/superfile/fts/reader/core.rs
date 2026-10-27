@@ -26,6 +26,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::future::join;
+use rayon::current_thread_index;
 use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 use tokio::sync::OnceCell;
@@ -2394,11 +2395,12 @@ thread_local! {
     };
 }
 
-/// Most words of fold bitsets a thread keeps between queries. A thread keeps
-/// only what the largest superfile it counted needed — an eighth of a byte
-/// per doc — so this bounds the rare outsized one: 64M docs, 8 MiB a bitset,
-/// covers a default-sized superfile of docs down to about 16 bytes each. A
-/// superfile past it allocates its bitsets per count instead.
+/// Most words of fold bitsets a reader-pool thread keeps between queries. A
+/// thread keeps only what the largest superfile it counted needed — an
+/// eighth of a byte per doc — so this bounds the rare outsized one: 64M
+/// docs, 8 MiB a bitset, covers a default-sized superfile of docs down to
+/// about 16 bytes each. A superfile past it allocates its bitsets per count
+/// instead.
 const FOLD_BITSETS_KEEP_WORDS: usize = 1 << 20;
 
 /// Run `f` over one all-zero doc-space bitset of `words` words, which it must
@@ -2409,9 +2411,11 @@ fn with_fold_bitset<R>(words: usize, f: impl FnOnce(&mut [u64]) -> R) -> R {
 
 /// Run `f` over two all-zero doc-space bitsets of `words` words, which it
 /// must leave all zero (a fold reads its result with
-/// [`popcount_and_clear`]). They are kept per thread, so a count neither
-/// allocates nor clears a corpus-sized bitset before it starts; a count that
-/// panicked part-way leaves them marked, and the next clears them first.
+/// [`popcount_and_clear`]). A reader-pool thread keeps them, so a count there
+/// neither allocates nor clears a corpus-sized bitset before it starts; a
+/// count that panicked part-way leaves them marked, and the next clears them
+/// first. Any other thread — a caller's, which may be one of many and live
+/// long — allocates them per count, so it holds nothing between queries.
 pub(super) fn with_fold_bitsets<R>(words: usize, f: impl FnOnce(&mut [u64], &mut [u64]) -> R) -> R {
     with_fold_sets(words, true, f)
 }
@@ -2420,7 +2424,7 @@ pub(super) fn with_fold_bitsets<R>(words: usize, f: impl FnOnce(&mut [u64], &mut
 /// [`with_fold_bitsets`]; the second is empty, and never grown, unless
 /// `both`.
 fn with_fold_sets<R>(words: usize, both: bool, f: impl FnOnce(&mut [u64], &mut [u64]) -> R) -> R {
-    if words > FOLD_BITSETS_KEEP_WORDS {
+    if words > FOLD_BITSETS_KEEP_WORDS || current_thread_index().is_none() {
         let mut b = if both { vec![0u64; words] } else { Vec::new() };
         return f(&mut vec![0u64; words], &mut b);
     }
@@ -2727,40 +2731,54 @@ fn check_version(version: u32) -> Result<(), FtsError> {
 #[cfg(test)]
 mod tests {
 
-    /// A fold that panics part-way leaves its per-thread bitsets marked, and
-    /// the next fold on the thread still starts from all zero, for one
-    /// bitset or two and whatever size each asks for.
+    /// On a reader-pool thread, a fold that panics part-way leaves the kept
+    /// bitsets marked, and the next fold there still starts from all zero,
+    /// for one bitset or two and whatever size each asks for; a superfile
+    /// past what the thread keeps folds over bitsets of its own. A thread off
+    /// the pool keeps nothing.
     #[test]
-    fn a_fold_after_a_panicked_one_starts_from_clear_bitsets() {
+    fn fold_bitsets_are_kept_clear_on_the_reader_pool_and_nowhere_else() {
         const WORDS: usize = 64;
-        let panicked = catch_unwind(AssertUnwindSafe(|| {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("one-thread pool");
+        pool.install(|| {
+            let panicked = catch_unwind(AssertUnwindSafe(|| {
+                with_fold_bitsets(WORDS, |a, b| {
+                    a.fill(u64::MAX);
+                    b.fill(u64::MAX);
+                    panic!("a fold fails part-way");
+                })
+            }));
+            assert!(panicked.is_err());
+            with_fold_bitset(WORDS / 2, |a| {
+                assert!(a.iter().all(|&w| w == 0), "the first bitset is cleared");
+            });
             with_fold_bitsets(WORDS, |a, b| {
-                a.fill(u64::MAX);
-                b.fill(u64::MAX);
-                panic!("a fold fails part-way");
-            })
-        }));
-        assert!(panicked.is_err());
-        with_fold_bitset(WORDS / 2, |a| {
-            assert!(a.iter().all(|&w| w == 0), "the first bitset is cleared");
+                assert!(
+                    a.iter().chain(b.iter()).all(|&w| w == 0),
+                    "both bitsets are cleared at their full size"
+                );
+            });
+            with_fold_bitsets(FOLD_BITSETS_KEEP_WORDS + 1, |a, b| {
+                assert_eq!(
+                    (a.len(), b.len()),
+                    (FOLD_BITSETS_KEEP_WORDS + 1, FOLD_BITSETS_KEEP_WORDS + 1)
+                );
+                assert!(a.iter().chain(b.iter()).all(|&w| w == 0));
+            });
+            FOLD_BITSETS
+                .with_borrow(|fb| assert_eq!(fb.a.len(), WORDS, "the kept bitsets did not grow"));
         });
-        with_fold_bitsets(WORDS, |a, b| {
-            assert!(
-                a.iter().chain(b.iter()).all(|&w| w == 0),
-                "both bitsets are cleared at their full size"
-            );
-        });
-        // A superfile past what a thread keeps folds over bitsets of its own,
-        // as clear, and the thread's stay at the size they were.
-        with_fold_bitsets(FOLD_BITSETS_KEEP_WORDS + 1, |a, b| {
+        with_fold_bitsets(WORDS, |a, b| a.len() + b.len());
+        FOLD_BITSETS.with_borrow(|fb| {
             assert_eq!(
-                (a.len(), b.len()),
-                (FOLD_BITSETS_KEEP_WORDS + 1, FOLD_BITSETS_KEEP_WORDS + 1)
+                fb.a.len() + fb.b.len(),
+                0,
+                "a thread off the pool keeps nothing"
             );
-            assert!(a.iter().chain(b.iter()).all(|&w| w == 0));
         });
-        FOLD_BITSETS
-            .with_borrow(|fb| assert_eq!(fb.a.len(), WORDS, "the kept bitsets did not grow"));
     }
 
     /// What the writer stores for a column's norms must be exactly what the
@@ -2950,6 +2968,7 @@ mod tests {
 
     use async_trait::async_trait;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use rayon::ThreadPoolBuilder;
     use tokio::{
         join, spawn,
         sync::Notify,
