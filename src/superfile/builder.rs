@@ -1759,32 +1759,29 @@ impl SuperfileBuilder {
             // band and re-raise after the walk (the sentinel `FtsError`
             // only stops iteration).
             let mut push_err: Option<BuildError> = None;
-            let walk =
-                fts.for_each_term_posting(column_id, |term, local_doc, tf, positions, sig| {
-                    let Some(out_doc) = remap[local_doc as usize] else {
-                        return Ok(());
-                    };
-                    let term_str = from_utf8(term).map_err(|_| {
-                        FtsError::Read(ReadError::Malformed(
-                            "non-utf8 term in FTS merge input".into(),
-                        ))
-                    })?;
-                    // `remap` already names the output blob's doc ids: the
-                    // reordering merge converts through the chosen order and
-                    // the arrival-order carries convert from the row, so
-                    // nothing is left to translate here. The signature rides
-                    // along: it describes the doc's other terms, which this
-                    // walk never sees.
-                    if let Err(e) = fb
-                        .add_prebuilt_term_posting(column_id, term_str, out_doc, tf, positions, sig)
-                    {
-                        push_err = Some(e);
-                        return Err(FtsError::Read(ReadError::Malformed(
-                            "prebuilt push aborted".into(),
-                        )));
-                    }
-                    Ok(())
-                });
+            let walk = fts.for_each_term_posting(column_id, |term, local_doc, tf, positions| {
+                let Some(out_doc) = remap[local_doc as usize] else {
+                    return Ok(());
+                };
+                let term_str = from_utf8(term).map_err(|_| {
+                    FtsError::Read(ReadError::Malformed(
+                        "non-utf8 term in FTS merge input".into(),
+                    ))
+                })?;
+                // `remap` already names the output blob's doc ids: the
+                // reordering merge converts through the chosen order and
+                // the arrival-order carries convert from the row, so
+                // nothing is left to translate here.
+                if let Err(e) =
+                    fb.add_prebuilt_term_posting(column_id, term_str, out_doc, tf, positions)
+                {
+                    push_err = Some(e);
+                    return Err(FtsError::Read(ReadError::Malformed(
+                        "prebuilt push aborted".into(),
+                    )));
+                }
+                Ok(())
+            });
             if let Some(e) = push_err {
                 return Err(e);
             }
@@ -4356,14 +4353,7 @@ fn escape_json(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cell::Cell,
-        collections::{BTreeMap, HashMap},
-        io::empty,
-        iter::once,
-        slice,
-        sync::Arc,
-    };
+    use std::{cell::Cell, collections::HashMap, io::empty, iter::once, slice, sync::Arc};
 
     thread_local! {
         /// Set by [`with_reorder_budget`] for the thread running a merge.
@@ -4404,12 +4394,8 @@ mod tests {
         superfile::{
             format::footer::read_kv_metadata,
             fts::{
-                builder::RADIX_SORT_MIN_TRIPLES,
-                positions::SIG_UNKNOWN,
-                reader::{BoolMode, ClauseLists, SIG_REJECTS},
-                short::SHORT_MAX_DF,
+                builder::RADIX_SORT_MIN_TRIPLES, reader::BoolMode, short::SHORT_MAX_DF,
                 sorted_merge::TERMS_PER_CHUNK,
-                tokenize::Phrase,
             },
             vector::{
                 builder::build_merged_subsection_from_materialized,
@@ -6180,7 +6166,7 @@ mod tests {
         let mut postings: Vec<(Vec<u8>, u32, u32, Vec<u32>)> = Vec::new();
         let mut doc_lengths: Vec<u32> = Vec::new();
         for column_id in 0..n_cols {
-            fts.for_each_term_posting(column_id, |term, doc_id, tf, pos, _| {
+            fts.for_each_term_posting(column_id, |term, doc_id, tf, pos| {
                 postings.push((term.to_vec(), row_of(doc_id), tf, pos.to_vec()));
                 Ok(())
             })
@@ -7441,154 +7427,6 @@ mod tests {
         sorted
     }
 
-    /// Every `(term, row)` posting's adjacency signature in `reader`'s
-    /// positional `title` column, rows shifted by `first_row`.
-    fn title_signatures(reader: &SuperfileReader, first_row: u32) -> BTreeMap<(Vec<u8>, u32), u8> {
-        let fts = reader.fts().expect("fts");
-        let map = fts.doc_map().expect("doc-id map");
-        let mut sigs = BTreeMap::new();
-        fts.for_each_term_posting(0, |term, doc_id, _, _, sig| {
-            let row = first_row + map.row_of(FtsDocId::new(doc_id)).get();
-            sigs.insert((term.to_vec(), row), sig);
-            Ok(())
-        })
-        .expect("walk title postings");
-        sigs
-    }
-
-    /// Titles of common words that sit next to each other in some docs and
-    /// apart in more, so a merge has signatures that matter to carry.
-    fn signature_docs(input: u32, first_id: u32, docs: u32) -> Vec<(String, String)> {
-        const WORDS: [&str; 6] = ["american", "south", "river", "city", "road", "lake"];
-        (0..docs)
-            .map(|d| {
-                let id = first_id + d;
-                let mut title: Vec<&str> = (0..12)
-                    .map(|k| WORDS[((id * 7 + k * (id % 5 + 1)) % 6) as usize])
-                    .collect();
-                if id.is_multiple_of(9) {
-                    title.extend(["american", "south"]);
-                }
-                (title.join(" "), format!("b{input} z{id}"))
-            })
-            .collect()
-    }
-
-    /// A merge carries each posting's signature to the output: the merged
-    /// file stores exactly what its inputs stored, an input written without
-    /// signatures (as a file from before them is) contributing the unknown
-    /// signature, and a phrase over the merge finds what a scan of the text
-    /// finds while still rejecting candidates by signature.
-    #[tokio::test]
-    async fn merges_carry_adjacency_signatures() {
-        const SIZES: [u32; 3] = [300, 200, 300];
-        /// The input written without signatures.
-        const OLD: usize = 1;
-        let opts = sorted_merge_opts(true);
-        let mut inputs = Vec::new();
-        let mut expected = BTreeMap::new();
-        let mut titles: Vec<String> = Vec::new();
-        let mut first_id = 0;
-        for (i, &n) in SIZES.iter().enumerate() {
-            let docs = signature_docs(i as u32, first_id, n);
-            let ids = decimal128_ids((first_id..first_id + n).map(u64::from));
-            let (t, b): (Vec<&str>, Vec<&str>) =
-                docs.iter().map(|(t, b)| (t.as_str(), b.as_str())).unzip();
-            let batch = RecordBatch::try_new(
-                opts.schema.clone(),
-                vec![
-                    Arc::new(ids),
-                    Arc::new(LargeStringArray::from(t)),
-                    Arc::new(LargeStringArray::from(b)),
-                ],
-            )
-            .expect("batch");
-            let mut builder = SuperfileBuilder::new(opts.clone()).expect("builder");
-            builder
-                .fts_builder
-                .as_mut()
-                .expect("an fts builder")
-                .omit_signatures = i == OLD;
-            builder.add_batch(&batch, &[]).expect("add_batch");
-            let reader = Arc::new(
-                SuperfileReader::open(Bytes::from(builder.finish().expect("finish")))
-                    .expect("open input"),
-            );
-            let sigs = title_signatures(&reader, first_id);
-            assert_eq!(
-                sigs.values().all(|&s| s == SIG_UNKNOWN),
-                i == OLD,
-                "input {i}: signatures written unless omitted"
-            );
-            expected.extend(sigs);
-            titles.extend(docs.into_iter().map(|(t, _)| t));
-            inputs.push((reader, None));
-            first_id += n;
-        }
-        let (merged, _) =
-            SuperfileBuilder::build_from_readers_fts_merge(&inputs).expect("fts merge");
-        let merged = SuperfileReader::open(Bytes::from(merged)).expect("open merge");
-        assert_eq!(title_signatures(&merged, 0), expected, "signatures carried");
-
-        let phrases = vec![Phrase::adjacent(vec![
-            "american".to_string(),
-            "south".to_string(),
-        ])];
-        let want: Vec<u32> = titles
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.contains("american south"))
-            .map(|(row, _)| row as u32)
-            .collect();
-        SIG_REJECTS.with(|n| n.set(0));
-        let hits = merged
-            .fts()
-            .expect("fts")
-            .search_excluding(
-                "title",
-                ClauseLists {
-                    should_phrases: &phrases,
-                    ..ClauseLists::default()
-                },
-                titles.len(),
-                f32::NEG_INFINITY,
-            )
-            .await
-            .expect("phrase search");
-        let mut got: Vec<u32> = hits.iter().map(|(row, _)| row.get()).collect();
-        got.sort_unstable();
-        assert_eq!(got, want, "phrase rows");
-        assert!(
-            SIG_REJECTS.with(|n| n.get()) > 0,
-            "the merged signatures still reject candidates"
-        );
-    }
-
-    /// A merge that chooses its own doc order sorts each term's postings,
-    /// and every signature moves with its posting.
-    #[test]
-    fn a_reordering_merge_keeps_each_signature_with_its_posting() {
-        let inputs = reorder_merge_inputs(true, &[]);
-        let mut expected = BTreeMap::new();
-        let mut first_row = 0;
-        for (reader, _) in &inputs {
-            expected.extend(title_signatures(reader, first_row));
-            first_row += reader.fts().expect("fts").n_docs();
-        }
-        assert!(
-            expected.values().any(|&s| s != SIG_UNKNOWN && s != 0),
-            "premise: the inputs carry signatures"
-        );
-        let (merged, _) =
-            SuperfileBuilder::build_from_readers_fts_merge(&inputs).expect("fts merge");
-        let merged = SuperfileReader::open(Bytes::from(merged)).expect("open merge");
-        assert!(
-            merged.fts().expect("fts").has_doc_map(),
-            "the merge reorders"
-        );
-        assert_eq!(title_signatures(&merged, 0), expected);
-    }
-
     /// Two reorder-corpus inputs, large enough together that the merge
     /// chooses its own doc order.
     fn reorder_merge_inputs(
@@ -7867,7 +7705,7 @@ mod tests {
                     column_id,
                     once((term.as_slice(), value)),
                     &mut Vec::new(),
-                    |_, _, _, _, _| {
+                    |_, _, _, _| {
                         postings += 1;
                         Ok(())
                     },

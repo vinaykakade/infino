@@ -79,9 +79,7 @@ pub(crate) struct SortedInput {
 /// surviving posting, `encode(state, postings, runs)` builds its output
 /// and `write(term, output)` places it. `postings` are
 /// `(output_doc_id, tf)`, doc ids ascending; `runs` holds each posting's
-/// position run, decoded (empty for a non-positional column), and its
-/// adjacency signature as its input stored it — a signature depends on the
-/// doc's other terms, so it is carried, never recomputed.
+/// position run, decoded (empty for a non-positional column).
 ///
 /// `encode` runs on many threads at once, each call with a worker state
 /// made by `new_state`; `write` runs on this thread, once per term, in term
@@ -216,8 +214,6 @@ struct TermWork {
     runs: Vec<u32>,
     /// Where each posting's run starts in `runs`.
     run_starts: Vec<usize>,
-    /// Each posting's adjacency signature, in step with `postings`.
-    sigs: Vec<u8>,
     positions_buf: Vec<u32>,
     sort_scratch: SortScratch,
 }
@@ -228,7 +224,6 @@ impl TermWork {
         self.postings.capacity() * size_of::<(u32, u32)>()
             + self.runs.capacity() * size_of::<u32>()
             + self.run_starts.capacity() * size_of::<usize>()
-            + self.sigs.capacity()
             + self.positions_buf.capacity() * size_of::<u32>()
             + self.sort_scratch.capacity_bytes()
     }
@@ -323,14 +318,12 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
             postings,
             runs,
             run_starts,
-            sigs,
             positions_buf,
             sort_scratch,
         } = work;
         postings.clear();
         runs.clear();
         run_starts.clear();
-        sigs.clear();
         let mut ascending = true;
         for &(i, value) in term_inputs {
             let remap = &self.inputs[i].remap;
@@ -339,7 +332,7 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
                     self.column_id,
                     once((term, value)),
                     positions_buf,
-                    |_, doc, tf, pos, sig| {
+                    |_, doc, tf, pos| {
                         if let Some(out_doc) = remap[doc as usize] {
                             debug_assert!(
                                 pos.is_empty() || pos.len() == tf as usize,
@@ -349,7 +342,6 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
                             ascending &= postings.last().is_none_or(|&(d, _)| d < out_doc);
                             postings.push((out_doc, tf));
                             run_starts.push(runs.len());
-                            sigs.push(sig);
                             push_run_values(runs, pos);
                         }
                         Ok(())
@@ -360,9 +352,9 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
         if postings.is_empty() {
             return Ok(None);
         }
-        let (starts, sigs) = match ascending {
-            true => (run_starts.as_slice(), sigs.as_slice()),
-            false => sort_scratch.sort(postings, run_starts, sigs),
+        let starts = match ascending {
+            true => run_starts.as_slice(),
+            false => sort_scratch.sort(postings, run_starts),
         };
         debug_assert!(
             postings.is_sorted_by(|a, b| a.0 < b.0),
@@ -371,7 +363,6 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
         let term_runs = TermRuns::Values {
             values: runs,
             starts,
-            sigs,
         };
         (self.encode)(state, postings, term_runs).map(Some)
     }
@@ -380,48 +371,36 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
 /// Reused buffers for sorting one term's postings by output doc id.
 #[derive(Default)]
 struct SortScratch {
-    /// `(output_doc_id, tf, run_start, sig)` per posting.
-    entries: Vec<(u32, u32, usize, u8)>,
+    /// `(output_doc_id, tf, run_start)` per posting.
+    entries: Vec<(u32, u32, usize)>,
     /// The run starts in sorted order.
     starts: Vec<usize>,
-    /// The signatures in sorted order.
-    sigs: Vec<u8>,
 }
 
 impl SortScratch {
-    /// Sort `postings` in place by doc id and return `run_starts` and
-    /// `sigs` in the same order. Only the starts move; the run values stay
-    /// where they are.
-    fn sort(
-        &mut self,
-        postings: &mut [(u32, u32)],
-        run_starts: &[usize],
-        sigs: &[u8],
-    ) -> (&[usize], &[u8]) {
+    /// Sort `postings` in place by doc id and return `run_starts` in the
+    /// same order. Only the starts move; the run values stay where they are.
+    fn sort(&mut self, postings: &mut [(u32, u32)], run_starts: &[usize]) -> &[usize] {
         self.entries.clear();
         self.entries.extend(
             postings
                 .iter()
                 .zip(run_starts)
-                .zip(sigs)
-                .map(|((&(doc, tf), &start), &sig)| (doc, tf, start, sig)),
+                .map(|(&(doc, tf), &start)| (doc, tf, start)),
         );
         self.entries.sort_unstable_by_key(|e| e.0);
         self.starts.clear();
-        self.sigs.clear();
-        for (slot, &(doc, tf, start, sig)) in postings.iter_mut().zip(&self.entries) {
+        for (slot, &(doc, tf, start)) in postings.iter_mut().zip(&self.entries) {
             *slot = (doc, tf);
             self.starts.push(start);
-            self.sigs.push(sig);
         }
-        (&self.starts, &self.sigs)
+        &self.starts
     }
 
     /// Bytes the buffers hold on to.
     fn capacity_bytes(&self) -> usize {
-        self.entries.capacity() * size_of::<(u32, u32, usize, u8)>()
+        self.entries.capacity() * size_of::<(u32, u32, usize)>()
             + self.starts.capacity() * size_of::<usize>()
-            + self.sigs.capacity()
     }
 }
 

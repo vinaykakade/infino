@@ -35,8 +35,6 @@ pub(crate) use expand::{ContainsRows, LONG_S_ASCII, TermPattern};
 pub(crate) use metadata::build_lut as norm_table;
 pub use metadata::{ColumnLengthStats, ColumnMeta, OpenOptions};
 pub use options::{Bm25SearchOptions, BoolMode};
-#[cfg(test)]
-pub(crate) use phrase::SIG_REJECTS;
 pub(crate) use search::FetchedTermMemo;
 #[cfg(test)]
 pub(crate) use search::FetchedTermSlot;

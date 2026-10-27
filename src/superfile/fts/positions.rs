@@ -8,18 +8,14 @@
 //! the gap to the previous position (positions within a doc are
 //! strictly increasing, so gaps are ≥ 1 and small for clustered
 //! terms). A run's varint count equals the posting's `tf`, so runs
-//! need no length framing — the decoder reads exactly `tf` values. The
-//! build accumulator stores each run behind the posting's one-byte
-//! [adjacency signature](next_bit).
+//! need no length framing — the decoder reads exactly `tf` values.
 //!
-//! The positions region of the FTS blob holds, per term, one **position
-//! group** per posting block ([`encode_group`]); the skip table records
-//! each block's group offset so a block's runs are randomly addressable
-//! without decoding its predecessors.
+//! The positions region of the FTS blob is, per term, the
+//! concatenation of its runs in posting (doc-id) order; the skip
+//! table records each 128-doc block's starting byte so a block's runs
+//! are randomly addressable without decoding its predecessors.
 
 use std::ops::Range;
-
-use xxhash_rust::xxh3::xxh3_64;
 
 use crate::{
     superfile::bits::{
@@ -29,83 +25,10 @@ use crate::{
     utils::varint::{push_varint, read_varint, varint_len},
 };
 
-/// A posting's adjacency signature when nothing is known about the words
-/// that follow the term in the doc: every bit set, so it never rules a
-/// document out. A posting read from a group without signatures carries
-/// it, as does a posting whose document's positions could not be trusted
-/// to say which token follows which.
-pub(crate) const SIG_UNKNOWN: u8 = 0xFF;
-
-/// Bits in a signature: one byte.
-const SIG_BITS: u64 = 8;
-
-/// The signature bit standing for `term` as a **follower**: one of eight,
-/// chosen by a hash of the term's bytes.
-///
-/// A posting `(t, d)` of a positional column stores the signature
-/// `sig(t, d)`: the OR of `next_bit(u)` over every token `u` at position
-/// `p + 1` for some occurrence of `t` at `p` in `d`. An exact phrase `t u`
-/// can only match `d` if `sig(t, d)` has `next_bit(u)`, so a candidate
-/// whose signature lacks it is rejected without decoding a position. A
-/// signature with the bit set proves nothing; the positions still decide.
-///
-/// The hash is written into every blob, so it must not change: XXH3-64,
-/// which is specified and identical on every platform, of the term's
-/// bytes, its low three bits picking the bit.
-#[inline]
-pub(crate) fn next_bit(term: &[u8]) -> u8 {
-    1u8 << (xxh3_64(term) % SIG_BITS)
-}
-
-/// Every token's **follower mask** in one document: entry `k` is the OR of
-/// `bits[j]` over the tokens `j` at position `position(k) + 1`, zero when
-/// that position holds no token (the doc's last token, or a gap a dropped
-/// word left). Tokens are given in emission order, `n` of them; `bits[k]`
-/// is token `k`'s [`next_bit`]. A term's signature in the doc is then the
-/// OR of its occurrences' masks.
-///
-/// Emission order puts positions in non-decreasing order for every
-/// tokenizer this crate ships, so one forward pass finds each token's
-/// followers. A tokenizer that reports a position below its predecessor's
-/// leaves the order unknown, and every mask is [`SIG_UNKNOWN`] rather than
-/// a guess that could reject a real match.
-pub(crate) fn follower_masks(
-    n: usize,
-    position: impl Fn(usize) -> u32,
-    bits: &[u8],
-    out: &mut Vec<u8>,
-) {
-    debug_assert_eq!(bits.len(), n, "one bit per token");
-    out.clear();
-    if (1..n).any(|k| position(k) < position(k - 1)) {
-        out.resize(n, SIG_UNKNOWN);
-        return;
-    }
-    // `j` is the first token past `k` whose position is not below
-    // `position(k) + 1`; it only moves forward as `k` does.
-    let mut j = 0usize;
-    for k in 0..n {
-        let want = u64::from(position(k)) + 1;
-        j = j.max(k + 1);
-        while j < n && u64::from(position(j)) < want {
-            j += 1;
-        }
-        let mut mask = 0u8;
-        let mut m = j;
-        while m < n && u64::from(position(m)) == want {
-            mask |= bits[m];
-            m += 1;
-        }
-        out.push(mask);
-    }
-}
-
-/// Append one document's position run as the build accumulator holds it:
-/// the posting's adjacency signature, then the positions — first value
-/// absolute, then gaps. `positions` must be strictly increasing (token
-/// positions within one doc always are).
-pub(crate) fn encode_run(out: &mut Vec<u8>, sig: u8, positions: &[u32]) {
-    out.push(sig);
+/// Append one document's position run — first value absolute, then
+/// gaps. `positions` must be strictly increasing (token positions
+/// within one doc always are).
+pub(crate) fn encode_run(out: &mut Vec<u8>, positions: &[u32]) {
     let mut prev: u32 = 0;
     for (i, &p) in positions.iter().enumerate() {
         debug_assert!(i == 0 || p > prev, "positions must be strictly increasing");
@@ -119,48 +42,37 @@ pub(crate) fn encode_run(out: &mut Vec<u8>, sig: u8, positions: &[u32]) {
 /// A run is a posting's first position, then the gaps between the rest.
 #[derive(Clone, Copy)]
 pub(crate) enum TermRuns<'a> {
-    /// Signature-prefixed LEB128 runs back to back ([`encode_run`]), as
-    /// the build accumulator holds them.
+    /// LEB128 runs back to back, as the build accumulator holds them.
     Encoded(&'a [u8]),
     /// Run values, as the compaction merge decodes them: posting `i`'s
-    /// `tf` values start at `starts[i]` and its signature is `sigs[i]`.
-    /// Keeping them decoded saves the merge a LEB128 round trip per
-    /// position.
+    /// `tf` values start at `starts[i]`. Keeping them decoded saves the
+    /// merge a LEB128 round trip per position.
     Values {
         values: &'a [u32],
         starts: &'a [usize],
-        sigs: &'a [u8],
     },
 }
 
 impl TermRuns<'_> {
-    /// Append posting `i`'s run of `tf` values to `out` and return its
-    /// signature. `at` walks the encoded form and must start at 0 for
-    /// posting 0; the decoded form ignores it.
+    /// Append posting `i`'s run of `tf` values to `out`. `at` walks the
+    /// encoded form and must start at 0 for posting 0; the decoded form
+    /// ignores it.
     #[inline]
-    pub(crate) fn push_run(&self, i: usize, tf: u32, at: &mut usize, out: &mut Vec<u32>) -> u8 {
+    pub(crate) fn push_run(&self, i: usize, tf: u32, at: &mut usize, out: &mut Vec<u32>) {
         match *self {
             Self::Encoded(bytes) => {
-                let sig = bytes[*at];
-                *at += 1;
                 for _ in 0..tf {
                     out.push(read_varint(bytes, at).expect("builder-encoded run"));
                 }
-                sig
             }
-            Self::Values {
-                values,
-                starts,
-                sigs,
-            } => {
+            Self::Values { values, starts } => {
                 let start = starts[i];
                 out.extend_from_slice(&values[start..start + tf as usize]);
-                sigs[i]
             }
         }
     }
 
-    /// The runs' bytes, when they are in the encoded form.
+    /// The runs' LEB128 bytes, when that is the form they are in.
     pub(crate) fn encoded(&self) -> Option<&[u8]> {
         match *self {
             Self::Encoded(bytes) => Some(bytes),
@@ -171,21 +83,17 @@ impl TermRuns<'_> {
     /// The first posting's first value.
     pub(crate) fn first_value(&self) -> u32 {
         match *self {
-            // Past the first run's signature byte.
-            Self::Encoded(bytes) => read_varint(bytes, &mut 1).expect("builder-encoded run"),
-            Self::Values { values, starts, .. } => values[starts[0]],
+            Self::Encoded(bytes) => read_varint(bytes, &mut 0).expect("builder-encoded run"),
+            Self::Values { values, starts } => values[starts[0]],
         }
     }
 }
 
-/// Decode one accumulator run of exactly `tf` positions from `bytes` at
-/// `*at`, appending the absolute positions to `out`, advancing `*at` and
-/// returning the run's signature. `None` on corrupt (truncated /
-/// overflowing) bytes.
+/// Decode one run of exactly `tf` positions from `bytes` at `*at`,
+/// appending the absolute positions to `out` and advancing `*at`.
+/// `None` on corrupt (truncated / overflowing) bytes.
 #[cfg(test)]
-pub(crate) fn decode_run(bytes: &[u8], at: &mut usize, tf: u32, out: &mut Vec<u32>) -> Option<u8> {
-    let sig = *bytes.get(*at)?;
-    *at += 1;
+pub(crate) fn decode_run(bytes: &[u8], at: &mut usize, tf: u32, out: &mut Vec<u32>) -> Option<()> {
     let mut prev: u32 = 0;
     for i in 0..tf {
         let delta = read_varint(bytes, at)?;
@@ -197,15 +105,12 @@ pub(crate) fn decode_run(bytes: &[u8], at: &mut usize, tf: u32, out: &mut Vec<u3
         out.push(p);
         prev = p;
     }
-    Some(sig)
+    Some(())
 }
 
-/// Advance `*at` past one accumulator run of `tf` positions, its
-/// signature included, without materializing them. `None` on truncated
-/// bytes.
+/// Advance `*at` past one run of `tf` positions without materializing
+/// them. `None` on truncated bytes.
 pub(crate) fn skip_run(bytes: &[u8], at: &mut usize, tf: u32) -> Option<()> {
-    bytes.get(*at)?;
-    *at += 1;
     for _ in 0..tf {
         read_varint(bytes, at)?;
     }
@@ -227,40 +132,6 @@ pub(crate) const GROUP_PACKED: u8 = 1;
 /// The streams and their lanes are those of [`GROUP_PACKED`]. Written from
 /// `VERSION_V10`.
 pub(crate) const GROUP_PACKED_FIXED: u8 = 2;
-/// Group header value for a [`GROUP_PACKED_FIXED`] group that carries its
-/// pairs' adjacency signatures ([`next_bit`]): one byte per pair, in pair
-/// order, right after the header, then the two streams exactly as
-/// [`GROUP_PACKED_FIXED`] lays them out. A phrase reads a candidate's
-/// signature at a fixed offset and rejects the candidate before any
-/// stream is parsed. Written from `VERSION_V11`.
-pub(crate) const GROUP_PACKED_FIXED_SIG: u8 = 3;
-/// Group header value for a [`GROUP_LEB128`] group that carries its pairs'
-/// signatures, laid out as for [`GROUP_PACKED_FIXED_SIG`]: the signature
-/// bytes, then the LEB128 values. Written from `VERSION_V11`.
-pub(crate) const GROUP_LEB128_SIG: u8 = 4;
-
-/// For a group header, the header of the same layout without signatures
-/// and whether signatures follow it; `None` for a value no version writes.
-fn group_layout(header: u8) -> Option<(u8, bool)> {
-    match header {
-        GROUP_LEB128 | GROUP_PACKED | GROUP_PACKED_FIXED => Some((header, false)),
-        GROUP_PACKED_FIXED_SIG => Some((GROUP_PACKED_FIXED, true)),
-        GROUP_LEB128_SIG => Some((GROUP_LEB128, true)),
-        _ => None,
-    }
-}
-
-/// Where the signatures of the group at `at` begin, without locating it:
-/// pair `p`'s is the byte at the returned offset plus `p`. `None` when the
-/// group carries none (a group of an older blob, or one whose every
-/// signature was [`SIG_UNKNOWN`]) or `at` is past the bytes.
-#[inline]
-pub(crate) fn group_signatures_at(bytes: &[u8], at: usize) -> Option<usize> {
-    match group_layout(*bytes.get(at)?) {
-        Some((_, true)) => Some(at + 1),
-        _ => None,
-    }
-}
 
 /// Bytes a little-endian field needs to hold `v`: 1, 2 or 4.
 fn field_bytes(v: u32) -> usize {
@@ -332,51 +203,28 @@ const GROUP_MAX_EXCEPTIONS: usize = 64;
 /// every long-form group is packed, so `allow_leb128` is `false` for
 /// them; a short-form term's group is decoded whole in any case and may
 /// take the LEB128 form when that is smaller.
-///
-/// `sigs` are the pairs' adjacency signatures, one per `tfs` entry. They
-/// are written ahead of the values under the signed form of the chosen
-/// header ([`GROUP_PACKED_FIXED_SIG`], [`GROUP_LEB128_SIG`]) — unless every
-/// one is [`SIG_UNKNOWN`], which rules nothing out, and the group is then
-/// written without them.
 pub(crate) fn encode_group(
     out: &mut Vec<u8>,
     tfs: &[u32],
     values: &[u32],
-    sigs: &[u8],
     allow_leb128: bool,
     scratch: &mut PackScratch,
 ) {
-    debug_assert_eq!(sigs.len(), tfs.len(), "one signature per pair");
-    let sigs = (!sigs.iter().all(|&s| s == SIG_UNKNOWN)).then_some(sigs);
-    encode_group_as(
-        out,
-        tfs,
-        values,
-        sigs,
-        allow_leb128,
-        scratch,
-        GROUP_PACKED_FIXED,
-    );
+    encode_group_as(out, tfs, values, allow_leb128, scratch, GROUP_PACKED_FIXED);
 }
 
 /// [`encode_group`] with the packed form `packed` ([`GROUP_PACKED`] or
-/// [`GROUP_PACKED_FIXED`]) and signatures only when `sigs` is `Some`; the
-/// tests write every form, as blobs of each version must read. Only the
-/// fixed-table form has a signed header.
+/// [`GROUP_PACKED_FIXED`]); the tests write both, as blobs of either
+/// version must read.
 fn encode_group_as(
     out: &mut Vec<u8>,
     tfs: &[u32],
     values: &[u32],
-    sigs: Option<&[u8]>,
     allow_leb128: bool,
     scratch: &mut PackScratch,
     packed: u8,
 ) {
     let fixed = packed == GROUP_PACKED_FIXED;
-    debug_assert!(
-        sigs.is_none() || fixed,
-        "only the fixed-table form is signed"
-    );
     debug_assert_eq!(
         tfs.iter().map(|&t| t as usize).sum::<usize>(),
         values.len(),
@@ -396,25 +244,17 @@ fn encode_group_as(
     plan_stream(gaps, fixed, &mut scratch.plan_b, &mut scratch.candidates);
     let (first_plan, gap_plan) = (&scratch.plan_a, &scratch.plan_b);
     let packed_len = 1 + first_plan.bytes + gap_plan.bytes;
-    // The signatures are the same bytes in either layout, so they do not
-    // weigh in the choice between them.
-    let (leb_header, packed_header) = match sigs {
-        Some(_) => (GROUP_LEB128_SIG, GROUP_PACKED_FIXED_SIG),
-        None => (GROUP_LEB128, packed),
-    };
     if allow_leb128 {
         let leb_len: usize = 1 + values.iter().map(|&v| varint_len(v)).sum::<usize>();
         if leb_len <= packed_len {
-            out.push(leb_header);
-            out.extend_from_slice(sigs.unwrap_or_default());
+            out.push(GROUP_LEB128);
             for &v in values {
                 push_varint(out, v);
             }
             return;
         }
     }
-    out.push(packed_header);
-    out.extend_from_slice(sigs.unwrap_or_default());
+    out.push(packed);
     write_stream(out, firsts, first_plan, fixed);
     write_stream(out, gaps, gap_plan, fixed);
 }
@@ -684,8 +524,6 @@ pub(crate) struct GroupIndex {
     /// the pairs before it) for a packed group, in the values (`Σ tf`)
     /// for a LEB128 one. `tfs.len() + 1` entries.
     starts: Vec<u32>,
-    /// Where the group's pair signatures begin, when it carries them.
-    sigs: Option<usize>,
 }
 
 impl GroupIndex {
@@ -696,14 +534,8 @@ impl GroupIndex {
     pub(crate) fn locate(&mut self, bytes: &[u8], at: &mut usize, tfs: &[u32]) -> Option<()> {
         let n: usize = tfs.iter().map(|&t| t as usize).sum();
         self.served = 0;
-        let (header, signed) = group_layout(*bytes.get(*at)?)?;
+        let header = *bytes.get(*at)?;
         *at += 1;
-        self.sigs = None;
-        if signed {
-            bytes.get(*at..*at + tfs.len())?;
-            self.sigs = Some(*at);
-            *at += tfs.len();
-        }
         match header {
             GROUP_LEB128 => {
                 self.kind = GroupKind::Leb128;
@@ -754,15 +586,6 @@ impl GroupIndex {
             *slot = acc;
         }
         Some(())
-    }
-
-    /// Pair `pair`'s adjacency signature, [`SIG_UNKNOWN`] when the group
-    /// carries none.
-    #[inline]
-    pub(crate) fn pair_sig(&self, bytes: &[u8], pair: usize) -> u8 {
-        self.sigs
-            .and_then(|at| bytes.get(at + pair).copied())
-            .unwrap_or(SIG_UNKNOWN)
     }
 
     /// The absolute positions of pair `pair` (whose term frequency is
@@ -868,9 +691,6 @@ pub(crate) fn positions_from_run_values(values: &[u32], out: &mut Vec<u32>) -> O
 mod tests {
     use super::*;
 
-    /// [`next_bit`] of `american`, `south`, `the`, the empty term and `x`.
-    const PINNED_BITS: [u8; 5] = [1, 4, 32, 4, 2];
-
     /// The decoded form of a term's runs reads, and re-encodes, exactly as
     /// the LEB128 form does, whatever order the postings' runs sit in.
     #[test]
@@ -889,16 +709,13 @@ mod tests {
             }
         }
         let mut bytes = Vec::new();
-        let sigs = [0x21u8, SIG_UNKNOWN, 0];
         for &i in &emitted {
-            encode_run(&mut bytes, sigs[i], docs[i]);
+            encode_run(&mut bytes, docs[i]);
         }
         let emitted_starts: Vec<usize> = emitted.iter().map(|&i| starts[i]).collect();
-        let emitted_sigs: Vec<u8> = emitted.iter().map(|&i| sigs[i]).collect();
         let decoded = TermRuns::Values {
             values: &values,
             starts: &emitted_starts,
-            sigs: &emitted_sigs,
         };
         let encoded = TermRuns::Encoded(&bytes);
         let tfs: Vec<u32> = emitted.iter().map(|&i| docs[i].len() as u32).collect();
@@ -906,9 +723,8 @@ mod tests {
         let (mut from_decoded, mut from_encoded) = (Vec::new(), Vec::new());
         let (mut at_decoded, mut at_encoded) = (0, 0);
         for (i, &tf) in tfs.iter().enumerate() {
-            let a = decoded.push_run(i, tf, &mut at_decoded, &mut from_decoded);
-            let b = encoded.push_run(i, tf, &mut at_encoded, &mut from_encoded);
-            assert_eq!((a, b), (emitted_sigs[i], emitted_sigs[i]), "signature {i}");
+            decoded.push_run(i, tf, &mut at_decoded, &mut from_decoded);
+            encoded.push_run(i, tf, &mut at_encoded, &mut from_encoded);
         }
         assert_eq!(from_decoded, from_encoded, "run values");
         assert_eq!(at_encoded, bytes.len(), "the encoded walk covers every run");
@@ -920,15 +736,7 @@ mod tests {
 
     /// Encode a group with fresh scratch.
     fn group(out: &mut Vec<u8>, tfs: &[u32], values: &[u32], allow_leb128: bool) {
-        let sigs = vec![SIG_UNKNOWN; tfs.len()];
-        encode_group(
-            out,
-            tfs,
-            values,
-            &sigs,
-            allow_leb128,
-            &mut PackScratch::default(),
-        );
+        encode_group(out, tfs, values, allow_leb128, &mut PackScratch::default());
     }
 
     /// Decode every pair of a group through the per-run index into
@@ -1015,9 +823,7 @@ mod tests {
             assert!(index.locate(&out[..cut], &mut 0, &tfs).is_none());
         }
         assert!(
-            GroupIndex::default()
-                .locate(&[5, 0], &mut 0, &[1])
-                .is_none(),
+            GroupIndex::default().locate(&[3], &mut 0, &[1]).is_none(),
             "unknown header"
         );
         assert!(
@@ -1184,7 +990,6 @@ mod tests {
                     &mut out,
                     &tfs,
                     &vals,
-                    None,
                     false,
                     &mut PackScratch::default(),
                     packed,
@@ -1422,178 +1227,14 @@ mod tests {
         }
     }
 
-    /// The bit a term hashes to is written into every blob and read by
-    /// every later reader: it must never change.
-    #[test]
-    fn next_bit_is_pinned() {
-        let got: Vec<u8> = ["american", "south", "the", "", "x"]
-            .iter()
-            .map(|t| next_bit(t.as_bytes()))
-            .collect();
-        assert_eq!(got, PINNED_BITS);
-        assert!(got.iter().all(|b| b.count_ones() == 1), "one bit each");
-    }
-
-    /// Follower masks of `positions` with token `k`'s bit `1 << k`.
-    fn masks(positions: &[u32]) -> Vec<u8> {
-        let bits: Vec<u8> = (0..positions.len()).map(|k| 1u8 << k).collect();
-        let mut out = vec![0xAA; 3];
-        follower_masks(positions.len(), |k| positions[k], &bits, &mut out);
-        out
-    }
-
-    #[test]
-    fn follower_masks_name_the_tokens_one_position_on() {
-        // A hole at position 2 (a dropped word): the token before it has no
-        // follower, and the last token never does.
-        assert_eq!(masks(&[0, 1, 3, 4]), [0b10, 0, 0b1000, 0]);
-        // Two tokens stacked at one position both follow the one before,
-        // and are both followed by the next.
-        assert_eq!(masks(&[0, 1, 1, 2]), [0b110, 0b1000, 0b1000, 0]);
-        // Far apart: nobody follows anybody.
-        assert_eq!(masks(&[0, 5, 9]), [0, 0, 0]);
-        assert_eq!(masks(&[]), [0u8; 0]);
-        assert_eq!(masks(&[7]), [0]);
-        // Positions that go backwards leave the order unknown: every mask
-        // is the one that rules nothing out.
-        assert_eq!(masks(&[0, 2, 1]), [SIG_UNKNOWN; 3]);
-    }
-
-    /// Encode with `sigs` and fresh scratch, behind a few bytes of
-    /// unrelated prefix; returns the group's start.
-    fn signed_group(
-        out: &mut Vec<u8>,
-        tfs: &[u32],
-        vals: &[u32],
-        sigs: &[u8],
-        allow: bool,
-    ) -> usize {
-        out.clear();
-        out.extend_from_slice(&[0xEE; 5]);
-        let start = out.len();
-        encode_group(out, tfs, vals, sigs, allow, &mut PackScratch::default());
-        start
-    }
-
-    #[test]
-    fn signed_groups_round_trip_and_expose_each_pairs_signature() {
-        // A long group (packed, as every long-form group is) and a short
-        // one small enough that LEB128 wins.
-        let long_tfs: Vec<u32> = (0..128u32).map(|d| 1 + d % 3).collect();
-        let mut long_vals = Vec::new();
-        for (d, &tf) in long_tfs.iter().enumerate() {
-            long_vals.push(9 * d as u32 + 1);
-            long_vals.extend((1..tf).map(|g| g + 1));
-        }
-        let long_sigs: Vec<u8> = (0..128u32).map(|d| (d * 37) as u8).collect();
-        let cases: [(&[u32], &[u32], &[u8], bool, u8); 3] = [
-            (
-                &long_tfs,
-                &long_vals,
-                &long_sigs,
-                false,
-                GROUP_PACKED_FIXED_SIG,
-            ),
-            (
-                &[1, 2],
-                &[3, 4, 1],
-                &[0, SIG_UNKNOWN],
-                true,
-                GROUP_LEB128_SIG,
-            ),
-            (
-                &long_tfs,
-                &long_vals,
-                &long_sigs,
-                true,
-                GROUP_PACKED_FIXED_SIG,
-            ),
-        ];
-        let mut out = Vec::new();
-        for (tfs, vals, sigs, allow, header) in cases {
-            let start = signed_group(&mut out, tfs, vals, sigs, allow);
-            assert_eq!(out[start], header);
-            assert_eq!(group_signatures_at(&out, start), Some(start + 1));
-            assert_eq!(&out[start + 1..start + 1 + sigs.len()], sigs);
-            let mut index = GroupIndex::default();
-            let mut at = start;
-            index.locate(&out, &mut at, tfs).expect("locates");
-            assert_eq!(at, out.len(), "header {header}: whole group consumed");
-            let mut got = Vec::new();
-            for (pair, &tf) in tfs.iter().enumerate() {
-                index.run_positions(&out, pair, tf, &mut got).expect("run");
-                assert_eq!(index.pair_sig(&out, pair), sigs[pair], "pair {pair}");
-            }
-            assert_eq!(got, positions_of(tfs, vals), "header {header}");
-            // A group cut anywhere, the signatures included, is refused.
-            for cut in start..out.len() {
-                assert!(
-                    GroupIndex::default()
-                        .locate(&out[..cut], &mut start.clone(), tfs)
-                        .is_none(),
-                    "header {header} cut {cut}"
-                );
-            }
-        }
-
-        // Signatures that are all unknown rule nothing out and are not
-        // written: the group takes the layout an older blob has.
-        for (allow, header) in [(false, GROUP_PACKED_FIXED), (true, GROUP_LEB128)] {
-            let tfs = [1u32, 1];
-            let start = signed_group(&mut out, &tfs, &[2, 5], &[SIG_UNKNOWN; 2], allow);
-            assert_eq!(out[start], header);
-            assert_eq!(group_signatures_at(&out, start), None);
-            let mut index = GroupIndex::default();
-            index
-                .locate(&out, &mut start.clone(), &tfs)
-                .expect("locates");
-            assert_eq!(index.pair_sig(&out, 1), SIG_UNKNOWN);
-            assert_eq!(decode_all(&out[start..], 0, &tfs), Some(vec![2, 5]));
-        }
-    }
-
-    #[test]
-    fn groups_without_signatures_read_as_unknown() {
-        // Every header an older blob writes: positions as before, and each
-        // pair's signature the one that never rejects.
-        let tfs = [2u32, 1, 3];
-        let vals = [4u32, 1, 9, 0, 2, 2];
-        for (packed, allow) in [
-            (GROUP_PACKED, false),
-            (GROUP_PACKED_FIXED, false),
-            (GROUP_PACKED_FIXED, true),
-        ] {
-            let mut out = Vec::new();
-            encode_group_as(
-                &mut out,
-                &tfs,
-                &vals,
-                None,
-                allow,
-                &mut PackScratch::default(),
-                packed,
-            );
-            assert!(out[0] <= GROUP_PACKED_FIXED, "an unsigned header");
-            assert_eq!(group_signatures_at(&out, 0), None);
-            let mut index = GroupIndex::default();
-            index.locate(&out, &mut 0, &tfs).expect("locates");
-            for pair in 0..tfs.len() {
-                assert_eq!(index.pair_sig(&out, pair), SIG_UNKNOWN);
-            }
-            assert_eq!(decode_all(&out, 0, &tfs), Some(positions_of(&tfs, &vals)));
-        }
-        assert_eq!(group_signatures_at(&[], 0), None, "past the bytes");
-    }
-
     #[test]
     fn run_round_trips() {
         let positions = [3u32, 4, 9, 100, 1_000_000];
         let mut buf = Vec::new();
-        encode_run(&mut buf, 0x42, &positions);
+        encode_run(&mut buf, &positions);
         let mut at = 0;
         let mut got = Vec::new();
-        let sig = decode_run(&buf, &mut at, positions.len() as u32, &mut got).expect("decode");
-        assert_eq!(sig, 0x42);
+        decode_run(&buf, &mut at, positions.len() as u32, &mut got).expect("decode");
         assert_eq!(got, positions);
         assert_eq!(at, buf.len());
     }
@@ -1604,21 +1245,21 @@ mod tests {
         let a = [5u32, 6];
         let b = [0u32, 2, 4];
         let mut buf = Vec::new();
-        encode_run(&mut buf, 1, &a);
+        encode_run(&mut buf, &a);
         let a_end = buf.len();
-        encode_run(&mut buf, 2, &b);
+        encode_run(&mut buf, &b);
         let mut at = 0;
         skip_run(&buf, &mut at, a.len() as u32).expect("skip");
         assert_eq!(at, a_end);
         let mut got = Vec::new();
-        assert_eq!(decode_run(&buf, &mut at, b.len() as u32, &mut got), Some(2));
+        decode_run(&buf, &mut at, b.len() as u32, &mut got).expect("decode");
         assert_eq!(got, b);
     }
 
     #[test]
     fn decode_run_rejects_truncated_tail() {
         let mut buf = Vec::new();
-        encode_run(&mut buf, 0, &[1u32, 2, 3]);
+        encode_run(&mut buf, &[1u32, 2, 3]);
         let mut at = 0;
         let mut got = Vec::new();
         assert_eq!(
