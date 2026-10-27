@@ -269,6 +269,12 @@ pub(super) fn score_postings(
     debug_assert_eq!(docs.len(), tfs.len());
     out.clear();
     let mut i = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx2")
+    {
+        // SAFETY: both features the kernel enables are present (checked above).
+        i = unsafe { score_dense_avx512(idf_weight, docs, tfs, dl_norm, out) };
+    }
     while i + 8 <= docs.len() {
         let dids: [u32; 8] = docs[i..i + 8]
             .try_into()
@@ -1462,6 +1468,70 @@ unsafe fn accumulate_run_avx512(
             let contributions = bm25::score_one_term_x8(idf_weight, tf8, dl_norm_k1.get8(dids));
             mark_lanes(scores, present, base, dids, contributions);
         }
+        i += 8;
+    }
+    i
+}
+
+/// The eight-wide loop of [`score_postings`], dense groups gathered:
+/// eight docs spanning fewer than 16 have their norms' buckets in 16
+/// contiguous bytes, read with one load, compressed to the eight docs' and
+/// gathered from the decode table, in place of eight dependent loads of
+/// each; a group spread wider looks its norms up one by one. Returns how
+/// many postings it scored (a multiple of eight); each score is the scalar
+/// path's bits, as the norms are [`NormTable::get`]'s.
+///
+/// # Safety
+///
+/// The caller must have detected both AVX-512F and AVX2 at runtime. Given
+/// that, the 16-byte bucket load is made only when it fits the norm table,
+/// and the gather indexes a 256-entry table with bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx2")]
+unsafe fn score_dense_avx512(
+    idf_weight: f32,
+    docs: &[u32],
+    tfs: &[u32],
+    dl_norm: &NormTable,
+    out: &mut Vec<f32>,
+) -> usize {
+    use std::arch::x86_64::*;
+    let (buckets, lut) = dl_norm.parts();
+    let mut i = 0usize;
+    while i + 8 <= docs.len() {
+        let dids: [u32; 8] = docs[i..i + 8]
+            .try_into()
+            .expect("invariant: an 8-wide slice");
+        let tf8: [u32; 8] = tfs[i..i + 8]
+            .try_into()
+            .expect("invariant: an 8-wide slice");
+        if dids[7] - dids[0] >= 16 || dids[0] as usize + 16 > buckets.len() {
+            out.extend_from_slice(&bm25::score_one_term_x8(
+                idf_weight,
+                tf8,
+                dl_norm.get8(dids),
+            ));
+            i += 8;
+            continue;
+        }
+        let mut mask = 0u32;
+        for d in dids {
+            mask |= 1 << (d - dids[0]);
+        }
+        // SAFETY: the target features are enabled on this function (see the
+        // contract above). The 16-byte load covers `[dids[0], dids[0] + 16)`,
+        // inside `buckets` by the check above; the compress keeps the eight
+        // selected lanes in order, each a byte below 256, so the gather reads
+        // only inside the 256-entry table.
+        let norms = unsafe {
+            let bytes = _mm_loadu_si128(buckets.as_ptr().add(dids[0] as usize).cast());
+            let picked = _mm512_maskz_compress_epi32(mask as u16, _mm512_cvtepu8_epi32(bytes));
+            let gathered = _mm256_i32gather_ps::<4>(lut.as_ptr(), _mm512_castsi512_si256(picked));
+            let mut norms = [0.0f32; 8];
+            _mm256_storeu_ps(norms.as_mut_ptr(), gathered);
+            norms
+        };
+        out.extend_from_slice(&bm25::score_one_term_x8(idf_weight, tf8, norms));
         i += 8;
     }
     i
