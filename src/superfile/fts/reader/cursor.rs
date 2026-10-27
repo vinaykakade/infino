@@ -34,8 +34,8 @@ use crate::superfile::{
         bm25,
         builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         posting::{
-            BLOCK_LEN, BlockHeader, ENCODING_RUN, decode_block, decode_block_doc_ids,
-            decode_block_tfs, dense_next_doc, dense_tf_at, is_dense_encoding,
+            BLOCK_LEN, BlockHeader, ENCODING_BITSET, ENCODING_RUN, decode_block,
+            decode_block_doc_ids, decode_block_tfs, dense_next_doc, dense_tf_at, is_dense_encoding,
         },
         short::decode_short,
     },
@@ -1596,6 +1596,24 @@ impl TermCursor {
     /// Whether the current block's doc ids and tfs are all decoded in the
     /// buffers (not a lazily held bitset block showing one doc).
     #[inline]
+    /// The current block's presence bitset when the cursor holds the block
+    /// whole and it is stored as one: the doc its first bit stands for, and
+    /// where its bytes sit in [`Self::bytes`].
+    pub(super) fn whole_bitset(&mut self) -> Option<(u32, Range<usize>)> {
+        if self.predecoded || !self.holds_whole_block() {
+            return None;
+        }
+        let hdr = self.current_header();
+        if hdr.encoding != ENCODING_BITSET {
+            return None;
+        }
+        let block = self.blocks[self.current_block];
+        Some((
+            hdr.base,
+            block.block_byte_offset + hdr.payload()..block.block_byte_end - hdr.tfs_size(),
+        ))
+    }
+
     pub(super) fn holds_whole_block(&self) -> bool {
         !self.is_exhausted()
             && !self.is_lazy()
