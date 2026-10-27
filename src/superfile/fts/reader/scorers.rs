@@ -1393,6 +1393,15 @@ unsafe fn accumulate_run_avx512(
     let scores = &mut scores[..OR_WINDOW as usize];
     let present = &mut present[..OR_WINDOW_WORDS];
     let (buckets, lut) = dl_norm_k1.parts();
+    // Dense runs are summed into one aligned 16-slot chunk held in a
+    // register and written back once when the run moves past it: adding each
+    // group into memory at its own offset made every load wait on the
+    // overlapping store before it. A slot gets at most one posting of the
+    // term, so its lane is exactly that contribution and the write-back adds
+    // it to the window as the per-group add did.
+    let iota = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let mut acc = _mm512_setzero_ps();
+    let mut acc_at = usize::MAX;
     let mut i = 0usize;
     while i + 8 <= ids.len() {
         let dids: [u32; 8] = ids[i..i + 8]
@@ -1432,11 +1441,32 @@ unsafe fn accumulate_run_avx512(
             // check above; both are unaligned forms. The expand reads only the
             // low eight source lanes (the mask has eight bits set), all of them
             // defined by the 256-bit load.
+            //
+            // The group's lanes split across the chunk holding `first` and,
+            // when the span crosses it, the next one; a chunk is 16 slots at a
+            // multiple of 16, so with `first + 16` inside the window both are.
             unsafe {
                 let src = _mm512_castps256_ps512(_mm256_loadu_ps(contributions.as_ptr()));
-                let add = _mm512_maskz_expand_ps(mask as u16, src);
-                let slot = scores.as_mut_ptr().add(first);
-                _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), add));
+                let off = first & 15;
+                let chunk = first - off;
+                let spread = mask << off;
+                let (lo, hi) = (spread as u16, (spread >> 16) as u16);
+                if acc_at != chunk {
+                    if acc_at != usize::MAX {
+                        let slot = scores.as_mut_ptr().add(acc_at);
+                        _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), acc));
+                    }
+                    acc = _mm512_setzero_ps();
+                    acc_at = chunk;
+                }
+                acc = _mm512_add_ps(acc, _mm512_maskz_expand_ps(lo, src));
+                if hi != 0 {
+                    let slot = scores.as_mut_ptr().add(chunk);
+                    _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), acc));
+                    let rest = _mm512_add_epi32(iota, _mm512_set1_epi32(lo.count_ones() as i32));
+                    acc = _mm512_maskz_expand_ps(hi, _mm512_permutexvar_ps(rest, src));
+                    acc_at = chunk + 16;
+                }
             }
             let (word, bit) = (first >> 6, first & 63);
             present[word] |= u64::from(mask) << bit;
@@ -1450,6 +1480,13 @@ unsafe fn accumulate_run_avx512(
             mark_lanes(scores, present, base, dids, contributions);
         }
         i += 8;
+    }
+    if acc_at != usize::MAX {
+        // SAFETY: as above; `acc_at` is a chunk inside the window.
+        unsafe {
+            let slot = scores.as_mut_ptr().add(acc_at);
+            _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), acc));
+        }
     }
     i
 }
