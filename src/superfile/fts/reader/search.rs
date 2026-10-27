@@ -20,7 +20,7 @@ use super::{
     metadata::NormTable,
     options::BoolMode,
     phrase::AnyCursor,
-    scorers::{BUFFERED_TOPK_MIN_K, score_postings},
+    scorers::{BUFFERED_TOPK_MIN_K, count_excluding, score_postings},
     sink::{Collector, LiveFloor, TopKBuffer, TopKEntry, and_heap_push, drain_top_k_desc},
     work::{
         MatchWork, atom_cursor_bytes, atom_planned_ranges, term_cursor_bytes, term_cursor_ranges,
@@ -919,8 +919,66 @@ impl FtsReader {
             prep.exact_count(),
             "run_prepared_with_count takes clauses prepared with exact_count"
         );
+        // Counting needs every match but no score, and the top `k` needs
+        // scores but not every match: where the count is a cheap merge of
+        // posting lists (a union, one term, the required side of a must+should,
+        // all minus their negations), the two are answered apart, the hits by
+        // the pruned ranked walk. A row-set filter is not a negation the count
+        // can apply, so those, and intersections and phrases, whose counting
+        // costs about what scoring does, keep the one exhaustive pass.
+        let countable =
+            |filter: &Option<ExcludeFilter>| filter.as_ref().is_none_or(|f| f.allow.is_none());
+        let negated = |filter: &Option<ExcludeFilter>| {
+            filter.as_ref().map_or_else(Vec::new, |f| f.cursors.clone())
+        };
         let (hits, count) = match prep {
             PreparedClauses::Done { hits, count, .. } => (hits, count),
+            PreparedClauses::Or {
+                column_id,
+                cursors,
+                mut filter,
+                k,
+                floor_eff,
+                ..
+            } if countable(&filter) => {
+                let count = count_excluding(cursors.clone(), false, negated(&filter));
+                let hits =
+                    self.dispatch_or_algo(column_id, cursors, k, filter.as_mut(), floor_eff)?;
+                (hits, count)
+            }
+            PreparedClauses::Must {
+                column_id,
+                must_cursors,
+                mut filter,
+                k,
+                floor_eff,
+                ..
+            } if must_cursors.len() == 1 && countable(&filter) => {
+                let count = count_excluding(must_cursors.clone(), true, negated(&filter));
+                let hits =
+                    self.dispatch_or_algo(column_id, must_cursors, k, filter.as_mut(), floor_eff)?;
+                (hits, count)
+            }
+            PreparedClauses::MustShould {
+                column_id,
+                must_cursors,
+                should_cursors,
+                mut filter,
+                k,
+                floor_eff,
+                ..
+            } if countable(&filter) => {
+                let count = count_excluding(must_cursors.clone(), true, negated(&filter));
+                let hits = self.run_must_should(
+                    column_id,
+                    must_cursors,
+                    should_cursors,
+                    k,
+                    filter.as_mut(),
+                    floor_eff,
+                )?;
+                (hits, count)
+            }
             // One required term matches exactly its own postings, as a
             // one-term union does: that walk scores a block at a time.
             PreparedClauses::Must {
