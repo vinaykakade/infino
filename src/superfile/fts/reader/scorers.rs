@@ -640,6 +640,61 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
     seed
 }
 
+/// A lower bound on a must+should query's `k`-th best before its walk: the
+/// required term's docs in its best blocks, scored in full — the required
+/// term first and the optional terms in query order, as the walk sums them,
+/// probed on copies so the walk's cursors stay put — and the `k`-th best of
+/// those. Every such doc matches, so `k` of them bound the answer's `k`-th
+/// from below; with the optional terms in, the bound clears the required
+/// term's own maxima, which is what lets the walk go optional-first from its
+/// start. One ulp down keeps a tied doc. `NEG_INFINITY` when the blocks hold
+/// fewer than `k` docs.
+fn must_should_seed(
+    lead: &TermCursor,
+    shoulds: &[TermCursor],
+    k: usize,
+    dl_norm: &NormTable,
+) -> f32 {
+    let n_blocks = lead.blocks.len();
+    if lead.predecoded || lead.df < k as u64 {
+        return f32::NEG_INFINITY;
+    }
+    let need = (UNION_SEED_DEPTH * (k.div_ceil(BLOCK_LEN) + 1)).min(n_blocks);
+    let mut order: Vec<usize> = (0..n_blocks).collect();
+    order.select_nth_unstable_by(need - 1, |&a, &b| {
+        lead.blocks[b]
+            .block_max_bm25
+            .total_cmp(&lead.blocks[a].block_max_bm25)
+    });
+    // In doc order, as the probes need.
+    order[..need].sort_unstable();
+    let (mut ids, mut tfs) = ([0u32; BLOCK_LEN], [0u32; BLOCK_LEN]);
+    let (mut docs, mut scores, mut block_scores) = (Vec::new(), Vec::new(), Vec::new());
+    for &b in &order[..need] {
+        let n = lead.decode_block_into(b, &mut ids, &mut tfs);
+        score_postings(
+            lead.idf_weight,
+            &ids[..n],
+            &tfs[..n],
+            dl_norm,
+            &mut block_scores,
+        );
+        docs.extend_from_slice(&ids[..n]);
+        scores.extend_from_slice(&block_scores);
+    }
+    if scores.len() < k {
+        return f32::NEG_INFINITY;
+    }
+    let mut probe_tfs: Vec<u32> = vec![0; docs.len()];
+    for c in shoulds {
+        let mut probe = c.clone();
+        probe.probe_tfs(&docs, &mut probe_tfs);
+        add_term_scores(c.idf_weight, &docs, &probe_tfs, dl_norm, &mut scores);
+    }
+    let (_, &mut kth, _) = scores.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+    pruning_bar(kth, shoulds.len() + 1).next_down()
+}
+
 /// A non-essential union term whose estimated docs in a window are at most
 /// this many times the essential terms' is accumulated in that window
 /// rather than probed.
@@ -2016,7 +2071,11 @@ impl FtsReader {
             && (k <= WAND_BMW_2TERM_MAX_K || optional != 2)
         {
             let lead = must_cursors.pop().expect("one must cursor");
-            must_lead_should_walk(lead, should_cursors, k, filter, floor_eff, dl_norm_k1, heap);
+            let floor = match k >= UNION_SEED_MIN_K && filter.is_none() {
+                true => floor_eff.max(must_should_seed(&lead, &should_cursors, k, dl_norm_k1)),
+                false => floor_eff,
+            };
+            must_lead_should_walk(lead, should_cursors, k, filter, floor, dl_norm_k1, heap);
             return;
         }
         must_cursors.sort_by_key(|c| c.block_count());
