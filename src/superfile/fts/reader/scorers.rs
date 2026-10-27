@@ -1252,6 +1252,19 @@ fn mark_lanes<const N: usize>(
     }
 }
 
+/// Whether any of `scores` is above `threshold`, compared lane-wise eight at
+/// a time so it vectorizes (a running `max` over floats does not).
+fn any_beats(scores: &[f32], threshold: f32) -> bool {
+    let mut hit = [0u32; 8];
+    let mut chunks = scores.chunks_exact(8);
+    for chunk in chunks.by_ref() {
+        for (h, &x) in hit.iter_mut().zip(chunk) {
+            *h |= u32::from(x > threshold);
+        }
+    }
+    hit.iter().fold(0, |a, &h| a | h) != 0 || chunks.remainder().iter().any(|&x| x > threshold)
+}
+
 /// Whether any of one presence word's 64 window slots scores above
 /// `threshold`. Compared lane-wise eight at a time so it vectorizes; a
 /// running `max` over floats does not, as `f32::max` cannot be reassociated.
@@ -2903,6 +2916,12 @@ impl FtsReader {
                 match filter.as_deref_mut() {
                     // Every doc counts; only one that beats the k-th best (or
                     // fills the heap) is offered, which is the offer's own test.
+                    // Once the heap is full, a block none of whose scores beats
+                    // the k-th best is counted whole and passed over, one
+                    // lane-wise compare instead of a branch per doc.
+                    None if heap.len() >= k && !any_beats(&lane_scores, threshold) => {
+                        count += (to - from) as u64;
+                    }
                     None => {
                         count += (to - from) as u64;
                         for (&doc, &score) in docs.zip(&lane_scores) {
