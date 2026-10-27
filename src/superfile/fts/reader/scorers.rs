@@ -2016,7 +2016,14 @@ impl FtsReader {
             && (k <= WAND_BMW_2TERM_MAX_K || optional != 2)
         {
             let lead = must_cursors.pop().expect("one must cursor");
-            must_lead_should_walk(lead, should_cursors, k, filter, floor_eff, dl_norm_k1, heap);
+            // Every document of the required term matches, scoring at least
+            // its required-term score: the k-th best of those over the term's
+            // best blocks bounds the answer's k-th from below.
+            let floor = match k >= UNION_SEED_MIN_K && filter.is_none() {
+                true => floor_eff.max(union_seed(std::slice::from_ref(&lead), k, dl_norm_k1)),
+                false => floor_eff,
+            };
+            must_lead_should_walk(lead, should_cursors, k, filter, floor, dl_norm_k1, heap);
             return;
         }
         must_cursors.sort_by_key(|c| c.block_count());
