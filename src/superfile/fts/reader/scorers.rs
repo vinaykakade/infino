@@ -7,7 +7,7 @@
 //! reader `core` as its own `impl FtsReader` block.
 
 #[cfg(test)]
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::{cmp::Ordering, collections::BinaryHeap, mem, slice::from_mut};
 
 use wide::f32x8;
@@ -187,6 +187,9 @@ thread_local! {
     /// walk can see it. The accompanying test checks the claims directly.
     pub(super) static BOUND_CLAIMS: RefCell<Vec<BoundClaim>> =
         const { RefCell::new(Vec::new()) };
+    /// How many times a ranked-union window promoted a non-essential term,
+    /// so a test of promotion can show it ran rather than pass vacuously.
+    pub(super) static PROMOTIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// One bound and the `[from, to)` docs it is claimed to cover.
@@ -3536,6 +3539,8 @@ impl FtsReader {
                     // drained already, and a doc below `min_doc` holds no
                     // essential term, so it cannot beat the bar.
                     cursors[f_win].reseek(min_doc);
+                    #[cfg(test)]
+                    PROMOTIONS.with(|p| p.set(p.get() + 1));
                     f_win += 1;
                 }
             }
@@ -4081,6 +4086,7 @@ mod tests {
             builder::FtsBuilder,
             posting::{ENCODING_BITSET, block_encoding},
             reader::BoolMode,
+            short::SHORT_MAX_DF,
             tokenize::StandardTokenizer,
         },
         id_space::{FtsDocId, RowId},
@@ -5830,27 +5836,22 @@ mod tests {
         }
     }
 
-    /// A union at a `k` the seed serves ranks as the unpruned exhaustive walk
-    /// does, doc for doc: the seeded bar never drops a doc of the top `k`. One
-    /// shape where the seed is tight — a common term with a less common one,
-    /// so the union's `k`-th best is mostly the common term's own — and one
-    /// with a stopword and overlapping terms, where it sits well below. At
-    /// `k` = 2,000 the less common term holds fewer than `k` docs, so the pair
-    /// is split instead and the lone common term is seeded.
-    #[tokio::test]
-    async fn seeded_large_k_union_agrees_with_the_exhaustive_walk() {
+    /// A reader over `n_docs` docs in which each `(word, per_mille)` lands in
+    /// about that many docs per thousand, one to three times, each doc padded
+    /// with up to 29 filler tokens; `seed` fixes the draw.
+    fn random_corpus(seed: u64, n_docs: u32, words: &[(&str, u64)]) -> FtsReader {
         let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
-        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut x = seed;
         let mut next = move || {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
             x
         };
-        for i in 0..6_000u32 {
+        for i in 0..n_docs {
             let mut text = String::new();
-            for (word, per_mille) in [("stop", 950u64), ("mid", 400), ("rare", 180), ("few", 8)] {
+            for &(word, per_mille) in words {
                 if next() % 1000 < per_mille {
                     for _ in 0..1 + next() % 3 {
                         text.push_str(word);
@@ -5862,27 +5863,106 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
-        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-        for terms in [&["mid", "rare"][..], &["stop", "mid", "rare"]] {
-            for k in [UNION_SEED_MIN_K, 1_000, 2_000] {
-                let got = r
-                    .search("body", terms, k, BoolMode::Or)
-                    .await
-                    .expect("search");
-                let want = r
-                    .search_with_algo_for_bench("body", terms, k, OrAlgo::Exhaustive)
-                    .await
-                    .expect("exhaustive");
-                assert_eq!(got.len(), want.len(), "{terms:?} k {k}");
-                for ((dg, sg), (dw, sw)) in got.iter().zip(&want) {
-                    assert_eq!(dg.get(), dw.get(), "{terms:?} k {k}: {sg} vs {sw}");
-                    assert!(
-                        (sg - sw).abs() < 1e-4,
-                        "{terms:?} k {k}: {dg:?} {sg} vs {dw:?} {sw}"
-                    );
-                }
+        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// Assert that `search` ranks `terms` at `k` as the exhaustive walk does,
+    /// doc for doc. Over one or two terms the scores match bit for bit, a sum
+    /// of two being the same in either order; over more the kernels sum in
+    /// different orders, so to within 1e-4.
+    async fn assert_ranks_as_exhaustive(r: &FtsReader, terms: &[&str], k: usize) {
+        let got = r
+            .search("body", terms, k, BoolMode::Or)
+            .await
+            .expect("search");
+        let want = r
+            .search_with_algo_for_bench("body", terms, k, OrAlgo::Exhaustive)
+            .await
+            .expect("exhaustive");
+        assert_eq!(got.len(), want.len(), "{terms:?} k {k}");
+        for ((dg, sg), (dw, sw)) in got.iter().zip(&want) {
+            let what = format!("{terms:?} k {k}: {} {sg} vs {} {sw}", dg.get(), dw.get());
+            assert_eq!(dg.get(), dw.get(), "{what}");
+            match terms.len() <= 2 {
+                true => assert_eq!(sg.to_bits(), sw.to_bits(), "{what}"),
+                false => assert!((sg - sw).abs() < 1e-4, "{what}"),
             }
         }
+    }
+
+    /// A union at a `k` the seed serves ranks as the unpruned exhaustive walk
+    /// does: the seeded bar never drops a doc of the top `k`. One shape where
+    /// the seed is tight — a common term with a less common one, so the
+    /// union's `k`-th best is mostly the common term's own — and one with a
+    /// stopword and overlapping terms, where it sits well below. At `k` =
+    /// 2,000 the less common term holds fewer than `k` docs, so the pair is
+    /// split instead and the lone common term is seeded.
+    #[tokio::test]
+    async fn seeded_large_k_union_agrees_with_the_exhaustive_walk() {
+        let words = [("stop", 950), ("mid", 400), ("rare", 180), ("few", 8)];
+        let r = random_corpus(0x2545_F491_4F6C_DD1D, 6_000, &words);
+        for terms in [&["mid", "rare"][..], &["stop", "mid", "rare"]] {
+            for k in [UNION_SEED_MIN_K, 1_000, 2_000] {
+                assert_ranks_as_exhaustive(&r, terms, k).await;
+            }
+        }
+    }
+
+    /// A union whose rarest term is stored in short form, its whole list
+    /// decoded up front with no block table, yet holds at least `k` docs: the
+    /// seed passes over that term and seeds from the others, and the union
+    /// ranks as the exhaustive walk does.
+    #[tokio::test]
+    async fn a_seed_passes_over_a_short_form_term() {
+        let words = [("short", 33), ("mid", 133), ("wide", 167)];
+        let r = random_corpus(0xD1B5_4A32_D192_ED03, 3_000, &words);
+        let df = r.term_df("body", "short").await.expect("df").0;
+        assert!(
+            (UNION_SEED_MIN_K as u64..=SHORT_MAX_DF as u64).contains(&df),
+            "`short` holds {df} docs"
+        );
+        for k in [UNION_SEED_MIN_K, df as usize] {
+            assert_ranks_as_exhaustive(&r, &["short", "mid", "wide"], k).await;
+        }
+    }
+
+    /// A ranked union promotes a non-essential term into a window where it
+    /// holds few docs, reseeking it there after the windows before probed it,
+    /// and ranks as the exhaustive walk does. `c` is in every doc of the
+    /// first third, where it is probed, and in one doc in ten after, where
+    /// it is accumulated; `a` and `b` are the essentials throughout.
+    #[tokio::test]
+    async fn a_promoted_term_ranks_as_the_exhaustive_walk() {
+        const N_DOCS: u32 = 3 * OR_WINDOW + 500;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        let mut x: u64 = 0xA076_1D64_78BD_642F;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for i in 0..N_DOCS {
+            let mut text = String::new();
+            for word in ["a", "b"] {
+                if next() % 10 < 3 {
+                    text.push_str(&format!("{word} ").repeat(1 + (next() % 3) as usize));
+                }
+            }
+            if i < N_DOCS / 3 || next() % 10 == 0 {
+                text.push_str("c ");
+            }
+            text.push_str(&"pad ".repeat((next() % 30) as usize));
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        PROMOTIONS.with(|p| p.set(0));
+        for k in [UNION_SEED_MIN_K, 100, 1_000] {
+            assert_ranks_as_exhaustive(&r, &["a", "b", "c"], k).await;
+        }
+        assert!(PROMOTIONS.with(Cell::get) > 0, "no window promoted `c`");
     }
 
     /// A seed one place too high drops the `k`-th doc only where it is the
@@ -5891,8 +5971,8 @@ mod tests {
     /// its tfs fall with the doc id, so each posting block holds the next
     /// `BLOCK_LEN` ranks: at `k` one past a block, the `k`-th doc heads the
     /// next. A union with a rarer term over its best docs, which splits and
-    /// seeds `x` as a lone term, and `x` searched alone must both rank
-    /// exactly as the exhaustive walk does.
+    /// seeds `x` as a lone term, must rank exactly as the exhaustive walk
+    /// does.
     #[tokio::test]
     async fn a_seed_over_distinct_scores_keeps_the_kth_doc() {
         /// Docs holding `x`, the `i`-th `X_DOCS - i` times; each doc's
@@ -5914,24 +5994,48 @@ mod tests {
         }
         let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-        for terms in [&["x", "y"][..], &["x"]] {
-            for k in [UNION_SEED_MIN_K, BLOCK_LEN + 1, 2 * BLOCK_LEN + 1] {
-                let got: Vec<(u32, u32)> = r
-                    .search("body", terms, k, BoolMode::Or)
-                    .await
-                    .expect("search")
-                    .into_iter()
-                    .map(|(d, s)| (d.get(), s.to_bits()))
-                    .collect();
-                let want: Vec<(u32, u32)> = r
-                    .search_with_algo_for_bench("body", terms, k, OrAlgo::Exhaustive)
-                    .await
-                    .expect("exhaustive")
-                    .into_iter()
-                    .map(|(d, s)| (d.get(), s.to_bits()))
-                    .collect();
-                assert_eq!(got, want, "{terms:?} k {k}");
+        for k in [UNION_SEED_MIN_K, BLOCK_LEN + 1, 2 * BLOCK_LEN + 1] {
+            assert_ranks_as_exhaustive(&r, &["x", "y"], k).await;
+        }
+    }
+
+    /// The single-term walk's seed, over a list long enough to be seeded,
+    /// keeps the `k`-th doc where a seed one place too high would lose it:
+    /// `k - 1` docs score highest and alike, and the `k`-th scores apart and
+    /// below them, alone in a block of the lowest scores, so that block's
+    /// bound sits under the `(k-1)`-th. Every doc has one length, so tf alone
+    /// orders the scores. Checked with the heap collector and the buffer.
+    #[tokio::test]
+    async fn a_single_term_seed_keeps_the_kth_doc_alone_in_its_block() {
+        /// Enough docs for the seeded single-term walk (`seed::MIN_BLOCKS`
+        /// blocks of `BLOCK_LEN`), every one holding `x`.
+        const N_DOCS: u32 = 34_000;
+        /// Tokens per doc.
+        const DOC_LEN: usize = 4;
+        for k in [UNION_SEED_MIN_K, BUFFERED_TOPK_MIN_K + 100] {
+            // The best `k - 1` lead the list, inside the blocks the seed
+            // reads; the `k`-th sits in the middle of the last block, so
+            // neither its block nor its span of blocks holds one of them.
+            let kth_doc = N_DOCS - BLOCK_LEN as u32 / 2;
+            let mut b = FtsBuilder::new();
+            b.register_column("body".into(), false).expect("register");
+            for i in 0..N_DOCS {
+                let tf = match i {
+                    _ if i == kth_doc => 2,
+                    _ if i < k as u32 - 1 => 3,
+                    _ => 1,
+                };
+                let text = ["x "].repeat(tf).concat() + &["pad "].repeat(DOC_LEN - tf).concat();
+                b.add_doc(0, i, text.trim()).expect("add doc");
             }
+            let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+            let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+            assert_ranks_as_exhaustive(&r, &["x"], k).await;
+            let hits = r
+                .search("body", &["x"], k, BoolMode::Or)
+                .await
+                .expect("search");
+            assert_eq!(hits[k - 1].0.get(), kth_doc, "k {k}");
         }
     }
 
@@ -5961,73 +6065,20 @@ mod tests {
         }
         let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-        let terms = ["rarer", "commoner"];
-        let got: Vec<u32> = r
-            .search("body", &terms, k, BoolMode::Or)
-            .await
-            .expect("search")
-            .into_iter()
-            .map(|(d, _)| d.get())
-            .collect();
-        let want: Vec<u32> = r
-            .search_with_algo_for_bench("body", &terms, k, OrAlgo::Exhaustive)
-            .await
-            .expect("exhaustive")
-            .into_iter()
-            .map(|(d, _)| d.get())
-            .collect();
-        assert_eq!(got.len(), k);
-        assert_eq!(got, want);
+        assert_ranks_as_exhaustive(&r, &["rarer", "commoner"], k).await;
     }
 
     /// A union with a term holding fewer than `k` documents, at a `k` far
     /// past the small-`k` routes: the rare term is split off and its
     /// documents merged with the other terms ranked alone, which must rank as
-    /// the exhaustive walk does, doc for doc, for a pair and for three terms.
+    /// the exhaustive walk does, for a pair and for three terms.
     #[tokio::test]
     async fn a_union_with_a_term_under_k_documents_agrees_with_the_exhaustive_walk() {
-        let mut b = FtsBuilder::new();
-        b.register_column("body".into(), false).expect("register");
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next = move || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        };
-        for i in 0..6_000u32 {
-            let mut text = String::new();
-            for (word, per_mille) in [("stop", 900u64), ("mid", 300), ("rare", 8)] {
-                if next() % 1000 < per_mille {
-                    for _ in 0..1 + next() % 3 {
-                        text.push_str(word);
-                        text.push(' ');
-                    }
-                }
-            }
-            text.push_str(&"pad ".repeat((next() % 30) as usize));
-            b.add_doc(0, i, text.trim()).expect("add doc");
-        }
-        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
-        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let words = [("stop", 900), ("mid", 300), ("rare", 8)];
+        let r = random_corpus(0x9E37_79B9_7F4A_7C15, 6_000, &words);
         for terms in [&["rare", "stop"][..], &["rare", "mid", "stop"]] {
             for k in [WAND_BMW_2TERM_MAX_K + 1, 1_000] {
-                let got = r
-                    .search("body", terms, k, BoolMode::Or)
-                    .await
-                    .expect("search");
-                let want = r
-                    .search_with_algo_for_bench("body", terms, k, OrAlgo::Exhaustive)
-                    .await
-                    .expect("exhaustive");
-                assert_eq!(got.len(), want.len(), "{terms:?} k {k}");
-                for ((dg, sg), (dw, sw)) in got.iter().zip(&want) {
-                    assert_eq!(dg.get(), dw.get(), "{terms:?} k {k}: {sg} vs {sw}");
-                    assert!(
-                        (sg - sw).abs() < 1e-4,
-                        "{terms:?} k {k}: {dg:?} {sg} vs {dw:?} {sw}"
-                    );
-                }
+                assert_ranks_as_exhaustive(&r, terms, k).await;
             }
         }
     }

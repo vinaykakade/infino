@@ -2254,6 +2254,95 @@ mod tests {
         assert_eq!(count, 2, "docs 0 and 2 are allowed and match");
     }
 
+    /// A counted single-term search with a negation folds the negated list
+    /// into a bitset; under a row-set filter it must not, as that bitset
+    /// knows nothing of the rows. Every doc holds `w`, so the fold's density
+    /// gate passes: only the row set keeps it off. The count and the hits are
+    /// those of the allowed, unnegated docs.
+    #[tokio::test]
+    async fn a_counted_single_term_with_a_negation_honours_the_allow_set() {
+        const N_DOCS: u32 = 2_000;
+        /// `x`, the negated term, is in one doc in this many.
+        const X_STRIDE: u32 = 7;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let text = match i.is_multiple_of(X_STRIDE) {
+                true => format!("w x {}", ["pad "].repeat((i % 5) as usize).concat()),
+                false => format!("w {}", ["pad "].repeat((i % 5) as usize).concat()),
+            };
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let allow: Arc<RoaringBitmap> = Arc::new((0..N_DOCS).step_by(2).collect());
+        let lists = || ClauseLists {
+            shoulds: &["w"],
+            negatives: &["x"],
+            allow: Some(Arc::clone(&allow)),
+            ..ClauseLists::default()
+        };
+        let want = (0..N_DOCS)
+            .filter(|i| i.is_multiple_of(2) && !i.is_multiple_of(X_STRIDE))
+            .count() as u64;
+        for k in [1, 10, 100] {
+            let (hits, count) = r
+                .search_excluding_with_count("body", lists(), k)
+                .await
+                .expect("counted search");
+            let pruned = r
+                .search_excluding("body", lists(), k, f32::NEG_INFINITY)
+                .await
+                .expect("pruned search");
+            assert_eq!(count, want, "k {k}");
+            assert!(
+                hits.iter().all(|(d, _)| d.get() % 2 == 0),
+                "k {k}: {hits:?}"
+            );
+            assert_same_top_k(&hits, &pruned, "allow-set with a negation");
+        }
+    }
+
+    /// A counted single-term search passes over a block none of whose scores
+    /// can enter the top `k`, testing its scores eight at a time and the rest
+    /// one by one. The best doc here sits in the term's last block, a few
+    /// docs too short for a group of eight: passing over that block would
+    /// lose it.
+    #[tokio::test]
+    async fn a_counted_single_term_finds_the_best_doc_in_a_short_last_block() {
+        /// Docs holding `x`: three full blocks and a short fourth.
+        const N_DOCS: u32 = 3 * BLOCK_LEN as u32 + 5;
+        /// Tokens per doc, so tf alone orders the scores.
+        const DOC_LEN: usize = 12;
+        const BEST_TF: usize = 10;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let tf = if i == N_DOCS - 1 { BEST_TF } else { 1 };
+            let text = ["x "].repeat(tf).concat() + &["pad "].repeat(DOC_LEN - tf).concat();
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let lists = || ClauseLists {
+            shoulds: &["x"],
+            ..ClauseLists::default()
+        };
+        for k in [1, 3] {
+            let (hits, count) = r
+                .search_excluding_with_count("body", lists(), k)
+                .await
+                .expect("counted search");
+            let pruned = r
+                .search_excluding("body", lists(), k, f32::NEG_INFINITY)
+                .await
+                .expect("pruned search");
+            assert_eq!(count, u64::from(N_DOCS), "k {k}");
+            assert_eq!(hits[0].0.get(), N_DOCS - 1, "k {k}");
+            assert_same_top_k(&hits, &pruned, "short last block");
+        }
+    }
+
     /// A table-wide search scores with its map's idf alone: a scored term
     /// the map leaves out is an error, never this superfile's own idf.
     #[tokio::test]
