@@ -3037,6 +3037,12 @@ impl FtsReader {
             top_k_initial_capacity(k, u64::from(self.n_docs), Some((doc_id_start, doc_id_end)));
         let mut heap = C::with_capacity(k, initial_cap);
         let mut threshold: f32 = floor_eff.max(0.0);
+        // A floor bars every doc at or under it, as a full collector's k-th
+        // does: pruning against the bar holds from the first window, not only
+        // once `k` docs are in. Without this a seeded floor, under which most
+        // docs fall, kept the collector from filling and every window on its
+        // unpruned path.
+        let floored = floor_eff > f32::NEG_INFINITY;
         // Bounds are tested against the threshold lowered for summing order
         // (see [`pruning_bar`]); offers compare real scores with it.
         let pb = |t: f32| pruning_bar(t, n);
@@ -3087,7 +3093,7 @@ impl FtsReader {
                 }
                 // Skip the whole block if it cannot beat threshold.
                 let mut block_others_ub = f32::INFINITY;
-                if heap.is_full(k) {
+                if floored || heap.is_full(k) {
                     // The other terms bounded over this block's own range,
                     // not their whole lists: a mid-frequency term's best
                     // document elsewhere must not hold this block open.
@@ -3342,7 +3348,7 @@ impl FtsReader {
             // restricted to essentials.
             // Block-max skip fires only once the heap is full (threshold is a
             // real k-th score); hoisted so the per-posting loop doesn't re-test.
-            let prune = heap.is_full(k);
+            let prune = floored || heap.is_full(k);
             // Block-level partition for this window. A term whose block maxima
             // over the window cannot lift the weaker terms past the threshold
             // is non-essential *here*, even if its term max keeps it essential
@@ -3493,7 +3499,7 @@ impl FtsReader {
             // the reference pipeline: SIMD-filter to competitive survivors,
             // complete the non-essentials over the survivors only, collect.
             let (_, non_ess) = cursors.split_at_mut(f_win);
-            let heap_full = heap.is_full(k);
+            let heap_full = floored || heap.is_full(k);
             let words = ((window_end - base) as usize)
                 .div_ceil(64)
                 .min(OR_WINDOW_WORDS);
@@ -3510,7 +3516,7 @@ impl FtsReader {
                     }
                     // A word whose best score cannot beat the k-th best holds no
                     // hit: clear its slots without visiting a document.
-                    if heap.is_full(k) {
+                    if floored || heap.is_full(k) {
                         let slots = &mut scores[word_idx << 6..(word_idx + 1) << 6];
                         if !word_beats(slots, threshold) {
                             slots.fill(0.0);
