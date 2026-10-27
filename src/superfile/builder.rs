@@ -1759,29 +1759,32 @@ impl SuperfileBuilder {
             // band and re-raise after the walk (the sentinel `FtsError`
             // only stops iteration).
             let mut push_err: Option<BuildError> = None;
-            let walk = fts.for_each_term_posting(column_id, |term, local_doc, tf, positions| {
-                let Some(out_doc) = remap[local_doc as usize] else {
-                    return Ok(());
-                };
-                let term_str = from_utf8(term).map_err(|_| {
-                    FtsError::Read(ReadError::Malformed(
-                        "non-utf8 term in FTS merge input".into(),
-                    ))
-                })?;
-                // `remap` already names the output blob's doc ids: the
-                // reordering merge converts through the chosen order and
-                // the arrival-order carries convert from the row, so
-                // nothing is left to translate here.
-                if let Err(e) =
-                    fb.add_prebuilt_term_posting(column_id, term_str, out_doc, tf, positions)
-                {
-                    push_err = Some(e);
-                    return Err(FtsError::Read(ReadError::Malformed(
-                        "prebuilt push aborted".into(),
-                    )));
-                }
-                Ok(())
-            });
+            let walk =
+                fts.for_each_term_posting(column_id, |term, local_doc, tf, positions, sig| {
+                    let Some(out_doc) = remap[local_doc as usize] else {
+                        return Ok(());
+                    };
+                    let term_str = from_utf8(term).map_err(|_| {
+                        FtsError::Read(ReadError::Malformed(
+                            "non-utf8 term in FTS merge input".into(),
+                        ))
+                    })?;
+                    // `remap` already names the output blob's doc ids: the
+                    // reordering merge converts through the chosen order and
+                    // the arrival-order carries convert from the row, so
+                    // nothing is left to translate here. The signature rides
+                    // along: it describes the doc's other terms, which this
+                    // walk never sees.
+                    if let Err(e) = fb
+                        .add_prebuilt_term_posting(column_id, term_str, out_doc, tf, positions, sig)
+                    {
+                        push_err = Some(e);
+                        return Err(FtsError::Read(ReadError::Malformed(
+                            "prebuilt push aborted".into(),
+                        )));
+                    }
+                    Ok(())
+                });
             if let Some(e) = push_err {
                 return Err(e);
             }
@@ -6166,7 +6169,7 @@ mod tests {
         let mut postings: Vec<(Vec<u8>, u32, u32, Vec<u32>)> = Vec::new();
         let mut doc_lengths: Vec<u32> = Vec::new();
         for column_id in 0..n_cols {
-            fts.for_each_term_posting(column_id, |term, doc_id, tf, pos| {
+            fts.for_each_term_posting(column_id, |term, doc_id, tf, pos, _| {
                 postings.push((term.to_vec(), row_of(doc_id), tf, pos.to_vec()));
                 Ok(())
             })
@@ -7705,7 +7708,7 @@ mod tests {
                     column_id,
                     once((term.as_slice(), value)),
                     &mut Vec::new(),
-                    |_, _, _, _| {
+                    |_, _, _, _, _| {
                         postings += 1;
                         Ok(())
                     },

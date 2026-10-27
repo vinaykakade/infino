@@ -7,6 +7,9 @@
 //! phrase uniformly. Drives both scored phrase search and phrase count.
 //! Scoped `pub(super)` to the `reader/` module.
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use bytes::Bytes;
 
 use super::{
@@ -16,8 +19,18 @@ use super::{
 use crate::superfile::{
     ReadError,
     error::FtsError,
-    fts::{bm25, positions::GroupIndex},
+    fts::{
+        bm25,
+        positions::{GroupIndex, SIG_UNKNOWN, group_signatures_at},
+    },
 };
+
+#[cfg(test)]
+thread_local! {
+    /// Phrase candidates this thread rejected by adjacency signature, so a
+    /// test can tell the filter fired rather than only that results agree.
+    pub(super) static SIG_REJECTS: Cell<u64> = const { Cell::new(0) };
+}
 
 /// One member term of a [`PhraseCursor`]: its posting cursor, its
 /// fetched position groups, and the current block's group located for
@@ -55,6 +68,10 @@ pub(super) struct PhraseMember {
     /// candidates by located pair ([`Self::located_positions`]).
     tfs: Vec<u32>,
     tfs_block: usize,
+    /// Where block `sig_block`'s group keeps its pair signatures, `None`
+    /// when it keeps none.
+    sig_base: Option<usize>,
+    sig_block: usize,
 }
 
 /// Sentinel for [`PhraseMember::group_block`]: no block located.
@@ -106,6 +123,25 @@ impl PhraseMember {
         }
         self.ensure_tfs(block);
         self.tfs[pair]
+    }
+
+    /// The member's adjacency signature in its `pair`-th posting of block
+    /// `block`: two byte reads at a block it has seen, one skip-table read
+    /// more at a new one, and no position group parsed.
+    /// [`SIG_UNKNOWN`] for an inline member or a group without signatures.
+    fn located_sig(&mut self, block: usize, pair: usize) -> u8 {
+        if self.inline_position.is_some() {
+            return SIG_UNKNOWN;
+        }
+        if self.sig_block != block {
+            let term_meta = self.term_meta.as_ref().expect("PFOR member has term meta");
+            let at = term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
+            self.sig_base = group_signatures_at(&self.positions, at);
+            self.sig_block = block;
+        }
+        self.sig_base
+            .and_then(|base| self.positions.get(base + pair).copied())
+            .unwrap_or(SIG_UNKNOWN)
     }
 
     /// The member's positions in its `pair`-th posting of block `block`,
@@ -192,12 +228,12 @@ fn verify_members(
     Ok(starts.len() as u32)
 }
 
-/// Compact `locs` to the entries at `kept` (ascending indices into it).
-fn compact_locs(locs: &mut Vec<(u32, u32)>, kept: &[u32]) {
+/// Compact `items` to the entries at `kept` (ascending indices into it).
+fn compact<T: Copy>(items: &mut Vec<T>, kept: &[u32]) {
     for (i, &k) in kept.iter().enumerate() {
-        locs[i] = locs[k as usize];
+        items[i] = items[k as usize];
     }
-    locs.truncate(kept.len());
+    items.truncate(kept.len());
 }
 
 /// Doc-at-a-time cursor over an exact phrase: the members'
@@ -260,6 +296,13 @@ pub(super) struct PhraseCursor {
     cand_locs: Vec<Vec<(u32, u32)>>,
     /// Scratch: which candidates a member's filter kept.
     kept: Vec<u32>,
+    /// `(i, bit)` per member `i` whose successor in query order sits one
+    /// position after it: a candidate whose signature for member `i` lacks
+    /// `bit`, the successor's [`next_bit`](crate::superfile::fts::positions::next_bit),
+    /// cannot hold the phrase. Members whose gap a removed stopword widened
+    /// are absent: what follows them in a match is the hole, not the
+    /// successor. So are inline members, which carry no signature.
+    adjacent_sigs: Vec<(usize, u8)>,
     /// Where the next block refill starts: one past the last block
     /// batched. `None` once the rarest member's last block is batched.
     refill_from: Option<u32>,
@@ -267,19 +310,23 @@ pub(super) struct PhraseCursor {
 
 impl PhraseCursor {
     /// Build from member cursors (query order), their fetched
-    /// position runs, and their positional metadata — `(term_meta,
-    /// inline_position)` per member, exactly one of the two present —
-    /// then seek to the first matching doc.
+    /// position runs, their positional metadata — `(term_meta,
+    /// inline_position)` per member, exactly one of the two present — and
+    /// each member term's signature bit
+    /// ([`next_bit`](crate::superfile::fts::positions::next_bit)), then seek
+    /// to the first matching doc.
     pub(super) fn new(
         cursors: Vec<TermCursor>,
         positions: Vec<Bytes>,
         positional: Vec<(Option<TermMeta>, Option<u32>)>,
         offsets: Vec<u32>,
+        next_bits: Vec<u8>,
     ) -> Result<Self, FtsError> {
         debug_assert!(cursors.len() >= 2, "single-token phrases degrade to terms");
         debug_assert_eq!(cursors.len(), positions.len());
         debug_assert_eq!(cursors.len(), positional.len());
         debug_assert_eq!(cursors.len(), offsets.len());
+        debug_assert_eq!(cursors.len(), next_bits.len());
         debug_assert_eq!(offsets.first(), Some(&0), "offsets are normalized");
         debug_assert!(
             offsets.windows(2).all(|w| w[0] < w[1]),
@@ -310,8 +357,14 @@ impl PhraseCursor {
                     group_block: NO_BLOCK_CACHED,
                     tfs: Vec::new(),
                     tfs_block: NO_BLOCK_CACHED,
+                    sig_base: None,
+                    sig_block: NO_BLOCK_CACHED,
                 }
             })
+            .collect();
+        let adjacent_sigs = (0..members.len().saturating_sub(1))
+            .filter(|&i| offsets[i + 1] == offsets[i] + 1 && members[i].inline_position.is_none())
+            .map(|i| (i, next_bits[i + 1]))
             .collect();
         // Rarest-first probe order for alignment: fewest posting blocks
         // (shortest list) first. Query order is preserved in `members`.
@@ -335,6 +388,7 @@ impl PhraseCursor {
             cand_next: 0,
             cand_locs: vec![Vec::new(); n_members],
             kept: Vec::new(),
+            adjacent_sigs,
             refill_from: Some(0),
         };
         cursor.seek_match_unranked(0)?;
@@ -548,9 +602,44 @@ impl PhraseCursor {
                 );
                 self.cand_locs[mi] = locs;
                 for &pj in &self.align_order[..oi] {
-                    compact_locs(&mut self.cand_locs[pj], &self.kept);
+                    compact(&mut self.cand_locs[pj], &self.kept);
                 }
             }
+            self.reject_by_signatures();
+        }
+    }
+
+    /// Drop the batch's candidates that a query-adjacent member pair rules
+    /// out by signature: member `i`'s signature at the candidate lacks the
+    /// next member's bit, so no occurrence of member `i` there is followed
+    /// by the next member's term, and the phrase cannot be in the doc. Most
+    /// candidates of a phrase of common words hold every member but not
+    /// the phrase, and each one dropped here is a doc whose positions are
+    /// never decoded. Runs before the ranked prescreen and verification,
+    /// which see the survivors exactly as they would have.
+    fn reject_by_signatures(&mut self) {
+        if self.adjacent_sigs.is_empty() || self.cands.is_empty() {
+            return;
+        }
+        let (members, locs) = (&mut self.members, &self.cand_locs);
+        self.kept.clear();
+        for c in 0..self.cands.len() {
+            let possible = self.adjacent_sigs.iter().all(|&(i, bit)| {
+                let (b, p) = locs[i][c];
+                members[i].located_sig(b as usize, p as usize) & bit != 0
+            });
+            if possible {
+                self.kept.push(c as u32);
+            }
+        }
+        if self.kept.len() == self.cands.len() {
+            return;
+        }
+        #[cfg(test)]
+        SIG_REJECTS.with(|n| n.set(n.get() + (self.cands.len() - self.kept.len()) as u64));
+        compact(&mut self.cands, &self.kept);
+        for member_locs in &mut self.cand_locs {
+            compact(member_locs, &self.kept);
         }
     }
 
@@ -854,14 +943,28 @@ mod tests {
                 false => vec![0, 1 << 20],
             };
             let beta: Vec<u32> = alpha.iter().map(|p| p + 1).collect();
-            b.add_prebuilt_term_posting(0, "alpha", FtsDocId::new(d), alpha.len() as u32, &alpha)
-                .expect("alpha");
-            b.add_prebuilt_term_posting(0, "beta", FtsDocId::new(d), beta.len() as u32, &beta)
-                .expect("beta");
+            b.add_prebuilt_term_posting(
+                0,
+                "alpha",
+                FtsDocId::new(d),
+                alpha.len() as u32,
+                &alpha,
+                SIG_UNKNOWN,
+            )
+            .expect("alpha");
+            b.add_prebuilt_term_posting(
+                0,
+                "beta",
+                FtsDocId::new(d),
+                beta.len() as u32,
+                &beta,
+                SIG_UNKNOWN,
+            )
+            .expect("beta");
             if d < 3 {
                 // Short-form member (df = 3) with two positions each.
                 let rare = [beta[0] + 1, beta[0] + 7];
-                b.add_prebuilt_term_posting(0, "rare", FtsDocId::new(d), 2, &rare)
+                b.add_prebuilt_term_posting(0, "rare", FtsDocId::new(d), 2, &rare, SIG_UNKNOWN)
                     .expect("rare");
             }
         }
@@ -1116,9 +1219,9 @@ mod tests {
             .collect();
         let filler: Vec<u32> = alpha.iter().map(|p| p + 1).collect();
         for d in 0..N_DOCS {
-            b.add_prebuilt_term_posting(0, "alpha", FtsDocId::new(d), TF, &alpha)
+            b.add_prebuilt_term_posting(0, "alpha", FtsDocId::new(d), TF, &alpha, SIG_UNKNOWN)
                 .expect("alpha");
-            b.add_prebuilt_term_posting(0, "filler", FtsDocId::new(d), TF, &filler)
+            b.add_prebuilt_term_posting(0, "filler", FtsDocId::new(d), TF, &filler, SIG_UNKNOWN)
                 .expect("filler");
         }
         b.append_prebuilt_doc_lengths(0, &vec![2 * TF + OUTLIER_GAP; N_DOCS as usize]);

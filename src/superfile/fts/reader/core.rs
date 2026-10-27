@@ -56,7 +56,7 @@ use crate::{
             analysis::{chain_tokenizer, check_recorded_tokenizer},
             bm25,
             builder::doc_lengths_entry_size,
-            positions::GroupIndex,
+            positions::{GroupIndex, SIG_UNKNOWN, next_bit},
             posting::{BLOCK_LEN, ENCODING_BITSET, ENCODING_RUN, decode_block_doc_ids},
             short::{SHORT_MAX_DF, decode_short},
             tokenize::{Phrase, Tokenizer},
@@ -1557,11 +1557,13 @@ impl FtsReader {
             for (member, group) in inline_groups {
                 positions[member] = group;
             }
+            let next_bits = member_refs.iter().map(|t| next_bit(t.as_bytes())).collect();
             out.push(Some(AnyCursor::Phrase(PhraseCursor::new(
                 cursors,
                 positions,
                 positional,
                 phrase.offsets().to_vec(),
+                next_bits,
             )?)));
         }
         Ok((out, dict_ranges))
@@ -1592,21 +1594,24 @@ impl FtsReader {
 
     /// Stream a column's postings for the FTS compaction merge: for every term
     /// (lex order) and every doc in its posting list (doc_ids ascending),
-    /// invoke `emit(term_bytes, local_doc_id, tf, positions)`. Reuses the
+    /// invoke `emit(term_bytes, local_doc_id, tf, positions, sig)`. Reuses the
     /// query-path [`TermCursor`] block decode for doc_ids/tfs and the
     /// block's position group for positions, so what is streamed is exactly
     /// what a fresh build produced. `positions` is empty for a non-positional
     /// column; otherwise it holds the `tf` token offsets for this `(term, doc)`
     /// (borrowed from a reused buffer — copy it if you need to retain it past
-    /// the call). Tombstone filtering is the caller's job — this streams every
-    /// stored posting.
+    /// the call). `sig` is the posting's adjacency signature as stored, or
+    /// [`SIG_UNKNOWN`] where there is none to carry: a non-positional
+    /// column, an inline posting, or a group written without signatures.
+    /// Tombstone filtering is the caller's job — this streams every stored
+    /// posting.
     ///
     /// Synchronous: compaction opens its inputs over resident bytes, so every
     /// range resolves without a runtime. `emit` may return an error to abort.
     pub(crate) fn for_each_term_posting(
         &self,
         column_id: u32,
-        emit: impl FnMut(&[u8], u32, u32, &[u32]) -> Result<(), FtsError>,
+        emit: impl FnMut(&[u8], u32, u32, &[u32], u8) -> Result<(), FtsError>,
     ) -> Result<(), FtsError> {
         let column_name = &self.columns[column_id as usize].name;
         let dict_bytes = self.dict_bytes()?;
@@ -1662,7 +1667,7 @@ impl FtsReader {
         column_id: u32,
         entries: impl Iterator<Item = (&'t [u8], DictEntry)>,
         positions_buf: &mut Vec<u32>,
-        mut emit: impl FnMut(&[u8], u32, u32, &[u32]) -> Result<(), FtsError>,
+        mut emit: impl FnMut(&[u8], u32, u32, &[u32], u8) -> Result<(), FtsError>,
     ) -> Result<(), FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let positional = col_meta.positions;
@@ -1676,9 +1681,9 @@ impl FtsReader {
                     // implied 1. Non-positional: `tf` is the frequency, no
                     // positions.
                     if positional {
-                        emit(term, doc_id, 1, &[tf])?;
+                        emit(term, doc_id, 1, &[tf], SIG_UNKNOWN)?;
                     } else {
-                        emit(term, doc_id, tf, &[])?;
+                        emit(term, doc_id, tf, &[], SIG_UNKNOWN)?;
                     }
                 }
                 DictEntry::Pfor {
@@ -1713,7 +1718,7 @@ impl FtsReader {
                                 })?;
                         }
                         for i in 0..decoded.n {
-                            let positions: &[u32] = match &position_bytes {
+                            let (positions, sig): (&[u32], u8) = match &position_bytes {
                                 Some(bytes) => {
                                     positions_buf.clear();
                                     group
@@ -1723,11 +1728,11 @@ impl FtsReader {
                                                 "position run overflowing in merge read".into(),
                                             ))
                                         })?;
-                                    positions_buf.as_slice()
+                                    (positions_buf.as_slice(), group.pair_sig(bytes, i))
                                 }
-                                None => &[],
+                                None => (&[], SIG_UNKNOWN),
                             };
-                            emit(term, d[i], t[i], positions)?;
+                            emit(term, d[i], t[i], positions, sig)?;
                         }
                         continue;
                     }
@@ -1778,7 +1783,7 @@ impl FtsReader {
                         while cursor.pos < cursor.block_n {
                             let doc_id = cursor.block_doc_ids[cursor.pos];
                             let tf = cursor.block_tfs[cursor.pos];
-                            let positions: &[u32] = match &position_bytes {
+                            let (positions, sig): (&[u32], u8) = match &position_bytes {
                                 Some(bytes) => {
                                     positions_buf.clear();
                                     group
@@ -1793,11 +1798,11 @@ impl FtsReader {
                                                 "position run overflowing in merge read".into(),
                                             ))
                                         })?;
-                                    positions_buf.as_slice()
+                                    (positions_buf.as_slice(), group.pair_sig(bytes, cursor.pos))
                                 }
-                                None => &[],
+                                None => (&[], SIG_UNKNOWN),
                             };
-                            emit(term, doc_id, tf, positions)?;
+                            emit(term, doc_id, tf, positions, sig)?;
                             cursor.pos += 1;
                         }
                         cursor.next();
@@ -2719,7 +2724,8 @@ fn check_version(version: u32) -> Result<(), FtsError> {
         format::fts::VERSION_V7
         | format::fts::VERSION_V8
         | format::fts::VERSION_V9
-        | format::fts::VERSION_V10 => Ok(()),
+        | format::fts::VERSION_V10
+        | format::fts::VERSION_V11 => Ok(()),
         v if v < VERSION_MIN => Err(FtsError::IndexTooOld { version: v }),
         v => Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
             "fts section version {v}"
@@ -3041,7 +3047,7 @@ mod tests {
         assert!(matches!(err, FtsError::IndexTooOld { .. }), "{err:?}");
 
         let err =
-            FtsReader::open(stamp(format::fts::VERSION_V10 + 1), json).expect_err("a future blob");
+            FtsReader::open(stamp(format::fts::VERSION_V11 + 1), json).expect_err("a future blob");
         assert!(
             matches!(err, FtsError::Read(ReadError::UnsupportedVersion(_))),
             "{err:?}"
@@ -3669,7 +3675,7 @@ mod tests {
         let r = FtsReader::open(blob, &json).expect("open");
 
         let mut got: BTreeMap<Vec<u8>, Vec<(u32, u32)>> = BTreeMap::new();
-        r.for_each_term_posting(0, |term, doc_id, tf, positions| {
+        r.for_each_term_posting(0, |term, doc_id, tf, positions, _| {
             assert!(
                 positions.is_empty(),
                 "non-positional column yields no positions"
@@ -3730,7 +3736,7 @@ mod tests {
         let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
 
         let mut got: BTreeMap<Vec<u8>, Vec<(u32, u32, Vec<u32>)>> = BTreeMap::new();
-        r.for_each_term_posting(0, |term, doc_id, tf, positions| {
+        r.for_each_term_posting(0, |term, doc_id, tf, positions, _| {
             got.entry(term.to_vec())
                 .or_default()
                 .push((doc_id, tf, positions.to_vec()));
@@ -3783,7 +3789,7 @@ mod tests {
         let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
         for column_id in 0..2 {
             let mut full: Vec<(Vec<u8>, u32)> = Vec::new();
-            r.for_each_term_posting(column_id, |term, doc, _, _| {
+            r.for_each_term_posting(column_id, |term, doc, _, _, _| {
                 full.push((term.to_vec(), doc));
                 Ok(())
             })
@@ -3835,9 +3841,9 @@ mod tests {
         // no re-tokenization. Doc lengths carried over ("a b a"/"b a c" = 3/3).
         let mut b = FtsBuilder::new();
         b.register_column("body".into(), true).expect("register b");
-        ra.for_each_term_posting(0, |term, doc_id, tf, positions| {
+        ra.for_each_term_posting(0, |term, doc_id, tf, positions, sig| {
             let term_str = std::str::from_utf8(term).expect("utf8 term");
-            b.add_prebuilt_term_posting(0, term_str, FtsDocId::new(doc_id), tf, positions)
+            b.add_prebuilt_term_posting(0, term_str, FtsDocId::new(doc_id), tf, positions, sig)
                 .expect("prebuilt push");
             Ok(())
         })
@@ -3848,18 +3854,25 @@ mod tests {
         // The two readers must expose identical postings (doc_ids, tfs,
         // positions) for every term.
         let collect = |r: &FtsReader| {
-            let mut m: BTreeMap<Vec<u8>, Vec<(u32, u32, Vec<u32>)>> = BTreeMap::new();
-            r.for_each_term_posting(0, |t, d, tf, p| {
-                m.entry(t.to_vec()).or_default().push((d, tf, p.to_vec()));
+            let mut m: BTreeMap<Vec<u8>, Vec<(u32, u32, Vec<u32>, u8)>> = BTreeMap::new();
+            r.for_each_term_posting(0, |t, d, tf, p, sig| {
+                m.entry(t.to_vec())
+                    .or_default()
+                    .push((d, tf, p.to_vec(), sig));
                 Ok(())
             })
             .expect("collect");
             m
         };
+        let carried = collect(&ra);
+        assert_eq!(carried, collect(&rb), "prebuilt-fed postings must match");
+        // "a" is followed by "b" in doc 0 and by "c" in doc 1: real
+        // signatures were carried, not the unknown one.
+        let a_sigs: Vec<u8> = carried[&b"a"[..]].iter().map(|e| e.3).collect();
         assert_eq!(
-            collect(&ra),
-            collect(&rb),
-            "prebuilt-fed postings must match"
+            a_sigs,
+            [next_bit(b"b"), next_bit(b"c")],
+            "a's signatures name its followers"
         );
         assert_eq!(rb.n_docs(), 2);
         assert_eq!(rb.n_terms(), ra.n_terms());
@@ -3883,9 +3896,9 @@ mod tests {
         let mut b = FtsBuilder::new();
         b.register_column("body".into(), true).expect("register b");
         b.set_spill_threshold_bytes(1);
-        ra.for_each_term_posting(0, |term, doc_id, tf, positions| {
+        ra.for_each_term_posting(0, |term, doc_id, tf, positions, sig| {
             let term_str = std::str::from_utf8(term).expect("utf8 term");
-            b.add_prebuilt_term_posting(0, term_str, FtsDocId::new(doc_id), tf, positions)
+            b.add_prebuilt_term_posting(0, term_str, FtsDocId::new(doc_id), tf, positions, sig)
                 .expect("prebuilt push (spilled)");
             Ok(())
         })
@@ -3894,16 +3907,23 @@ mod tests {
         let rb = FtsReader::open(Bytes::from(b.finish().expect("finish b")), json).expect("open b");
 
         let collect = |r: &FtsReader| {
-            let mut m: BTreeMap<Vec<u8>, Vec<(u32, u32, Vec<u32>)>> = BTreeMap::new();
-            r.for_each_term_posting(0, |t, d, tf, p| {
-                m.entry(t.to_vec()).or_default().push((d, tf, p.to_vec()));
+            let mut m: BTreeMap<Vec<u8>, Vec<(u32, u32, Vec<u32>, u8)>> = BTreeMap::new();
+            r.for_each_term_posting(0, |t, d, tf, p, sig| {
+                m.entry(t.to_vec())
+                    .or_default()
+                    .push((d, tf, p.to_vec(), sig));
                 Ok(())
             })
             .expect("collect");
             m
         };
+        let carried = collect(&ra);
+        assert!(
+            carried.values().flatten().any(|e| e.3 != SIG_UNKNOWN),
+            "the source carries signatures"
+        );
         assert_eq!(
-            collect(&ra),
+            carried,
             collect(&rb),
             "spilled prebuilt-fed postings must match a fresh build"
         );

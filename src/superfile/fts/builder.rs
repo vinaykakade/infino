@@ -90,12 +90,14 @@ use std::{
 };
 
 use bumpalo::Bump;
-use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
+use hashbrown::hash_map::{Entry, HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use tempfile::{Builder, TempDir};
 use tracing::debug;
 
+#[cfg(test)]
+use crate::superfile::fts::positions::SIG_UNKNOWN;
 use crate::{
     config::scratch_root,
     superfile::{
@@ -109,7 +111,7 @@ use crate::{
         fts::{
             analysis::ChainTokenizer,
             bm25,
-            positions::{TermRuns, encode_group, encode_run, skip_run},
+            positions::{TermRuns, encode_group, encode_run, follower_masks, next_bit, skip_run},
             posting::{BLOCK_LEN, Block, EncodedBlock, encode_block_with},
             reader::{ColumnLengthStats, TopKEntry, finish_head},
             short::{SHORT_MAX_DF, encode_short},
@@ -172,12 +174,32 @@ type TermIdMap = HbHashMap<&'static str, u32, FxBuildHasher>;
 type DocTfMap = HbHashMap<&'static str, u32, FxBuildHasher>;
 
 /// Per-doc positional chain-head map — same key lifetime rules as
-/// [`DocTfMap`] (bump-arena keys, cleared before every arena reset).
-type DocPosHeadMap = HbHashMap<&'static str, u32, FxBuildHasher>;
+/// [`DocTfMap`] (bump-arena keys, cleared before every arena reset). Each
+/// term maps to its chain head and its [`next_bit`], hashed once per
+/// document rather than once per occurrence.
+type DocPosHeadMap = HbHashMap<&'static str, (u32, u8), FxBuildHasher>;
 
 /// Chain terminator for the per-doc position chains
 /// (`FtsBuilder::doc_pos_chain`): no previous occurrence.
 const CHAIN_END: u32 = u32::MAX;
+
+/// One term's run from the per-doc chain headed at `head`: its positions,
+/// ascending, into `out`, and its adjacency signature — the OR of its
+/// occurrences' follower masks (`follow`, in step with `chain`).
+fn walk_chain(chain: &[(u32, u32)], follow: &[u8], head: u32, out: &mut Vec<u32>) -> u8 {
+    out.clear();
+    let mut sig = 0u8;
+    let mut at = head;
+    while at != CHAIN_END {
+        let (pos, prev) = chain[at as usize];
+        out.push(pos);
+        sig |= follow[at as usize];
+        at = prev;
+    }
+    // The chain heads at the last occurrence, so it walks descending.
+    out.reverse();
+    sig
+}
 
 #[derive(Default)]
 struct FinishProfile {
@@ -516,6 +538,10 @@ enum ColumnPostings {
         /// Allocated (and maintained) only for positional columns;
         /// stays empty otherwise.
         dense_doc_poshead: Vec<u32>,
+        /// Each term's [`next_bit`], indexed by `term_id`, so a token
+        /// costs an array load rather than a hash. Positional columns
+        /// only, like `dense_doc_poshead`.
+        term_bits: Vec<u8>,
         /// Set of `term_id`s that were written in the current
         /// `add_doc` call. Drained at the end of each call to emit
         /// triples and zero out `dense_doc_tf` slots — bounded by
@@ -1380,6 +1406,13 @@ pub struct FtsBuilder {
     /// `CHAIN_END` terminating each term's chain. Cleared per doc;
     /// capacity persists.
     doc_pos_chain: Vec<(u32, u32)>,
+    /// Each chain entry's token's [`next_bit`], in step with
+    /// `doc_pos_chain`.
+    doc_tok_bits: Vec<u8>,
+    /// Each chain entry's follower mask ([`follower_masks`]): the bits of
+    /// the tokens one position on. A term's adjacency signature in the
+    /// doc is the OR over its chain.
+    doc_follow: Vec<u8>,
     /// Scratch for one term's positions while draining a doc (chain
     /// walk emits them descending; reversed here before encoding).
     pos_scratch: Vec<u32>,
@@ -1418,6 +1451,11 @@ pub struct FtsBuilder {
     head_sink: Option<Box<dyn TermHeadSink>>,
     /// Best documents per term handed to the sink; `0` keeps none.
     head_depth: usize,
+    /// Write every posting's signature as unknown, so the groups take the
+    /// layouts of a blob from before signatures: what the tests read and
+    /// merge as an older input.
+    #[cfg(test)]
+    pub(crate) omit_signatures: bool,
 }
 
 /// Receives each term's facts as the blob is written: what a table-level
@@ -1574,6 +1612,8 @@ impl FtsBuilder {
             doc_tf: DocTfMap::with_hasher(FxBuildHasher),
             doc_pos_head: DocPosHeadMap::with_hasher(FxBuildHasher),
             doc_pos_chain: Vec::new(),
+            doc_tok_bits: Vec::new(),
+            doc_follow: Vec::new(),
             pos_scratch: Vec::new(),
             run_scratch: Vec::new(),
             bump: Bump::new(),
@@ -1581,6 +1621,8 @@ impl FtsBuilder {
             sorted_inputs: Vec::new(),
             head_sink: None,
             head_depth: 0,
+            #[cfg(test)]
+            omit_signatures: false,
         }
     }
 
@@ -1896,7 +1938,11 @@ impl FtsBuilder {
     /// column's accumulator without tokenizing — the FTS-compaction-merge
     /// counterpart of [`add_doc`]. `positions` is empty for a non-positional
     /// column; otherwise it holds the `tf` token offsets for this `(term,
-    /// doc)`. The concatenating merges feed each term's docs in ascending
+    /// doc)`, and `sig` its adjacency signature as the source stored it
+    /// ([`SIG_UNKNOWN`](crate::superfile::fts::positions::SIG_UNKNOWN) when
+    /// the source had none; unused on a non-positional column). A signature
+    /// depends on the doc's other terms, so a posting carried without its
+    /// doc's text cannot have it recomputed. The concatenating merges feed each term's docs in ascending
     /// doc-id order (sequential inputs, dense remap), matching what
     /// `add_doc` produces. The multi-cell merge does not — it remaps
     /// postings through the packed stable-id row order — so it forces the
@@ -1920,6 +1966,7 @@ impl FtsBuilder {
         doc_id: FtsDocId,
         tf: u32,
         positions: &[u32],
+        sig: u8,
     ) -> Result<(), BuildError> {
         // The accumulators below are the blob's own id space from end to
         // end, so the id comes off here, once, at the entry point that
@@ -1927,7 +1974,7 @@ impl FtsBuilder {
         let doc_id = doc_id.get();
         let col_idx = column_id as usize;
         if self.postings[col_idx].is_spilled() {
-            return self.push_prebuilt_spilled(col_idx, term, doc_id, tf, positions);
+            return self.push_prebuilt_spilled(col_idx, term, doc_id, tf, positions, sig);
         }
 
         // In-RAM push, mirroring the `add_doc_inram` drain minus the tokenize +
@@ -1958,12 +2005,12 @@ impl FtsBuilder {
                     match pos_runs.get_mut(term) {
                         Some(run) => {
                             let before = run.len();
-                            encode_run(run, positions);
+                            encode_run(run, sig, positions);
                             new_bytes = new_bytes.saturating_add(run.len() - before);
                         }
                         None => {
                             let mut run = Vec::new();
-                            encode_run(&mut run, positions);
+                            encode_run(&mut run, sig, positions);
                             new_bytes = new_bytes
                                 .saturating_add(ACCUM_NEW_TERM_FIXED_BYTES + term_len + run.len());
                             pos_runs.insert(Box::<str>::from(term), run);
@@ -2044,9 +2091,12 @@ impl FtsBuilder {
             }
         };
         let dense_doc_tf = vec![0u32; id_to_term.len()];
-        let dense_doc_poshead = match positional {
-            true => vec![CHAIN_END; id_to_term.len()],
-            false => Vec::new(),
+        let (dense_doc_poshead, term_bits) = match positional {
+            true => (
+                vec![CHAIN_END; id_to_term.len()],
+                id_to_term.iter().map(|t| next_bit(t.as_bytes())).collect(),
+            ),
+            false => (Vec::new(), Vec::new()),
         };
         self.postings[col_idx] = ColumnPostings::Spilled {
             partitions: store,
@@ -2054,6 +2104,7 @@ impl FtsBuilder {
             id_to_term,
             dense_doc_tf,
             dense_doc_poshead,
+            term_bits,
             updated_terms: Vec::new(),
             term_arena,
         };
@@ -2072,6 +2123,7 @@ impl FtsBuilder {
         doc_id: u32,
         tf: u32,
         positions: &[u32],
+        sig: u8,
     ) -> Result<(), BuildError> {
         let positional = self.columns[col_idx].positions;
         let ColumnPostings::Spilled {
@@ -2080,6 +2132,7 @@ impl FtsBuilder {
             id_to_term,
             dense_doc_tf,
             dense_doc_poshead,
+            term_bits,
             term_arena,
             ..
         } = &mut self.postings[col_idx]
@@ -2093,6 +2146,7 @@ impl FtsBuilder {
             dense_doc_tf.push(0);
             if positional {
                 dense_doc_poshead.push(CHAIN_END);
+                term_bits.push(next_bit(term.as_bytes()));
             }
         }
 
@@ -2112,7 +2166,7 @@ impl FtsBuilder {
                     .as_mut()
                     .expect("positions blob writer open before finish");
                 let mut run = Vec::new();
-                encode_run(&mut run, positions);
+                encode_run(&mut run, sig, positions);
                 writer.write_all(&run)?;
                 let pos_off = blob.len;
                 blob.len += run.len() as u64;
@@ -2186,6 +2240,7 @@ impl FtsBuilder {
             id_to_term,
             dense_doc_tf,
             dense_doc_poshead,
+            term_bits,
             updated_terms,
             term_arena,
         ) = match col_post {
@@ -2195,6 +2250,7 @@ impl FtsBuilder {
                 id_to_term,
                 dense_doc_tf,
                 dense_doc_poshead,
+                term_bits,
                 updated_terms,
                 term_arena,
             } => (
@@ -2203,6 +2259,7 @@ impl FtsBuilder {
                 id_to_term,
                 dense_doc_tf,
                 dense_doc_poshead,
+                term_bits,
                 updated_terms,
                 term_arena,
             ),
@@ -2253,7 +2310,9 @@ impl FtsBuilder {
             // per-doc chain (the same chain the in-RAM path uses),
             // headed per term in `dense_doc_poshead`.
             self.doc_pos_chain.clear();
+            self.doc_tok_bits.clear();
             let doc_pos_chain = &mut self.doc_pos_chain;
+            let doc_tok_bits = &mut self.doc_tok_bits;
             // `record` interns the token, bumps its tf, and links its
             // `position` into the per-doc chain. `position` is the
             // gap-inclusive ordinal — a token the tokenizer drops still
@@ -2270,6 +2329,7 @@ impl FtsBuilder {
                     debug_assert_eq!(idx, dense_doc_tf.len());
                     dense_doc_tf.push(0);
                     dense_doc_poshead.push(CHAIN_END);
+                    term_bits.push(next_bit(tok.as_bytes()));
                 }
                 // SAFETY: same lockstep invariant as the positionless
                 // closure; `dense_doc_poshead` is pushed in the same
@@ -2289,6 +2349,7 @@ impl FtsBuilder {
                 let head = unsafe { dense_doc_poshead.get_unchecked_mut(idx) };
                 doc_pos_chain.push((position as u32, *head));
                 *head = chain_idx;
+                doc_tok_bits.push(term_bits[idx]);
             };
             if let Some(standard) = standard_tok {
                 // `standard` drops nothing — every segment carrying an
@@ -2360,6 +2421,17 @@ impl FtsBuilder {
             }
             SpillStore::Positional { partitions, blobs } => {
                 let doc_pos_chain = &self.doc_pos_chain;
+                follower_masks(
+                    doc_pos_chain.len(),
+                    |k| doc_pos_chain[k].0,
+                    &self.doc_tok_bits,
+                    &mut self.doc_follow,
+                );
+                #[cfg(test)]
+                if self.omit_signatures {
+                    self.doc_follow.fill(SIG_UNKNOWN);
+                }
+                let doc_follow = &self.doc_follow;
                 let pos_scratch = &mut self.pos_scratch;
                 let run_buf = &mut self.run_scratch;
                 for &term_id in updated_terms.iter() {
@@ -2370,17 +2442,10 @@ impl FtsBuilder {
                     let head_slot = unsafe { dense_doc_poshead.get_unchecked_mut(idx) };
                     let head = *head_slot;
                     *head_slot = CHAIN_END;
-                    pos_scratch.clear();
-                    let mut at = head;
-                    while at != CHAIN_END {
-                        let (pos, prev) = doc_pos_chain[at as usize];
-                        pos_scratch.push(pos);
-                        at = prev;
-                    }
-                    pos_scratch.reverse();
+                    let sig = walk_chain(doc_pos_chain, doc_follow, head, pos_scratch);
                     debug_assert_eq!(pos_scratch.len() as u32, tf, "chain length must equal tf");
                     run_buf.clear();
-                    encode_run(run_buf, pos_scratch);
+                    encode_run(run_buf, sig, pos_scratch);
                     let p = (term_id as usize) & mask;
                     let blob = &mut blobs[p];
                     let pos_off = blob.len;
@@ -2490,8 +2555,10 @@ impl FtsBuilder {
             // positionless hot path above stays byte-identical.
             self.doc_pos_head.clear();
             self.doc_pos_chain.clear();
+            self.doc_tok_bits.clear();
             let doc_pos_head = &mut self.doc_pos_head;
             let doc_pos_chain = &mut self.doc_pos_chain;
+            let doc_tok_bits = &mut self.doc_tok_bits;
             let mut pos_overflow = false;
             // `record` accumulates tf and links each occurrence's
             // `position` into the per-doc chain. `position` is the
@@ -2528,8 +2595,20 @@ impl FtsBuilder {
                     return;
                 }
                 let idx = doc_pos_chain.len() as u32;
-                let prev = doc_pos_head.insert(key, idx).unwrap_or(CHAIN_END);
+                let (prev, bit) = match doc_pos_head.entry(key) {
+                    Entry::Occupied(mut e) => {
+                        let (head, bit) = *e.get();
+                        e.get_mut().0 = idx;
+                        (head, bit)
+                    }
+                    Entry::Vacant(e) => {
+                        let bit = next_bit(key.as_bytes());
+                        e.insert((idx, bit));
+                        (CHAIN_END, bit)
+                    }
+                };
                 doc_pos_chain.push((position as u32, prev));
+                doc_tok_bits.push(bit);
             };
             if let Some(standard) = standard_tok {
                 // `standard` drops nothing — every segment carrying an
@@ -2574,7 +2653,6 @@ impl FtsBuilder {
             self.n_docs = docs_now;
         }
 
-        let column_id = col_idx as u32;
         let col_post = &mut self.postings[col_idx];
         let (terms, pos_runs, bytes) = match col_post {
             ColumnPostings::InRam {
@@ -2592,6 +2670,19 @@ impl FtsBuilder {
         // insertion. Bytes accounting folds into the same loop.
         let doc_pos_head = &self.doc_pos_head;
         let doc_pos_chain = &self.doc_pos_chain;
+        if positional {
+            follower_masks(
+                doc_pos_chain.len(),
+                |k| doc_pos_chain[k].0,
+                &self.doc_tok_bits,
+                &mut self.doc_follow,
+            );
+            #[cfg(test)]
+            if self.omit_signatures {
+                self.doc_follow.fill(SIG_UNKNOWN);
+            }
+        }
+        let doc_follow = &self.doc_follow;
         let pos_scratch = &mut self.pos_scratch;
         let mut new_bytes: usize = 0;
         for (term, tf) in tf_per_term.drain() {
@@ -2609,32 +2700,24 @@ impl FtsBuilder {
                 }
             }
             if positional {
-                // Walk this term's per-doc chain (positions come out
-                // descending — the chain heads at the LAST occurrence),
-                // reverse to ascending, and append the delta-varint run
-                // to the term's run buffer. Pair order and run order
-                // stay aligned because both append once per (term, doc)
-                // in this same loop.
-                let head = doc_pos_head.get(term).copied().unwrap_or(CHAIN_END);
+                // Walk this term's per-doc chain into its ascending
+                // positions and signature, and append the run to the
+                // term's run buffer. Pair order and run order stay
+                // aligned because both append once per (term, doc) in
+                // this same loop.
+                let head = doc_pos_head.get(term).map_or(CHAIN_END, |&(head, _)| head);
                 debug_assert_ne!(head, CHAIN_END, "tf term missing from position chain");
-                pos_scratch.clear();
-                let mut at = head;
-                while at != CHAIN_END {
-                    let (p, prev) = doc_pos_chain[at as usize];
-                    pos_scratch.push(p);
-                    at = prev;
-                }
-                pos_scratch.reverse();
+                let sig = walk_chain(doc_pos_chain, doc_follow, head, pos_scratch);
                 debug_assert_eq!(pos_scratch.len() as u32, tf, "chain length must equal tf");
                 match pos_runs.get_mut(term) {
                     Some(run) => {
                         let before = run.len();
-                        encode_run(run, pos_scratch);
+                        encode_run(run, sig, pos_scratch);
                         new_bytes = new_bytes.saturating_add(run.len() - before);
                     }
                     None => {
                         let mut run = Vec::new();
-                        encode_run(&mut run, pos_scratch);
+                        encode_run(&mut run, sig, pos_scratch);
                         new_bytes = new_bytes
                             .saturating_add(ACCUM_NEW_TERM_FIXED_BYTES + term_len + run.len());
                         pos_runs.insert(Box::<str>::from(term), run);
@@ -2652,66 +2735,7 @@ impl FtsBuilder {
             // `add_doc_spilled`.
             let drained = mem::take(terms);
             let drained_pos_runs = mem::take(pos_runs);
-            let term_arena = Bump::new();
-            let mut term_to_id: TermIdMap = TermIdMap::default();
-            // Pre-size to the exact post-flush vocab.
-            let mut id_to_term: Vec<&'static str> = Vec::with_capacity(drained.len());
-            let store = match positional {
-                false => {
-                    let mut partitions = Self::open_partitions_for_column(
-                        self.scratch_dir.path(),
-                        column_id,
-                        self.spill_partitions,
-                    )?;
-                    Self::flush_in_ram_to_partitions(
-                        drained,
-                        &mut partitions,
-                        &mut term_to_id,
-                        &mut id_to_term,
-                        &term_arena,
-                    )?;
-                    SpillStore::Plain(partitions)
-                }
-                true => {
-                    let mut partitions = Self::open_partitions_for_column(
-                        self.scratch_dir.path(),
-                        column_id,
-                        self.spill_partitions,
-                    )?;
-                    let mut blobs = Self::open_position_blobs_for_column(
-                        self.scratch_dir.path(),
-                        column_id,
-                        self.spill_partitions,
-                    )?;
-                    Self::flush_in_ram_to_positional_partitions(
-                        drained,
-                        drained_pos_runs,
-                        &mut partitions,
-                        &mut blobs,
-                        &mut term_to_id,
-                        &mut id_to_term,
-                        &term_arena,
-                    )?;
-                    SpillStore::Positional { partitions, blobs }
-                }
-            };
-            let dense_doc_tf = vec![0u32; id_to_term.len()];
-            let dense_doc_poshead = match positional {
-                true => vec![CHAIN_END; id_to_term.len()],
-                false => Vec::new(),
-            };
-            let updated_terms: Vec<u32> = Vec::new();
-            *col_post = ColumnPostings::Spilled {
-                partitions: store,
-                term_to_id,
-                id_to_term,
-                dense_doc_tf,
-                dense_doc_poshead,
-                updated_terms,
-                // Declared last in the variant so it drops last;
-                // see `TermIdMap` doc for the lifetime invariant.
-                term_arena,
-            };
+            self.spill_inram_column(col_idx, drained, drained_pos_runs)?;
         } else {
             *bytes = new_total;
         }
@@ -2798,6 +2822,8 @@ impl FtsBuilder {
             doc_tf,
             doc_pos_head,
             doc_pos_chain: _,
+            doc_tok_bits: _,
+            doc_follow: _,
             pos_scratch: _,
             run_scratch: _,
             bump,
@@ -2805,6 +2831,8 @@ impl FtsBuilder {
             sorted_inputs: _,
             mut head_sink,
             head_depth,
+            #[cfg(test)]
+                omit_signatures: _,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -2985,6 +3013,8 @@ impl FtsBuilder {
             doc_tf,
             doc_pos_head,
             doc_pos_chain: _,
+            doc_tok_bits: _,
+            doc_follow: _,
             pos_scratch: _,
             run_scratch: _,
             bump,
@@ -2992,6 +3022,8 @@ impl FtsBuilder {
             sorted_inputs,
             mut head_sink,
             head_depth,
+            #[cfg(test)]
+                omit_signatures: _,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -3242,6 +3274,7 @@ impl FtsBuilder {
                         id_to_term,
                         dense_doc_tf: _,
                         dense_doc_poshead: _,
+                        term_bits: _,
                         updated_terms: _,
                         term_arena,
                     } => {
@@ -3996,6 +4029,8 @@ struct TermScratch {
     /// One block's run values (first position absolute per doc, then
     /// gaps) decoded from the accumulator's LEB128 runs for regrouping.
     pos_vals: Vec<u32>,
+    /// The same block's adjacency signatures, one per posting.
+    pos_sigs: Vec<u8>,
 }
 
 /// Merge one spilled column's sorted partition files and emit every
@@ -4336,12 +4371,14 @@ fn encode_term(
                 // The whole term is one position group, inline in the body:
                 // its run values, packed or LEB128, whichever is smaller.
                 let vals = &mut scratch.pos_vals;
+                let sigs = &mut scratch.pos_sigs;
                 let out = &mut scratch.pos_out;
                 vals.clear();
+                sigs.clear();
                 out.clear();
                 let mut at = 0usize;
                 for (i, &(_, tf)) in pairs.iter().enumerate() {
-                    runs.push_run(i, tf, &mut at, vals);
+                    sigs.push(runs.push_run(i, tf, &mut at, vals));
                 }
                 debug_assert!(
                     runs.encoded().is_none_or(|bytes| at == bytes.len()),
@@ -4350,7 +4387,7 @@ fn encode_term(
                 let tfs = &mut scratch.tfs;
                 tfs.clear();
                 tfs.extend(pairs.iter().map(|&(_, tf)| tf));
-                encode_group(out, tfs, vals, true, &mut scratch.pack);
+                encode_group(out, tfs, vals, sigs, true, &mut scratch.pack);
                 Some(out.as_slice())
             }
             None => None,
@@ -4459,16 +4496,18 @@ fn encode_term(
         if let Some(runs) = &term_positions {
             let mut at: usize = 0;
             let vals = &mut scratch.pos_vals;
+            let sigs = &mut scratch.pos_sigs;
             for (c, chunk) in pairs.chunks(BLOCK_LEN).enumerate() {
                 pos_block_offsets.push(pos_out.len() as u32);
                 vals.clear();
+                sigs.clear();
                 for (k, &(_, tf)) in chunk.iter().enumerate() {
-                    runs.push_run(c * BLOCK_LEN + k, tf, &mut at, vals);
+                    sigs.push(runs.push_run(c * BLOCK_LEN + k, tf, &mut at, vals));
                 }
                 let tfs = &mut scratch.tfs;
                 tfs.clear();
                 tfs.extend(chunk.iter().map(|&(_, tf)| tf));
-                encode_group(pos_out, tfs, vals, false, &mut scratch.pack);
+                encode_group(pos_out, tfs, vals, sigs, false, &mut scratch.pack);
             }
             debug_assert!(
                 runs.encoded().is_none_or(|bytes| at == bytes.len()),
