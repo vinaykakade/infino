@@ -97,7 +97,7 @@ use tempfile::{Builder, TempDir};
 use tracing::debug;
 
 #[cfg(test)]
-use crate::superfile::fts::positions::SIG_UNKNOWN;
+use crate::superfile::fts::positions::{FOLLOW_BITS, LEAD_BITS, SIG_UNKNOWN};
 use crate::{
     config::scratch_root,
     superfile::{
@@ -111,7 +111,9 @@ use crate::{
         fts::{
             analysis::ChainTokenizer,
             bm25,
-            positions::{TermRuns, encode_group, encode_run, follower_masks, next_bit, skip_run},
+            positions::{
+                TermRuns, adjacency_bits, adjacency_masks, encode_group, encode_run, skip_run,
+            },
             posting::{BLOCK_LEN, Block, EncodedBlock, encode_block_with},
             reader::{ColumnLengthStats, TopKEntry, finish_head},
             short::{SHORT_MAX_DF, encode_short},
@@ -175,7 +177,7 @@ type DocTfMap = HbHashMap<&'static str, u32, FxBuildHasher>;
 
 /// Per-doc positional chain-head map — same key lifetime rules as
 /// [`DocTfMap`] (bump-arena keys, cleared before every arena reset). Each
-/// term maps to its chain head and its [`next_bit`], hashed once per
+/// term maps to its chain head and its [`adjacency_bits`], hashed once per
 /// document rather than once per occurrence.
 type DocPosHeadMap = HbHashMap<&'static str, (u32, u8), FxBuildHasher>;
 
@@ -185,7 +187,7 @@ const CHAIN_END: u32 = u32::MAX;
 
 /// One term's run from the per-doc chain headed at `head`: its positions,
 /// ascending, into `out`, and its adjacency signature — the OR of its
-/// occurrences' follower masks (`follow`, in step with `chain`).
+/// occurrences' adjacency masks (`follow`, in step with `chain`).
 fn walk_chain(chain: &[(u32, u32)], follow: &[u8], head: u32, out: &mut Vec<u32>) -> u8 {
     out.clear();
     let mut sig = 0u8;
@@ -538,7 +540,7 @@ enum ColumnPostings {
         /// Allocated (and maintained) only for positional columns;
         /// stays empty otherwise.
         dense_doc_poshead: Vec<u32>,
-        /// Each term's [`next_bit`], indexed by `term_id`, so a token
+        /// Each term's [`adjacency_bits`], indexed by `term_id`, so a token
         /// costs an array load rather than a hash. Positional columns
         /// only, like `dense_doc_poshead`.
         term_bits: Vec<u8>,
@@ -1406,12 +1408,12 @@ pub struct FtsBuilder {
     /// `CHAIN_END` terminating each term's chain. Cleared per doc;
     /// capacity persists.
     doc_pos_chain: Vec<(u32, u32)>,
-    /// Each chain entry's token's [`next_bit`], in step with
+    /// Each chain entry's token's [`adjacency_bits`], in step with
     /// `doc_pos_chain`.
     doc_tok_bits: Vec<u8>,
-    /// Each chain entry's follower mask ([`follower_masks`]): the bits of
-    /// the tokens one position on. A term's adjacency signature in the
-    /// doc is the OR over its chain.
+    /// Each chain entry's adjacency mask ([`adjacency_masks`]): the bits of
+    /// the tokens one position on either side. A term's adjacency
+    /// signature in the doc is the OR over its chain.
     doc_follow: Vec<u8>,
     /// Scratch for one term's positions while draining a doc (chain
     /// walk emits them descending; reversed here before encoding).
@@ -2094,7 +2096,10 @@ impl FtsBuilder {
         let (dense_doc_poshead, term_bits) = match positional {
             true => (
                 vec![CHAIN_END; id_to_term.len()],
-                id_to_term.iter().map(|t| next_bit(t.as_bytes())).collect(),
+                id_to_term
+                    .iter()
+                    .map(|t| adjacency_bits(t.as_bytes()))
+                    .collect(),
             ),
             false => (Vec::new(), Vec::new()),
         };
@@ -2146,7 +2151,7 @@ impl FtsBuilder {
             dense_doc_tf.push(0);
             if positional {
                 dense_doc_poshead.push(CHAIN_END);
-                term_bits.push(next_bit(term.as_bytes()));
+                term_bits.push(adjacency_bits(term.as_bytes()));
             }
         }
 
@@ -2329,7 +2334,7 @@ impl FtsBuilder {
                     debug_assert_eq!(idx, dense_doc_tf.len());
                     dense_doc_tf.push(0);
                     dense_doc_poshead.push(CHAIN_END);
-                    term_bits.push(next_bit(tok.as_bytes()));
+                    term_bits.push(adjacency_bits(tok.as_bytes()));
                 }
                 // SAFETY: same lockstep invariant as the positionless
                 // closure; `dense_doc_poshead` is pushed in the same
@@ -2421,7 +2426,7 @@ impl FtsBuilder {
             }
             SpillStore::Positional { partitions, blobs } => {
                 let doc_pos_chain = &self.doc_pos_chain;
-                follower_masks(
+                adjacency_masks(
                     doc_pos_chain.len(),
                     |k| doc_pos_chain[k].0,
                     &self.doc_tok_bits,
@@ -2602,7 +2607,7 @@ impl FtsBuilder {
                         (head, bit)
                     }
                     Entry::Vacant(e) => {
-                        let bit = next_bit(key.as_bytes());
+                        let bit = adjacency_bits(key.as_bytes());
                         e.insert((idx, bit));
                         (CHAIN_END, bit)
                     }
@@ -2671,7 +2676,7 @@ impl FtsBuilder {
         let doc_pos_head = &self.doc_pos_head;
         let doc_pos_chain = &self.doc_pos_chain;
         if positional {
-            follower_masks(
+            adjacency_masks(
                 doc_pos_chain.len(),
                 |k| doc_pos_chain[k].0,
                 &self.doc_tok_bits,
@@ -5660,23 +5665,25 @@ mod tests {
     }
 
     /// Build a one-column blob from `docs`, positional or not.
-    /// Each posting's signature is the OR of the bits of the tokens one
-    /// position after its occurrences — none past a removed stopword's
-    /// hole or after the doc's last token — whether the doc is added to
-    /// the in-RAM accumulator or straight to the spilled one.
+    /// Each posting's signature is the OR of the follow bits of the tokens
+    /// one position after its occurrences and the lead bits of those one
+    /// before — none across a removed stopword's hole or past the doc's
+    /// ends — whether the doc is added to the in-RAM accumulator or
+    /// straight to the spilled one.
     #[test]
-    fn signatures_name_each_terms_followers_in_ram_and_spilled() {
+    fn signatures_name_each_terms_neighbours_in_ram_and_spilled() {
         let docs = ["x the y x z", "y x", "z z x", "x"];
-        let bit = |t: &str| next_bit(t.as_bytes());
+        let follow = |t: &str| adjacency_bits(t.as_bytes()) & FOLLOW_BITS;
+        let lead = |t: &str| adjacency_bits(t.as_bytes()) & LEAD_BITS;
         // Doc 0's positions: x 0, the hole at 1, y 2, x 3, z 4.
         let want: BTreeMap<(Vec<u8>, u32), u8> = [
-            ("x", 0, bit("z")),
-            ("y", 0, bit("x")),
-            ("z", 0, 0),
-            ("x", 1, 0),
-            ("y", 1, bit("x")),
-            ("x", 2, 0),
-            ("z", 2, bit("z") | bit("x")),
+            ("x", 0, follow("z") | lead("y")),
+            ("y", 0, follow("x")),
+            ("z", 0, lead("x")),
+            ("x", 1, lead("y")),
+            ("y", 1, follow("x")),
+            ("x", 2, lead("z")),
+            ("z", 2, follow("z") | follow("x") | lead("z")),
             ("x", 3, 0),
         ]
         .into_iter()

@@ -22,7 +22,7 @@ use crate::superfile::{
     error::FtsError,
     fts::{
         bm25,
-        positions::{GroupIndex, SIG_UNKNOWN, group_signatures_at},
+        positions::{FOLLOW_BITS, GroupIndex, LEAD_BITS, SIG_UNKNOWN, group_signatures_at},
     },
 };
 
@@ -329,13 +329,14 @@ pub(super) struct PhraseCursor {
     cand_locs: Vec<Vec<(u32, u32)>>,
     /// Scratch: which candidates a member's filter kept.
     kept: Vec<u32>,
-    /// `(m, bit)` per query position of member `m` whose successor sits
-    /// one position after it: a candidate whose signature for member `m`
-    /// lacks `bit`, the successor's
-    /// [`next_bit`](crate::superfile::fts::positions::next_bit), cannot
-    /// hold the phrase. Positions whose gap a removed stopword widened are
-    /// absent: what follows them in a match is the hole, not the successor.
-    /// So are inline members, which carry no signature.
+    /// `(m, bit)` checks, two per pair of query positions one apart: the
+    /// first's member must have the second's follow bit, and the second's
+    /// member the first's lead bit
+    /// ([`adjacency_bits`](crate::superfile::fts::positions::adjacency_bits)).
+    /// A candidate whose signature for `m` lacks `bit` cannot hold the
+    /// phrase. Positions whose gap a removed stopword widened are absent:
+    /// what sits next to them in a match is the hole. So are checks on
+    /// inline members, which carry no signature.
     adjacent_sigs: Vec<(usize, u8)>,
     /// Where the next block refill starts: one past the last block
     /// batched. `None` once the driver's last block is batched.
@@ -376,7 +377,7 @@ impl PhraseCursor {
     /// [`distinct_members`]), their fetched position runs, their
     /// positional metadata — `(term_meta, inline_position)` per member,
     /// exactly one of the two present — and signature bits
-    /// ([`next_bit`](crate::superfile::fts::positions::next_bit)), plus
+    /// ([`adjacency_bits`](crate::superfile::fts::positions::adjacency_bits)), plus
     /// each query position's member (`member_at`) and offset, then seek to
     /// the first matching doc.
     pub(super) fn new(
@@ -385,7 +386,7 @@ impl PhraseCursor {
         positional: Vec<(Option<TermMeta>, Option<u32>)>,
         member_at: Vec<usize>,
         offsets: Vec<u32>,
-        next_bits: Vec<u8>,
+        adjacency_bits: Vec<u8>,
     ) -> Result<Self, FtsError> {
         debug_assert!(
             member_at.len() >= 2,
@@ -395,7 +396,7 @@ impl PhraseCursor {
         debug_assert_eq!(cursors.len(), positional.len());
         debug_assert_eq!(member_at.len(), offsets.len());
         debug_assert!(member_at.iter().all(|&m| m < cursors.len()));
-        debug_assert_eq!(cursors.len(), next_bits.len());
+        debug_assert_eq!(cursors.len(), adjacency_bits.len());
         debug_assert_eq!(offsets.first(), Some(&0), "offsets are normalized");
         debug_assert!(
             offsets.windows(2).all(|w| w[0] < w[1]),
@@ -434,11 +435,18 @@ impl PhraseCursor {
                 }
             })
             .collect();
-        // Each query-adjacent pair checks its first member's signature for
-        // the second's bit; a repeated term's pairs are checked once.
+        // Each query-adjacent pair checks both members' signatures, each
+        // for the other's bit on its side; a repeated term's pairs are
+        // checked once.
         let mut adjacent_sigs: Vec<(usize, u8)> = (0..member_at.len() - 1)
             .filter(|&q| offsets[q + 1] == offsets[q] + 1)
-            .map(|q| (member_at[q], next_bits[member_at[q + 1]]))
+            .flat_map(|q| {
+                let (a, b) = (member_at[q], member_at[q + 1]);
+                [
+                    (a, adjacency_bits[b] & FOLLOW_BITS),
+                    (b, adjacency_bits[a] & LEAD_BITS),
+                ]
+            })
             .filter(|&(m, _)| members[m].inline_position.is_none())
             .collect();
         adjacent_sigs.sort_unstable();
@@ -747,9 +755,9 @@ impl PhraseCursor {
     }
 
     /// Drop the batch's candidates that a query-adjacent member pair rules
-    /// out by signature: member `i`'s signature at the candidate lacks the
-    /// next member's bit, so no occurrence of member `i` there is followed
-    /// by the next member's term, and the phrase cannot be in the doc. Most
+    /// out by signature: member `i`'s signature at the candidate lacks its
+    /// neighbour's bit, so no occurrence of member `i` there sits next to
+    /// the neighbour's term, and the phrase cannot be in the doc. Most
     /// candidates of a phrase of common words hold every member but not
     /// the phrase, and each one dropped here is a doc whose positions are
     /// never decoded. Runs before the ranked prescreen and verification,
@@ -1040,6 +1048,7 @@ mod tests {
             fts::{
                 analysis::{Stemmer, Stopwords, chain_tokenizer},
                 builder::FtsBuilder,
+                positions::adjacency_bits,
                 reader::{BoolMode, FtsReader, QueryIdf, core::ClauseLists, cursor::CursorUse},
                 tokenize::Phrase,
             },
@@ -1892,6 +1901,72 @@ mod tests {
             sig_rejects(walk_phrase(&unsigned, terms, &expected)).await,
             0
         );
+    }
+
+    /// A first word that every word follows somewhere in a doc has a full
+    /// follow side, which rejects nothing; the second word's lead side
+    /// still rules the doc out. Every doc holds both words and the phrase
+    /// is in one in ten: exactly the docs either signature rules out are
+    /// rejected, and the results are those of an index without them.
+    #[tokio::test]
+    async fn the_second_words_lead_side_rejects_what_the_first_cannot() {
+        const FILLER: [&str; 8] = [
+            "river", "city", "state", "wind", "road", "north", "lake", "hill",
+        ];
+        let docs: Vec<Vec<&str>> = (0..SIG_DOCS as usize)
+            .map(|d| {
+                let mut doc: Vec<&str> = FILLER.iter().flat_map(|&f| ["the", f]).collect();
+                let before = match d % 10 {
+                    0 => "the",
+                    _ => FILLER[d % FILLER.len()],
+                };
+                doc.extend([before, "movement"]);
+                doc
+            })
+            .collect();
+        let bits = |t: &str| adjacency_bits(t.as_bytes());
+        // A term's signature in a doc, from the words on either side.
+        let sig = |doc: &[&str], term: &str| {
+            (0..doc.len())
+                .filter(|&i| doc[i] == term)
+                .fold(0u8, |sig, i| {
+                    let follow = doc.get(i + 1).map_or(0, |&t| bits(t) & FOLLOW_BITS);
+                    let lead = match i {
+                        0 => 0,
+                        _ => bits(doc[i - 1]) & LEAD_BITS,
+                    };
+                    sig | follow | lead
+                })
+        };
+        let terms: &[&str] = &["the", "movement"];
+        let ruled_out = docs
+            .iter()
+            .filter(|d| {
+                sig(d, "the") & bits("movement") & FOLLOW_BITS == 0
+                    || sig(d, "movement") & bits("the") & LEAD_BITS == 0
+            })
+            .count() as u64;
+        let first_side = docs
+            .iter()
+            .filter(|d| sig(d, "the") & bits("movement") & FOLLOW_BITS == 0)
+            .count();
+        assert_eq!(first_side, 0, "premise: the first word's side is full");
+        assert!(
+            ruled_out > SIG_DOCS as u64 / 2,
+            "premise: the second's is not"
+        );
+        let expected: Vec<(u32, u32)> = (0..docs.len() as u32)
+            .filter(|d| d % 10 == 0)
+            .map(|d| (d, 1))
+            .collect();
+        let signed = open_signature_index(&docs, false, false);
+        let unsigned = open_signature_index(&docs, true, false);
+        // The scored and the unscored walk each reject them.
+        let rejected = sig_rejects(walk_phrase(&signed, terms, &expected)).await;
+        assert_eq!(rejected, 2 * ruled_out);
+        let want = ranked(&unsigned, terms, 50).await;
+        assert_eq!(want.1, expected.len() as u64);
+        assert_eq!(ranked(&signed, terms, 50).await, want);
     }
 
     /// Members a removed stopword holds apart are not checked by signature:
