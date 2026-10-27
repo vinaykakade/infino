@@ -147,7 +147,7 @@ mod seed {
 /// cost more to decode than the walk saves (measured: a block per doc, or a
 /// quarter of one, both decode more in total than half). Saturating so a
 /// merge caller's huge `k` clamps to the cap rather than overflowing.
-fn seed_blocks_for(k: usize) -> usize {
+pub(super) fn seed_blocks_for(k: usize) -> usize {
     (k.saturating_add(k / 4) / 2).clamp(seed::MIN_BLOCKS_SEED, seed::MAX_BLOCKS_SEED)
 }
 
