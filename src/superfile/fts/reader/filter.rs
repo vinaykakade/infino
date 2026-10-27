@@ -121,6 +121,17 @@ pub(crate) struct ExcludeFilter {
 }
 
 impl ExcludeFilter {
+    /// A copy back at the start of the doc order, for a pass of its own over
+    /// docs in ascending order (a seed's) that must not move this one.
+    pub(super) fn fork(&self) -> Self {
+        Self {
+            cursors: self.cursors.clone(),
+            allow: self.allow.clone(),
+            doc_map: self.doc_map.clone(),
+            last_doc: 0,
+        }
+    }
+
     /// A pure negation gate. The search path always builds through
     /// [`Self::with_allow`] (it may or may not carry a row set), so this
     /// shorthand is for the tests that exercise negation alone.
