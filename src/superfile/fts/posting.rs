@@ -958,6 +958,16 @@ pub fn decode_block_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut 
         // is the step count, not one exit per set bit, which the predictor
         // misses once a word. The last step overruns the block's docs by at
         // most `EXPAND_STEP - 1` slots.
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            // SAFETY: AVX-512F is present (checked above), the one
+            // precondition of the expansion; it bounds its own stores.
+            let j = unsafe {
+                crate::superfile::bits::expand_bitset_avx512(words, hdr.base, dest_doc_ids)
+            };
+            debug_assert_eq!(j, count, "bitset set-bit count must equal doc_count");
+            return count;
+        }
         let mut out = [0u32; BLOCK_LEN + EXPAND_STEP];
         let mut j = 0usize;
         for (wi, chunk) in words.chunks_exact(8).enumerate() {

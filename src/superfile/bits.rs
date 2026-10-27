@@ -388,6 +388,43 @@ fn unpack_groups_w<const W: usize>(payload: &[u8], start_bit: usize, out: &mut [
     }
 }
 
+/// The doc ids a presence bitset's set bits stand for, `base` plus each bit's
+/// index, ascending, into `out`: sixteen bits at a time, each slice's ids
+/// built in one register and compress-stored, so a word costs four steps
+/// whatever it holds. Returns how many were written.
+///
+/// # Safety
+///
+/// The caller must have detected AVX-512F at runtime. Every store is
+/// bounds-checked first: a compress-store writes exactly the selected lanes,
+/// and a slice whose set bits would pass `out`'s end panics instead.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn expand_bitset_avx512(words: &[u8], base: u32, out: &mut [u32]) -> usize {
+    use std::arch::x86_64::*;
+    let iota = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let mut j = 0usize;
+    for (wi, chunk) in words.chunks_exact(8).enumerate() {
+        let word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+        for quarter in 0..4u32 {
+            let mask = (word >> (16 * quarter)) as u16;
+            if mask == 0 {
+                continue;
+            }
+            let n = mask.count_ones() as usize;
+            assert!(j + n <= out.len(), "bitset holds more docs than its block");
+            let at = base.wrapping_add(wi as u32 * 64 + 16 * quarter) as i32;
+            let ids = _mm512_add_epi32(_mm512_set1_epi32(at), iota);
+            // SAFETY: the target feature is enabled on this function (see the
+            // contract above). The store writes `n` consecutive u32s from
+            // `out[j]`, inside `out` by the assert above.
+            unsafe { _mm512_mask_compressstoreu_epi32(out.as_mut_ptr().add(j).cast(), mask, ids) };
+            j += n;
+        }
+    }
+    j
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
