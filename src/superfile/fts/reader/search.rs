@@ -1802,7 +1802,13 @@ impl SeedBlocks<'_> {
                 &mut scores,
             );
             for (&doc, &score) in buf_d[..n].iter().zip(&scores) {
-                if score > self.floor_eff && filter.as_deref_mut().is_none_or(|f| f.admits(doc)) {
+                // The filter is asked only about docs that would enter: most
+                // fall under the bar, and a membership probe costs more than
+                // the score.
+                if score > self.floor_eff
+                    && (!coll.is_full(self.k) || score > bar)
+                    && filter.as_deref_mut().is_none_or(|f| f.admits(doc))
+                {
                     coll.offer(self.k, &mut bar, score, doc);
                 }
             }
