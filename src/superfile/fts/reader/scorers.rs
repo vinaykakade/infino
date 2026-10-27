@@ -17,6 +17,7 @@ use super::{
     cursor::{CursorUse, TermCursor, seek_sorted},
     filter::ExcludeFilter,
     metadata::{NormTable, unscored_norm_table},
+    search::seed_blocks_for,
     sink::{
         AndSink, BufferedScoreSink, CollectSink, Collector, MustShouldCountSink, MustShouldSink,
         ScoreCountSink, ScoreSink, ShouldBatch, TopKBuffer, TopKEntry, drain_top_k_desc,
@@ -552,20 +553,28 @@ const UNION_SEED_MAX_BLOCKS: usize = 4096;
 /// score is at least its score for any one term, so `k` docs score at least
 /// that; one ulp down keeps a doc tied at the bound. `NEG_INFINITY` when no
 /// term qualifies.
+///
+/// A lone term (what a split leaves of a union) is seeded as the single-term
+/// walk seeds one: from about a block per top-k doc, however long its list,
+/// as its top `k` spreads across that many blocks and fewer give a loose bar.
 pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) -> f32 {
+    let lone = cursors.len() == 1;
     let mut seed = f32::NEG_INFINITY;
     let mut order: Vec<usize> = Vec::new();
     let (mut ids, mut tfs) = ([0u32; BLOCK_LEN], [0u32; BLOCK_LEN]);
-    let mut scores: Vec<f32> = Vec::new();
     let mut block_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
     for c in cursors {
         let n_blocks = c.blocks.len();
-        if c.predecoded || c.df < k as u64 || n_blocks > UNION_SEED_MAX_BLOCKS {
+        if c.predecoded || c.df < k as u64 || (!lone && n_blocks > UNION_SEED_MAX_BLOCKS) {
             continue;
         }
         // The highest-bound blocks, enough to hold `k` docs (every block but
         // the last holds `BLOCK_LEN`), selected rather than sorted.
-        let need = (k.div_ceil(BLOCK_LEN) + 1).min(n_blocks);
+        let need = match lone {
+            true => seed_blocks_for(k),
+            false => k.div_ceil(BLOCK_LEN) + 1,
+        }
+        .min(n_blocks);
         order.clear();
         order.extend(0..n_blocks);
         order.select_nth_unstable_by(need - 1, |&a, &b| {
@@ -573,8 +582,8 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
                 .block_max_bm25
                 .total_cmp(&c.blocks[a].block_max_bm25)
         });
-        scores.clear();
-        scores.reserve(need * BLOCK_LEN);
+        let mut best = <TopKBuffer as Collector>::with_capacity(k, k);
+        let mut bar = f32::NEG_INFINITY;
         for &b in &order[..need] {
             let n = c.decode_block_into(b, &mut ids, &mut tfs);
             score_postings(
@@ -584,10 +593,11 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
                 dl_norm,
                 &mut block_scores,
             );
-            scores.extend_from_slice(&block_scores);
+            for (&doc, &score) in ids[..n].iter().zip(&block_scores) {
+                best.offer(k, &mut bar, score, doc);
+            }
         }
-        if scores.len() >= k {
-            let (_, &mut kth, _) = scores.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+        if let Some(&(_, kth)) = best.into_sorted().get(k - 1) {
             seed = seed.max(kth.next_down());
         }
     }
