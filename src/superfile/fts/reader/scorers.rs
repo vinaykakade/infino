@@ -2908,6 +2908,22 @@ impl FtsReader {
             };
         cursors.retain(|c| !c.is_exhausted());
         if let [c] = cursors.as_mut_slice() {
+            // Every doc of the term is asked about, so the negated terms are
+            // folded once into a bitset over its span and each doc is one bit
+            // test, rather than a search in a negated block per doc. A row-set
+            // filter keeps its own test.
+            let excluded: Option<Vec<u64>> = match filter.as_deref() {
+                Some(f) if f.allow.is_none() && !f.cursors.is_empty() => {
+                    let last = c.blocks.last().map_or(0, |b| b.last_doc_id);
+                    let mut ex = vec![0u64; last as usize / 64 + 1];
+                    let mut scratch = [0u32; BLOCK_LEN];
+                    for nc in &f.cursors {
+                        or_cursor_into_bitset(&mut ex, nc, &mut scratch);
+                    }
+                    Some(ex)
+                }
+                _ => None,
+            };
             let mut lane_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
             while !c.is_exhausted() {
                 c.hold_whole_block();
@@ -2939,7 +2955,11 @@ impl FtsReader {
                     }
                     Some(f) => {
                         for (&doc, &score) in docs.zip(&lane_scores) {
-                            if !f.admits(doc) {
+                            let admitted = match &excluded {
+                                Some(ex) => (ex[(doc >> 6) as usize] >> (doc & 63)) & 1 == 0,
+                                None => f.admits(doc),
+                            };
+                            if !admitted {
                                 continue;
                             }
                             count += 1;
