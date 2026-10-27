@@ -388,6 +388,20 @@ fn unpack_groups_w<const W: usize>(payload: &[u8], start_bit: usize, out: &mut [
     }
 }
 
+/// [`expand_bitset_avx512`] where the CPU has AVX-512F, else `None` and the
+/// caller expands the bitset itself.
+#[inline]
+pub(crate) fn expand_bitset(words: &[u8], base: u32, out: &mut [u32]) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f") {
+        // SAFETY: AVX-512F is present (checked above), the expansion's one
+        // precondition; it bounds its own stores.
+        return Some(unsafe { expand_bitset_avx512(words, base, out) });
+    }
+    let _ = (words, base, out);
+    None
+}
+
 /// The doc ids a presence bitset's set bits stand for, `base` plus each bit's
 /// index, ascending, into `out`: sixteen bits at a time, each slice's ids
 /// built in one register and compress-stored, so a word costs four steps
@@ -525,6 +539,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The AVX-512 bitset expansion gives exactly the set bits' doc ids, in
+    /// order, for empty, full and random words at any origin, and refuses a
+    /// bitset holding more docs than its output has room for.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx512_bitset_expansion_agrees_with_the_set_bits() {
+        if !std::arch::is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..200 {
+            let n_words = 1 + (next() % 4) as usize;
+            let words: Vec<u64> = (0..n_words)
+                .map(|w| match case % 4 {
+                    0 => 0,
+                    1 => u64::MAX,
+                    _ => next() & next() >> (w % 3),
+                })
+                .collect();
+            let base = (next() % 1_000_000) as u32 & !63;
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let want: Vec<u32> = words
+                .iter()
+                .enumerate()
+                .flat_map(|(wi, &w)| {
+                    (0..64)
+                        .filter(move |b| (w >> b) & 1 == 1)
+                        .map(move |b| base + wi as u32 * 64 + b)
+                })
+                .collect();
+            let mut got = vec![u32::MAX; 256];
+            // SAFETY: avx512f was detected above.
+            let n = unsafe { expand_bitset_avx512(&bytes, base, &mut got) };
+            assert_eq!(&got[..n], want.as_slice(), "case {case}");
+            assert!(
+                got[n..].iter().all(|&g| g == u32::MAX),
+                "case {case}: no write past the docs"
+            );
+        }
+        let full = [0xFFu8; 8];
+        let mut short = vec![0u32; 63];
+        // SAFETY: avx512f was detected above.
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            expand_bitset_avx512(&full, 0, &mut short)
+        }));
+        assert!(
+            refused.is_err(),
+            "a bitset past its output's room must panic, not overrun"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
