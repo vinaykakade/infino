@@ -543,6 +543,13 @@ pub(super) fn pruning_bar(bar: f32, terms: usize) -> f32 {
 /// smaller `k` the bar rises within the first windows anyway.
 pub(super) const UNION_SEED_MIN_K: usize = 64;
 
+/// How many times the blocks that could hold `k` docs a union term is seeded
+/// from: the best blocks often hold a few of the top docs each, so reading
+/// only enough blocks for `k` docs leaves the seed's `k`-th well under the
+/// final one, and the walk's bar starts low. Measured at `k` = 1000: four
+/// times as many cut the walk most; more cost more to read than they save.
+const UNION_SEED_DEPTH: usize = 4;
+
 /// Block tables longer than this are not scanned for a seed: a term that
 /// common scores too low per doc to raise the bar, and the scan is linear.
 const UNION_SEED_MAX_BLOCKS: usize = 4096;
@@ -569,11 +576,12 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
         if c.predecoded || c.df < k as u64 || (!lone && n_blocks > UNION_SEED_MAX_BLOCKS) {
             continue;
         }
-        // The highest-bound blocks, enough to hold `k` docs (every block but
-        // the last holds `BLOCK_LEN`), selected rather than sorted.
+        // The highest-bound blocks, [`UNION_SEED_DEPTH`] times enough to hold
+        // `k` docs (every block but the last holds `BLOCK_LEN`), selected
+        // rather than sorted.
         let need = match lone {
             true => seed_blocks_for(k),
-            false => k.div_ceil(BLOCK_LEN) + 1,
+            false => UNION_SEED_DEPTH * (k.div_ceil(BLOCK_LEN) + 1),
         }
         .min(n_blocks);
         order.clear();
