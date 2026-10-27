@@ -1599,6 +1599,7 @@ impl TermCursor {
     /// The current block's presence bitset when the cursor holds the block
     /// whole and it is stored as one: the doc its first bit stands for, and
     /// where its bytes sit in [`Self::bytes`].
+    #[cfg(target_arch = "x86_64")]
     pub(super) fn whole_bitset(&mut self) -> Option<(u32, Range<usize>)> {
         if self.predecoded || !self.holds_whole_block() {
             return None;

@@ -1565,11 +1565,21 @@ impl BitsetRun<'_> {
     fn tile_mask(&self, tile: u32) -> u16 {
         let off = i64::from(tile) - i64::from(self.bit_base);
         let (at, shift) = (off.div_euclid(8), off.rem_euclid(8));
-        let byte = |i: i64| match usize::try_from(i) {
-            Ok(i) => self.words.get(i).map_or(0, |&b| u32::from(b)),
-            Err(_) => 0,
+        // Inside the bitset, one four-byte read holds the tile's bits; at
+        // its edges, the bytes past it read as empty.
+        let bits = match usize::try_from(at)
+            .ok()
+            .and_then(|at| self.words.get(at..at + 4))
+        {
+            Some(four) => u32::from_le_bytes(four.try_into().expect("four bytes")),
+            None => {
+                let byte = |i: i64| match usize::try_from(i) {
+                    Ok(i) => self.words.get(i).map_or(0, |&b| u32::from(b)),
+                    Err(_) => 0,
+                };
+                byte(at) | byte(at + 1) << 8 | byte(at + 2) << 16
+            }
         };
-        let bits = byte(at) | byte(at + 1) << 8 | byte(at + 2) << 16;
         let mut mask = (bits >> shift) as u16;
         // Lanes before the run's first doc or past its last are dropped.
         let lo = self.docs.start.saturating_sub(tile).min(16);
