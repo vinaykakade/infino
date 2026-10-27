@@ -8,7 +8,7 @@
 
 #[cfg(test)]
 use std::cell::RefCell;
-use std::{cmp::Ordering, collections::BinaryHeap, slice::from_mut};
+use std::{cmp::Ordering, collections::BinaryHeap, mem, slice::from_mut};
 
 use wide::f32x8;
 
@@ -382,33 +382,41 @@ fn count_excluding_fold(
     max_doc: u32,
 ) -> u64 {
     let words = max_doc as usize / 64 + 1;
-    let mut scratch = [0u32; BLOCK_LEN];
-    let mut positive = vec![0u64; words];
-    let mut term = vec![0u64; words];
-    for (i, c) in pos.iter().enumerate() {
-        match (all, i) {
-            (false, _) | (true, 0) => or_cursor_into_bitset(&mut positive, c, &mut scratch),
-            (true, _) => {
-                term.fill(0);
-                or_cursor_into_bitset(&mut term, c, &mut scratch);
-                for (p, t) in positive.iter_mut().zip(&term) {
-                    *p &= *t;
+    with_fold_bitsets(words, |positive, term| {
+        let mut scratch = [0u32; BLOCK_LEN];
+        // `term` holds an intersected term's docs once the AND has a second
+        // term, and is cleared before each reuse only then.
+        let mut term_dirty = false;
+        for (i, c) in pos.iter().enumerate() {
+            match (all, i) {
+                (false, _) | (true, 0) => or_cursor_into_bitset(positive, c, &mut scratch),
+                (true, _) => {
+                    if term_dirty {
+                        term.fill(0);
+                    }
+                    or_cursor_into_bitset(term, c, &mut scratch);
+                    term_dirty = true;
+                    for (p, t) in positive.iter_mut().zip(term.iter()) {
+                        *p &= *t;
+                    }
                 }
             }
         }
-    }
-    if neg.is_empty() {
-        return positive.iter().map(|w| u64::from(w.count_ones())).sum();
-    }
-    term.fill(0);
-    for c in &neg {
-        or_cursor_into_bitset(&mut term, c, &mut scratch);
-    }
-    positive
-        .iter()
-        .zip(&term)
-        .map(|(p, n)| u64::from((p & !n).count_ones()))
-        .sum()
+        if term_dirty {
+            term.fill(0);
+        }
+        if neg.is_empty() {
+            return popcount_and_clear(positive);
+        }
+        for c in &neg {
+            or_cursor_into_bitset(term, c, &mut scratch);
+        }
+        positive
+            .iter_mut()
+            .zip(term.iter_mut())
+            .map(|(p, n)| u64::from((mem::take(p) & !mem::take(n)).count_ones()))
+            .sum()
+    })
 }
 
 /// [`count_excluding`] by probing: walk the positive side's documents (the
