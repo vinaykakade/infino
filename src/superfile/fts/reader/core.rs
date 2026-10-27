@@ -2363,10 +2363,7 @@ fn or_count_prefers_heap(terms: usize, total_df: u64, max_doc: u32) -> bool {
 fn or_count_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
     let words = max_doc as usize / 64 + 1;
     with_fold_bitset(words, |union| {
-        let mut scratch = [0u32; BLOCK_LEN];
-        for c in &cursors {
-            or_cursor_into_bitset(union, c, &mut scratch);
-        }
+        or_cursors_into_bitset(union, &cursors);
         popcount_and_clear(union)
     })
 }
@@ -2402,7 +2399,7 @@ const FOLD_BITSETS_KEEP_WORDS: usize = 1 << 20;
 
 /// Run `f` over one all-zero doc-space bitset of `words` words, which it must
 /// leave all zero, as [`with_fold_bitsets`] does for two.
-pub(super) fn with_fold_bitset<R>(words: usize, f: impl FnOnce(&mut [u64]) -> R) -> R {
+fn with_fold_bitset<R>(words: usize, f: impl FnOnce(&mut [u64]) -> R) -> R {
     with_fold_sets(words, false, |a, _| f(a))
 }
 
@@ -2469,6 +2466,14 @@ pub(super) fn or_cursor_into_bitset(
     }
     for b in 0..c.blocks.len() {
         or_block_into(dest, c, b, 0, scratch);
+    }
+}
+
+/// [`or_cursor_into_bitset`] for each of `cursors`.
+pub(super) fn or_cursors_into_bitset(dest: &mut [u64], cursors: &[TermCursor]) {
+    let mut scratch = [0u32; BLOCK_LEN];
+    for c in cursors {
+        or_cursor_into_bitset(dest, c, &mut scratch);
     }
 }
 
@@ -2628,7 +2633,7 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
                 &mut scratch,
             );
             for (w, a) in present.iter_mut().zip(&anchor_win) {
-                n += u64::from((std::mem::take(w) & !a).count_ones());
+                n += u64::from((mem::take(w) & !a).count_ones());
             }
             continue;
         }
@@ -2637,7 +2642,7 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
         // in one word-load; `skip_to` would decode each block — expanding its
         // ~128 doc ids — as the frontier drags the anchor across its whole list.
         for (word_idx, word) in present.iter_mut().enumerate() {
-            let mut bits = std::mem::take(word);
+            let mut bits = mem::take(word);
             while bits != 0 {
                 let doc = base + ((word_idx as u32) << 6) + bits.trailing_zeros();
                 bits &= bits - 1;

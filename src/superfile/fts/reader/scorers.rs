@@ -267,8 +267,8 @@ pub(super) fn score_postings(
     out: &mut Vec<f32>,
 ) {
     debug_assert_eq!(docs.len(), tfs.len());
-    // Sized once and written in place: appending eight scores at a time paid
-    // a capacity check and a copy per group.
+    // Sized once and written in place, so a group of eight costs no
+    // capacity check.
     out.clear();
     out.resize(docs.len(), 0.0);
     let groups = docs.chunks_exact(8).zip(tfs.chunks_exact(8));
@@ -382,34 +382,26 @@ fn count_excluding_fold(
 ) -> u64 {
     let words = max_doc as usize / 64 + 1;
     with_fold_bitsets(words, |positive, term| {
-        let mut scratch = [0u32; BLOCK_LEN];
-        // `term` holds an intersected term's docs once the AND has a second
-        // term, and is cleared before each reuse only then.
-        let mut term_dirty = false;
-        for (i, c) in pos.iter().enumerate() {
-            match (all, i) {
-                (false, _) | (true, 0) => or_cursor_into_bitset(positive, c, &mut scratch),
-                (true, _) => {
-                    if term_dirty {
-                        term.fill(0);
-                    }
+        match all {
+            false => or_cursors_into_bitset(positive, &pos),
+            // Each further term is folded into `term` and intersected in,
+            // which leaves `term` clear for the next.
+            true => {
+                let mut scratch = [0u32; BLOCK_LEN];
+                let (first, rest) = pos.split_first().expect("invariant: a positive term");
+                or_cursor_into_bitset(positive, first, &mut scratch);
+                for c in rest {
                     or_cursor_into_bitset(term, c, &mut scratch);
-                    term_dirty = true;
-                    for (p, t) in positive.iter_mut().zip(term.iter()) {
-                        *p &= *t;
+                    for (p, t) in positive.iter_mut().zip(term.iter_mut()) {
+                        *p &= mem::take(t);
                     }
                 }
             }
         }
-        if term_dirty {
-            term.fill(0);
-        }
         if neg.is_empty() {
             return popcount_and_clear(positive);
         }
-        for c in &neg {
-            or_cursor_into_bitset(term, c, &mut scratch);
-        }
+        or_cursors_into_bitset(term, &neg);
         positive
             .iter_mut()
             .zip(term.iter_mut())
@@ -518,9 +510,7 @@ fn must_lead_should_count(
         }
         count += docs.len() as u64;
         for (&doc, &score) in docs.iter().zip(&scores) {
-            if heap.len() < k || score > threshold {
-                offer_top_k(heap, k, &mut threshold, score, doc);
-            }
+            offer_top_k(heap, k, &mut threshold, score, doc);
         }
         lead.advance_by(to - from);
     }
@@ -578,7 +568,7 @@ pub(super) fn kth_scored<C: Collector>(
 
 /// `k` from which a multi-term union starts its bar at [`union_seed`]: at a
 /// smaller `k` the bar rises within the first windows anyway.
-pub(super) const UNION_SEED_MIN_K: usize = 64;
+const UNION_SEED_MIN_K: usize = 64;
 
 /// How many times the blocks that could hold `k` docs a union term is seeded
 /// from: the best blocks often hold a few of the top docs each, so reading
@@ -601,21 +591,18 @@ const UNION_SEED_MAX_BLOCKS: usize = 4096;
 /// A lone term (what a split leaves of a union) is seeded as the single-term
 /// walk seeds one, from the [`seed_blocks_for`] best blocks however long its
 /// list.
-pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) -> f32 {
+fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) -> f32 {
     let lone = cursors.len() == 1;
     let mut seed = f32::NEG_INFINITY;
     let mut order: Vec<usize> = Vec::new();
-    let (mut ids, mut tfs) = ([0u32; BLOCK_LEN], [0u32; BLOCK_LEN]);
-    let mut block_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
-    let mut scores: Vec<f32> = Vec::new();
     for c in cursors {
         let n_blocks = c.blocks.len();
         if c.predecoded || c.df < k as u64 || (!lone && n_blocks > UNION_SEED_MAX_BLOCKS) {
             continue;
         }
-        // The highest-bound blocks, [`UNION_SEED_DEPTH`] times enough to hold
-        // `k` docs (every block but the last holds `BLOCK_LEN`), selected
-        // rather than sorted.
+        // The highest-bound blocks — for a term of several,
+        // [`UNION_SEED_DEPTH`] times enough to hold `k` docs (every block but
+        // the last holds `BLOCK_LEN`) — selected rather than sorted.
         let need = match lone {
             true => seed_blocks_for(k),
             false => UNION_SEED_DEPTH * (k.div_ceil(BLOCK_LEN) + 1),
@@ -628,48 +615,20 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
                 .block_max_bm25
                 .total_cmp(&c.blocks[a].block_max_bm25)
         });
-        // A few blocks' scores are selected from directly; a lone term's
-        // many go through a top-k buffer, which keeps only those that can
-        // still place.
-        let kth = match lone {
-            false => {
-                scores.clear();
-                for &b in &order[..need] {
-                    let n = c.decode_block_into(b, &mut ids, &mut tfs);
-                    score_postings(
-                        c.idf_weight,
-                        &ids[..n],
-                        &tfs[..n],
-                        dl_norm,
-                        &mut block_scores,
-                    );
-                    scores.extend_from_slice(&block_scores);
-                }
-                (scores.len() >= k).then(|| {
-                    *scores
-                        .select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a))
-                        .1
-                })
-            }
-            true => {
-                // The blocks hold at most `need` × `BLOCK_LEN` docs, which
-                // bounds the buffer however large `k` is.
-                let cap = k.min(need.saturating_mul(BLOCK_LEN));
-                let mut blocks = order[..need].iter();
-                let kth = kth_scored(
-                    <TopKBuffer as Collector>::with_capacity(k, cap),
-                    k,
-                    f32::NEG_INFINITY,
-                    c.idf_weight,
-                    dl_norm,
-                    |ids, tfs| blocks.next().map(|&b| c.decode_block_into(b, ids, tfs)),
-                );
-                (kth > f32::NEG_INFINITY).then_some(kth)
-            }
-        };
-        if let Some(kth) = kth {
-            seed = seed.max(kth.next_down());
-        }
+        // The blocks hold at most `need` × `BLOCK_LEN` docs, which bounds the
+        // buffer however large `k` is.
+        let cap = k.min(need.saturating_mul(BLOCK_LEN));
+        let mut blocks = order[..need].iter();
+        let kth = kth_scored(
+            <TopKBuffer as Collector>::with_capacity(k, cap),
+            k,
+            f32::NEG_INFINITY,
+            c.idf_weight,
+            dl_norm,
+            |ids, tfs| blocks.next().map(|&b| c.decode_block_into(b, ids, tfs)),
+        );
+        // `NEG_INFINITY` (fewer than `k` docs) stays `NEG_INFINITY`.
+        seed = seed.max(kth.next_down());
     }
     seed
 }
@@ -743,12 +702,10 @@ fn must_lead_should_walk<C: Collector>(
     // Probe the optional terms strongest first (the bound on what is still
     // unprobed then falls fastest), but add their scores in query order, as
     // the general must+should walk does, so a score is the same bits on
-    // either path.
+    // either path. The block batch probes in query order instead from
+    // [`BUFFERED_TOPK_MIN_K`] (see there).
     let m = shoulds.len();
-    // The block batch probes in query order at a `k` from which a top-k
-    // buffer collects (see below), `identity` being that order.
     let query_order = k >= BUFFERED_TOPK_MIN_K;
-    let identity: Vec<usize> = (0..m).collect();
     let mut order: Vec<usize> = (0..m).collect();
     order.sort_unstable_by(|&a, &b| {
         shoulds[b]
@@ -819,7 +776,8 @@ fn must_lead_should_walk<C: Collector>(
         }
         // The rest of the required block at once: score it, keep the docs
         // that can clear the bar with every optional term at its maximum over
-        // the block, and probe the optional terms strongest first, each in one
+        // the block, and probe the optional terms (strongest first below
+        // [`BUFFERED_TOPK_MIN_K`], in query order from it), each in one
         // sorted pass over the docs still alive, dropping a doc once what it
         // has plus what is still unprobed cannot clear the bar. That is the
         // walk's own test against bounds never tighter than its per-doc ones
@@ -984,14 +942,11 @@ fn must_lead_should_walk<C: Collector>(
             // are then kept per term and summed in query order at the end.
             // Either way `win_suffix[r]` bounds the terms from the `r`-th probed
             // on, and the scored docs end in `probe_docs` and `partial`.
-            let probed = match query_order {
-                true => &identity,
-                false => &order,
-            };
             if pruning {
                 win_suffix[m] = 0.0;
                 for r in (0..m).rev() {
-                    win_suffix[r] = win_suffix[r + 1] + win[probed[r]];
+                    let term = if query_order { r } else { order[r] };
+                    win_suffix[r] = win_suffix[r + 1] + win[term];
                 }
             }
             if query_order {
@@ -2966,10 +2921,7 @@ impl FtsReader {
                         && c.df >= f.cursors.iter().map(|nc| nc.blocks.len() as u64).sum() =>
                 {
                     let mut ex = vec![0u64; words];
-                    let mut scratch = [0u32; BLOCK_LEN];
-                    for nc in &f.cursors {
-                        or_cursor_into_bitset(&mut ex, nc, &mut scratch);
-                    }
+                    or_cursors_into_bitset(&mut ex, &f.cursors);
                     Some(ex)
                 }
                 _ => None,
@@ -2987,18 +2939,13 @@ impl FtsReader {
                 );
                 let docs = c.block_doc_ids[from..to].iter();
                 match filter.as_deref_mut() {
-                    // Every doc counts; only one that beats the k-th best (or
-                    // fills the heap) is offered, which is the offer's own test.
-                    // Once the heap is full, a block none of whose scores beats
-                    // the k-th best is counted whole and passed over, one
-                    // lane-wise compare instead of a branch per doc.
-                    None if heap.len() >= k && !any_beats(&lane_scores, threshold) => {
-                        count += (to - from) as u64;
-                    }
+                    // Every doc counts. Once the heap is full, a block none of
+                    // whose scores beats the k-th best is passed over whole,
+                    // one lane-wise compare instead of an offer per doc.
                     None => {
                         count += (to - from) as u64;
-                        for (&doc, &score) in docs.zip(&lane_scores) {
-                            if heap.len() < k || score > threshold {
+                        if heap.len() < k || any_beats(&lane_scores, threshold) {
+                            for (&doc, &score) in docs.zip(&lane_scores) {
                                 offer(&mut heap, &mut threshold, doc, score);
                             }
                         }
@@ -3045,7 +2992,7 @@ impl FtsReader {
                 }
             }
             for (word_idx, word) in present.iter_mut().enumerate() {
-                let mut bits = std::mem::take(word);
+                let mut bits = mem::take(word);
                 if bits == 0 {
                     continue;
                 }
@@ -3063,7 +3010,7 @@ impl FtsReader {
                 while bits != 0 {
                     let local = (word_idx << 6) | bits.trailing_zeros() as usize;
                     bits &= bits - 1;
-                    let score = std::mem::take(&mut scores[local]);
+                    let score = mem::take(&mut scores[local]);
                     let doc = base + local as u32;
                     if let Some(f) = filter.as_deref_mut() {
                         if !f.admits(doc) {
@@ -3182,10 +3129,8 @@ impl FtsReader {
         let mut heap = C::with_capacity(k, initial_cap);
         let mut threshold: f32 = floor_eff.max(0.0);
         // A floor bars every doc at or under it, as a full collector's k-th
-        // does: pruning against the bar holds from the first window, not only
-        // once `k` docs are in. Without this a seeded floor, under which most
-        // docs fall, kept the collector from filling and every window on its
-        // unpruned path.
+        // does, so pruning holds from the first window rather than once `k`
+        // docs are in.
         let floored = floor_eff > f32::NEG_INFINITY;
         // Bounds are tested against the threshold lowered for summing order
         // (see [`pruning_bar`]); offers compare real scores with it.
@@ -3539,7 +3484,7 @@ impl FtsReader {
                     win_all_sum = win_ub.iter().sum();
                 }
             }
-            let f_win = if sole {
+            let mut f_win = if sole {
                 partial_win.copy_from_slice(&partial_max);
                 f_essential
             } else if prune {
@@ -3571,14 +3516,14 @@ impl FtsReader {
                 }
                 continue;
             }
-            // Promotion, the converse: a non-essential term holding few more
-            // docs in this window than the essentials is accumulated with them
-            // rather than probed at nearly every candidate, accumulating a
-            // posting costing a fraction of a probe. Terms stay in term-max
-            // order, so a doc's score is summed in the same order either way,
-            // and the suffix bounds of the terms still probed are unchanged.
-            let mut f_win = f_win;
-            if prune && !sole && f_win == f_essential {
+            // Promotion, the converse: a non-essential term with at most
+            // [`PROMOTE_DENSITY`] times the essentials' docs in this window is
+            // accumulated with them rather than probed at their candidates,
+            // accumulating a posting costing a fraction of a probe. Terms stay
+            // in term-max order, so a doc's score is summed in the same order
+            // either way, and the suffix bounds of the terms still probed are
+            // unchanged.
+            if windowed && f_win == f_essential {
                 let essential_docs: f32 = win_docs_est[..f_essential].iter().sum();
                 while f_win < n
                     && !cursors[f_win].predecoded
@@ -3652,7 +3597,6 @@ impl FtsReader {
             // the reference pipeline: SIMD-filter to competitive survivors,
             // complete the non-essentials over the survivors only, collect.
             let (_, non_ess) = cursors.split_at_mut(f_win);
-            let barred = floored || heap.is_full(k);
             let words = ((window_end - base) as usize)
                 .div_ceil(64)
                 .min(OR_WINDOW_WORDS);
@@ -3681,7 +3625,7 @@ impl FtsReader {
                         bits &= bits - 1;
                         let local = (word_idx << 6) | b;
                         let doc = base + local as u32;
-                        let score = std::mem::take(&mut scores[local]);
+                        let score = mem::take(&mut scores[local]);
                         if let Some(f) = filter.as_deref_mut()
                             && !f.admits(doc)
                         {
@@ -3702,7 +3646,7 @@ impl FtsReader {
                     bits &= bits - 1;
                     let local = (word_idx << 6) | b;
                     let doc = base + local as u32;
-                    let score = std::mem::take(&mut scores[local]);
+                    let score = mem::take(&mut scores[local]);
                     if let Some(f) = filter.as_deref_mut()
                         && !f.admits(doc)
                     {
@@ -3720,7 +3664,7 @@ impl FtsReader {
             // batch-scoring matches — so weaker terms touch a shrinking
             // survivor set. Before then every doc must be admitted, so score
             // all non-essentials over every candidate.
-            if barred {
+            if prune {
                 complete_survivors(
                     non_ess,
                     &partial_win[f_win..],

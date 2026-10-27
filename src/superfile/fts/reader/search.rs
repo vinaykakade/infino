@@ -1419,19 +1419,24 @@ impl FtsReader {
                 // at a large one, where a sift per admission would cost more than
                 // the walk the seed saves. Clamp the preallocation to the corpus
                 // size: `k` is caller-controlled and may be `usize::MAX`.
-                let seed = SeedBlocks {
-                    blocks: &cand[..m],
-                    term_meta: &term_meta,
-                    postings,
-                    idf_weight,
-                    dl_norm_k1,
-                    k,
-                    floor_eff,
+                let mut blocks = cand[..m].iter();
+                let decode = |ids: &mut [u32; BLOCK_LEN], tfs: &mut [u32; BLOCK_LEN]| {
+                    let &(_, bi) = blocks.next()?;
+                    let range = term_meta.block_range_in_term(postings, bi, None);
+                    let bytes = &postings[range.start..range.end];
+                    let hdr = BlockHeader::parse(bytes, term_meta.prev_last_doc_id(postings, bi));
+                    Some(decode_block(bytes, &hdr, ids, tfs))
                 };
                 let cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
                 match k >= BUFFERED_TOPK_MIN_K {
-                    true => seed.kth(<TopKBuffer as Collector>::with_capacity(k, cap)),
-                    false => seed.kth(<BinaryHeap<TopKEntry> as Collector>::with_capacity(k, cap)),
+                    true => {
+                        let buffer = <TopKBuffer as Collector>::with_capacity(k, cap);
+                        kth_scored(buffer, k, floor_eff, idf_weight, dl_norm_k1, decode)
+                    }
+                    false => {
+                        let heap = <BinaryHeap<TopKEntry> as Collector>::with_capacity(k, cap);
+                        kth_scored(heap, k, floor_eff, idf_weight, dl_norm_k1, decode)
+                    }
                 }
             } else {
                 f32::NEG_INFINITY
@@ -1757,41 +1762,6 @@ impl FtsReader {
             }
         }
         Ok(cursors)
-    }
-}
-
-/// The blocks a single-term walk's seed decodes, and what scores them.
-struct SeedBlocks<'a> {
-    blocks: &'a [(f32, usize)],
-    term_meta: &'a TermMeta,
-    postings: &'a [u8],
-    idf_weight: f32,
-    dl_norm_k1: &'a NormTable,
-    k: usize,
-    floor_eff: f32,
-}
-
-impl SeedBlocks<'_> {
-    /// The `k`-th best score over the blocks' docs, scored eight at a time
-    /// into `coll`, or `NEG_INFINITY` when they hold fewer than `k` docs
-    /// above the floor: only a full `k` bounds the walk's `k`-th from below.
-    fn kth<C: Collector>(&self, coll: C) -> f32 {
-        let mut blocks = self.blocks.iter();
-        kth_scored(
-            coll,
-            self.k,
-            self.floor_eff,
-            self.idf_weight,
-            self.dl_norm_k1,
-            |buf_d, buf_t| {
-                let &(_, bi) = blocks.next()?;
-                let range = self.term_meta.block_range_in_term(self.postings, bi, None);
-                let bytes = &self.postings[range.start..range.end];
-                let hdr =
-                    BlockHeader::parse(bytes, self.term_meta.prev_last_doc_id(self.postings, bi));
-                Some(decode_block(bytes, &hdr, buf_d, buf_t))
-            },
-        )
     }
 }
 

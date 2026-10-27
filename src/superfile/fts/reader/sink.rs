@@ -592,10 +592,9 @@ fn admit_top_k(
         if heap.len() < k {
             return false;
         }
-    } else if score > *threshold {
-        replace_worst(heap, TopKEntry(score, FtsDocId::new(doc)));
     } else {
-        return false;
+        debug_assert!(score > *threshold, "the caller rejected a score at the bar");
+        replace_worst(heap, TopKEntry(score, FtsDocId::new(doc)));
     }
     *threshold = heap.peek().expect("a full heap").0.max(*threshold);
     true
