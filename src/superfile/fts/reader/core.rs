@@ -42,6 +42,7 @@ use super::{
 use crate::{
     superfile::{
         ReadError,
+        bits::prefetch_read,
         error::FtsError,
         format::{
             self, KEY_SEPARATOR,
@@ -2390,9 +2391,17 @@ pub(super) fn or_cursor_into_bitset(
         return;
     }
     for b in 0..c.blocks.len() {
+        // The walk is bound by each block's first read: ask for the block two
+        // on now, so its bytes are in cache by then.
+        if let Some(ahead) = c.blocks.get(b + COUNT_PREFETCH_AHEAD) {
+            prefetch_read(c.bytes.as_ptr().wrapping_add(ahead.block_byte_offset));
+        }
         or_block_into(dest, c, b, 0, scratch);
     }
 }
+
+/// Blocks ahead a counting walk prefetches.
+const COUNT_PREFETCH_AHEAD: usize = 2;
 
 /// OR block `b` of `c` into `dest`, a bitset whose bit 0 is doc `base` (a
 /// multiple of 64), dropping docs past its span: a **bitset** block's

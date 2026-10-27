@@ -388,6 +388,22 @@ fn unpack_groups_w<const W: usize>(payload: &[u8], start_bit: usize, out: &mut [
     }
 }
 
+/// Ask the cache for the line holding `at`, to be read soon. A hint only:
+/// a prefetch reads no memory the program sees and cannot fault, so any
+/// address, even one past an allocation, is sound.
+#[inline(always)]
+pub(crate) fn prefetch_read(at: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE, the one feature the intrinsic needs, is part of the
+    // x86_64 baseline; the instruction never dereferences `at` for the
+    // program and raises no fault on any address.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(at.cast());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = at;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
