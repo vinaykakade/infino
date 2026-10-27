@@ -573,7 +573,7 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
         // the last holds `BLOCK_LEN`), selected rather than sorted.
         let need = match lone {
             true => seed_blocks_for(k),
-            false => k.div_ceil(BLOCK_LEN) + 1,
+            false => 4 * (k.div_ceil(BLOCK_LEN) + 1),
         }
         .min(n_blocks);
         order.clear();
