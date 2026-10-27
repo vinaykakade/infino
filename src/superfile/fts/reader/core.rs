@@ -2741,6 +2741,17 @@ mod tests {
                 "both bitsets are cleared at their full size"
             );
         });
+        // A superfile past what a thread keeps folds over bitsets of its own,
+        // as clear, and the thread's stay at the size they were.
+        with_fold_bitsets(FOLD_BITSETS_KEEP_WORDS + 1, |a, b| {
+            assert_eq!(
+                (a.len(), b.len()),
+                (FOLD_BITSETS_KEEP_WORDS + 1, FOLD_BITSETS_KEEP_WORDS + 1)
+            );
+            assert!(a.iter().chain(b.iter()).all(|&w| w == 0));
+        });
+        FOLD_BITSETS
+            .with_borrow(|fb| assert_eq!(fb.a.len(), WORDS, "the kept bitsets did not grow"));
     }
 
     /// What the writer stores for a column's norms must be exactly what the

@@ -5991,6 +5991,51 @@ mod tests {
         }
     }
 
+    /// A pair whose rarer term is too common for the rare-led walk yet under
+    /// `k` documents: the walk declines it, and the pair runs the seeded
+    /// windowed walk, which must rank as the exhaustive walk does, doc for
+    /// doc.
+    #[tokio::test]
+    async fn a_pair_the_rare_led_walk_declines_runs_the_seeded_walk() {
+        // `rarer` holds just more docs than the rare-led walk takes, and `k`
+        // is past them; `commoner` holds more than `k`.
+        let rarer_docs = RARE_LED_MAX_DF as u32 + 1_000;
+        let k = rarer_docs as usize + 2_000;
+        let n_docs = rarer_docs + 30_000;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..n_docs {
+            let text = match (i < rarer_docs, i % 7 != 0) {
+                (true, true) => format!(
+                    "rarer commoner {}",
+                    ["pad "].repeat((i % 5) as usize).concat()
+                ),
+                (true, false) => "rarer pad".to_string(),
+                (false, _) => format!("commoner {}", ["pad "].repeat((i % 3) as usize).concat()),
+            };
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let terms = ["rarer", "commoner"];
+        let got: Vec<u32> = r
+            .search("body", &terms, k, BoolMode::Or)
+            .await
+            .expect("search")
+            .into_iter()
+            .map(|(d, _)| d.get())
+            .collect();
+        let want: Vec<u32> = r
+            .search_with_algo_for_bench("body", &terms, k, OrAlgo::Exhaustive)
+            .await
+            .expect("exhaustive")
+            .into_iter()
+            .map(|(d, _)| d.get())
+            .collect();
+        assert_eq!(got.len(), k);
+        assert_eq!(got, want);
+    }
+
     /// A union with a term holding fewer than `k` documents, at a `k` far
     /// past the small-`k` routes: the rare term is split off and its
     /// documents merged with the other terms ranked alone, which must rank as
