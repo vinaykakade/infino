@@ -62,21 +62,21 @@ const NO_BLOCK_CACHED: usize = usize::MAX;
 
 impl PhraseMember {
     /// The member's positions at its cursor's current doc, decoded
-    /// into `pos_scratch`. The cursor must be positioned on a doc
+    /// into `pos_scratch` through the first past `limit`. The cursor must be positioned on a doc
     /// (not exhausted) **with its whole block decoded**: `pos` is read as
     /// the pair index within the block and `block_tfs[..block_n]` as the
     /// block's tf run. A cursor that reached the doc by a skip into a
     /// bitset block holds only that one doc (`block_n == 1`, `pos == 0`)
     /// and would read the wrong run; `materialize_at` expands it first,
     /// which is why every caller goes through it.
-    pub(super) fn decode_current_positions(&mut self) -> Result<(), FtsError> {
+    pub(super) fn decode_current_positions(&mut self, limit: u32) -> Result<(), FtsError> {
         if self.inline_position.is_none() {
             debug_assert_eq!(
                 self.cursor.decoded_block, self.cursor.current_block,
                 "positions need the whole block decoded; call materialize_at first"
             );
         }
-        self.located_positions(self.cursor.current_block, self.cursor.pos)
+        self.located_positions(self.cursor.current_block, self.cursor.pos, limit)
     }
 }
 
@@ -109,10 +109,11 @@ impl PhraseMember {
     }
 
     /// The member's positions in its `pair`-th posting of block `block`,
-    /// decoded into `pos_scratch`. Reads the block's tfs and position group
-    /// once per block and the posting's run alone: the doc ids are never
-    /// expanded, and no cursor is walked to the doc.
-    fn located_positions(&mut self, block: usize, pair: usize) -> Result<(), FtsError> {
+    /// decoded into `pos_scratch` through the first past `limit` (see
+    /// [`GroupIndex::run_positions_through`]). Reads the block's tfs and
+    /// position group once per block and the posting's run alone: the doc
+    /// ids are never expanded, and no cursor is walked to the doc.
+    fn located_positions(&mut self, block: usize, pair: usize, limit: u32) -> Result<(), FtsError> {
         self.pos_scratch.clear();
         if let Some(p) = self.inline_position {
             self.pos_scratch.push(p);
@@ -133,7 +134,13 @@ impl PhraseMember {
             self.group_block = block;
         }
         self.group_index
-            .run_positions(&self.positions, pair, self.tfs[pair], &mut self.pos_scratch)
+            .run_positions_through(
+                &self.positions,
+                pair,
+                self.tfs[pair],
+                limit,
+                &mut self.pos_scratch,
+            )
             .ok_or_else(|| {
                 FtsError::Read(ReadError::Malformed(
                     "position run truncated or overflowing".into(),
@@ -148,19 +155,20 @@ impl PhraseMember {
 /// `s + offsets[j]`, so the rarest member (`order[0]`) seeds the candidate
 /// starts and each other member, in `order`, keeps the starts it confirms,
 /// compacted in place in `starts`. A member's positions are only read
-/// (`positions_of`, which fills its `pos_scratch`) once some start survives
-/// every rarer member, so on the many docs a rare member rejects the common
-/// members' runs are never decoded. Returns the surviving starts: the
-/// phrase's tf at the doc.
+/// (`positions_of`, which fills its `pos_scratch` through the limit it is
+/// given) once some start survives every rarer member, so on the many docs a
+/// rare member rejects the common members' runs are never decoded; and a
+/// member is read only as far as the last surviving start needs it. Returns
+/// the surviving starts: the phrase's tf at the doc.
 fn verify_members(
     members: &mut [PhraseMember],
     order: &[usize],
     offsets: &[u32],
     starts: &mut Vec<u32>,
-    mut positions_of: impl FnMut(&mut PhraseMember, usize) -> Result<(), FtsError>,
+    mut positions_of: impl FnMut(&mut PhraseMember, usize, u32) -> Result<(), FtsError>,
 ) -> Result<u32, FtsError> {
     let anchor = order[0];
-    positions_of(&mut members[anchor], anchor)?;
+    positions_of(&mut members[anchor], anchor, u32::MAX)?;
     starts.clear();
     starts.extend(
         members[anchor]
@@ -172,9 +180,11 @@ fn verify_members(
         if starts.is_empty() {
             break;
         }
-        positions_of(&mut members[j], j)?;
-        let plist = &members[j].pos_scratch;
         let off = offsets[j];
+        // Starts ascend, so the last needs the furthest position.
+        let limit = starts.last().map_or(0, |&s| s.saturating_add(off));
+        positions_of(&mut members[j], j, limit)?;
+        let plist = &members[j].pos_scratch;
         // Compacted in place without a branch on the outcome, which on a
         // common member is close to a coin flip; the search per start stays,
         // as it beat a merge on every lane measured.
@@ -564,9 +574,9 @@ impl PhraseCursor {
             &self.align_order,
             &self.position_offsets,
             &mut self.verify_scratch,
-            |m, j| {
+            |m, j, limit| {
                 let (b, p) = locs[j][c];
-                m.located_positions(b as usize, p as usize)
+                m.located_positions(b as usize, p as usize, limit)
             },
         )?;
         Ok(self.current_tf)
@@ -591,9 +601,9 @@ impl PhraseCursor {
             &self.align_order,
             &self.position_offsets,
             &mut self.verify_scratch,
-            |m, _| {
+            |m, _, limit| {
                 m.cursor.materialize_at(aligned);
-                m.decode_current_positions()
+                m.decode_current_positions(limit)
             },
         )?;
         Ok(self.current_tf)

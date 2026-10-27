@@ -498,6 +498,11 @@ enum GroupKind {
 const BULK_AFTER_RUNS: u32 = 2;
 /// Runs up to this many positions bypass the generic lane reader.
 const SMALL_TF: usize = 4;
+/// Gaps a long run is decoded at a time when the caller needs it only up
+/// to a position: two groups of the lane unpacker's eight, so a chunk
+/// costs about what one group's setup does, and a run that passes the
+/// limit early leaves the rest unread.
+const RUN_CHUNK: usize = 16;
 const BULK_MAX_STRIDE: usize = 4;
 
 /// A position group located for **per-run** access: one pair's run is
@@ -597,6 +602,23 @@ impl GroupIndex {
         tf: u32,
         out: &mut Vec<u32>,
     ) -> Option<()> {
+        self.run_positions_through(bytes, pair, tf, u32::MAX, out)
+    }
+
+    /// [`Self::run_positions`] for a caller that asks only about positions
+    /// up to `limit`: a prefix of the run is appended that holds every
+    /// position up to `limit`. A long run read lane by lane from the group
+    /// is decoded [`RUN_CHUNK`] gaps at a time and stops at the chunk that
+    /// passes `limit`, so the rest of it is never read; a short run, or one
+    /// from a block decoded whole, is appended whole.
+    pub(crate) fn run_positions_through(
+        &mut self,
+        bytes: &[u8],
+        pair: usize,
+        tf: u32,
+        limit: u32,
+        out: &mut Vec<u32>,
+    ) -> Option<()> {
         let start = *self.starts.get(pair)? as usize;
         if self.kind == GroupKind::Packed
             && self.served >= BULK_AFTER_RUNS
@@ -633,11 +655,28 @@ impl GroupIndex {
                     return Some(());
                 }
                 // A long run: its raw values go straight into `out` and are
-                // summed there, with no staging buffer in between.
+                // summed there, with no staging buffer in between, a chunk
+                // at a time once the caller has a limit.
                 let base = out.len();
                 self.first.read_lanes(bytes, pair, 1, out)?;
-                self.gap.read_lanes(bytes, start, tf as usize - 1, out)?;
-                prefix_sum_in_place(&mut out[base..])
+                let gaps = tf as usize - 1;
+                if limit == u32::MAX {
+                    self.gap.read_lanes(bytes, start, gaps, out)?;
+                    return prefix_sum_in_place(&mut out[base..]);
+                }
+                let mut acc = out[base];
+                let mut done = 0usize;
+                while done < gaps && acc <= limit {
+                    let take = RUN_CHUNK.min(gaps - done);
+                    let at = out.len();
+                    self.gap.read_lanes(bytes, start + done, take, out)?;
+                    for slot in &mut out[at..] {
+                        acc = acc.checked_add(*slot)?;
+                        *slot = acc;
+                    }
+                    done += take;
+                }
+                Some(())
             }
             GroupKind::Bulk => {
                 let base = out.len();
@@ -1025,6 +1064,50 @@ mod tests {
                         "case {case} kind {packed} cut {cut}"
                     );
                 }
+            }
+        }
+    }
+
+    /// A run read through a limit is a prefix of the run holding every
+    /// position up to the limit, however long the run and wherever its gap
+    /// exceptions fall, and the whole run when none is past it.
+    #[test]
+    fn a_run_read_through_a_limit_stops_at_its_first_position_past_it() {
+        // Long runs, whose gaps a reader takes a chunk at a time, among
+        // short ones; a few gaps wide enough to be exceptions.
+        let tfs: Vec<u32> = (0..40u32)
+            .map(|d| [1, 3, 17, 40, 70][d as usize % 5])
+            .collect();
+        let mut vals = Vec::new();
+        for (d, &tf) in tfs.iter().enumerate() {
+            vals.push(5 * d as u32 + 1);
+            vals.extend((1..tf).map(|g| 1 + (g * 13 + d as u32) % 9));
+        }
+        vals[60] = 1 << 20;
+        vals[400] = 1 << 18;
+        let mut out = Vec::new();
+        group(&mut out, &tfs, &vals, false);
+        let mut vi = 0usize;
+        for (pair, &tf) in tfs.iter().enumerate() {
+            let mut full = Vec::new();
+            positions_from_run_values(&vals[vi..vi + tf as usize], &mut full).expect("sums");
+            vi += tf as usize;
+            let limits = full.iter().flat_map(|&p| [p.saturating_sub(1), p, p + 1]);
+            for limit in limits.chain([0, u32::MAX - 1]) {
+                let mut index = GroupIndex::default();
+                index.locate(&out, &mut 0, &tfs).expect("locates");
+                let mut got = Vec::new();
+                index
+                    .run_positions_through(&out, pair, tf, limit, &mut got)
+                    .expect("run");
+                let through = full
+                    .iter()
+                    .position(|&p| p > limit)
+                    .map_or(full.len(), |i| i + 1);
+                assert!(
+                    got.len() >= through && full.starts_with(&got),
+                    "pair {pair} limit {limit}: {got:?} of {full:?}"
+                );
             }
         }
     }
