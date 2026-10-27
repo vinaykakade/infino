@@ -520,10 +520,15 @@ pub(crate) struct GroupIndex {
     gaps: Vec<u32>,
     /// Runs served from this block so far.
     served: u32,
-    /// Where pair `p`'s lanes begin: in the gap stream (`Σ (tf - 1)` over
-    /// the pairs before it) for a packed group, in the values (`Σ tf`)
-    /// for a LEB128 one. `tfs.len() + 1` entries.
-    starts: Vec<u32>,
+    /// The block's per-doc term frequencies, from which a run's start is
+    /// summed when it is asked for.
+    tfs: Vec<u32>,
+    /// A pair and where its lanes begin: in the gap stream (`Σ (tf - 1)`
+    /// over the pairs before it) for a packed group, in the values (`Σ tf`)
+    /// for a LEB128 one. Runs are mostly asked for in ascending pair order,
+    /// so each start is summed on from the last rather than from the
+    /// block's first pair, and a block's tfs are summed about once.
+    start_at: (usize, usize),
 }
 
 impl GroupIndex {
@@ -569,23 +574,31 @@ impl GroupIndex {
             _ => return None,
         }
         // Every partial sum is at most `n`, so one check that `n` fits makes
-        // the prefix sum overflow-free; the per-encoding lane rule is chosen
-        // once, not called per pair.
+        // the starts summed from these tfs overflow-free.
         u32::try_from(n).ok()?;
-        // Sized once and filled with the running sum in a register: pushing
-        // grew the vector through memory for every pair of every block.
-        self.starts.clear();
-        self.starts.resize(tfs.len() + 1, 0);
-        let mut acc = 0u32;
-        let lanes_per_pair = |tf: u32| match self.kind {
-            GroupKind::Packed => tf.saturating_sub(1),
-            _ => tf,
-        };
-        for (slot, &tf) in self.starts[1..].iter_mut().zip(tfs) {
-            acc += lanes_per_pair(tf);
-            *slot = acc;
-        }
+        self.tfs.clear();
+        self.tfs.extend_from_slice(tfs);
+        self.start_at = (0, 0);
         Some(())
+    }
+
+    /// Where pair `pair`'s lanes begin (see `start_at`); `pair` may be the
+    /// block's pair count, for the end of its last run. `None` past it.
+    fn start_of(&mut self, pair: usize) -> Option<usize> {
+        if pair > self.tfs.len() {
+            return None;
+        }
+        if pair < self.start_at.0 {
+            self.start_at = (0, 0);
+        }
+        let (from, start) = self.start_at;
+        let tfs = &self.tfs[from..pair];
+        let lanes = match self.kind {
+            GroupKind::Leb128 => tfs.iter().map(|&t| t as usize).sum::<usize>(),
+            _ => tfs.iter().map(|&t| t.saturating_sub(1) as usize).sum(),
+        };
+        self.start_at = (pair, start + lanes);
+        Some(start + lanes)
     }
 
     /// The absolute positions of pair `pair` (whose term frequency is
@@ -597,13 +610,14 @@ impl GroupIndex {
         tf: u32,
         out: &mut Vec<u32>,
     ) -> Option<()> {
-        let start = *self.starts.get(pair)? as usize;
+        let start = self.start_of(pair)?;
         if self.kind == GroupKind::Packed
             && self.served >= BULK_AFTER_RUNS
             && pair < self.served as usize * BULK_MAX_STRIDE
         {
-            let n_pairs = self.starts.len() - 1;
-            let n_gaps = *self.starts.last()? as usize;
+            let n_pairs = self.tfs.len();
+            let n_gaps = self.start_of(n_pairs)?;
+            self.start_at = (pair, start);
             // Sized, not cleared: every lane is overwritten, so only growth
             // past the last group's length is zero-filled.
             self.firsts.resize(n_pairs, 0);
