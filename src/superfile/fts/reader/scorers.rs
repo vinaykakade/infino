@@ -563,6 +563,7 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
     let mut order: Vec<usize> = Vec::new();
     let (mut ids, mut tfs) = ([0u32; BLOCK_LEN], [0u32; BLOCK_LEN]);
     let mut block_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+    let mut scores: Vec<f32> = Vec::new();
     for c in cursors {
         let n_blocks = c.blocks.len();
         if c.predecoded || c.df < k as u64 || (!lone && n_blocks > UNION_SEED_MAX_BLOCKS) {
@@ -582,22 +583,49 @@ pub(super) fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) 
                 .block_max_bm25
                 .total_cmp(&c.blocks[a].block_max_bm25)
         });
-        let mut best = <TopKBuffer as Collector>::with_capacity(k, k);
-        let mut bar = f32::NEG_INFINITY;
-        for &b in &order[..need] {
-            let n = c.decode_block_into(b, &mut ids, &mut tfs);
-            score_postings(
-                c.idf_weight,
-                &ids[..n],
-                &tfs[..n],
-                dl_norm,
-                &mut block_scores,
-            );
-            for (&doc, &score) in ids[..n].iter().zip(&block_scores) {
-                best.offer(k, &mut bar, score, doc);
+        // A few blocks' scores are selected from directly; a lone term's
+        // many go through a top-k buffer, which keeps only those that can
+        // still place.
+        let kth = match lone {
+            false => {
+                scores.clear();
+                for &b in &order[..need] {
+                    let n = c.decode_block_into(b, &mut ids, &mut tfs);
+                    score_postings(
+                        c.idf_weight,
+                        &ids[..n],
+                        &tfs[..n],
+                        dl_norm,
+                        &mut block_scores,
+                    );
+                    scores.extend_from_slice(&block_scores);
+                }
+                (scores.len() >= k).then(|| {
+                    *scores
+                        .select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a))
+                        .1
+                })
             }
-        }
-        if let Some(&(_, kth)) = best.into_sorted().get(k - 1) {
+            true => {
+                let mut best = <TopKBuffer as Collector>::with_capacity(k, k);
+                let mut bar = f32::NEG_INFINITY;
+                for &b in &order[..need] {
+                    let n = c.decode_block_into(b, &mut ids, &mut tfs);
+                    score_postings(
+                        c.idf_weight,
+                        &ids[..n],
+                        &tfs[..n],
+                        dl_norm,
+                        &mut block_scores,
+                    );
+                    for (&doc, &score) in ids[..n].iter().zip(&block_scores) {
+                        best.offer(k, &mut bar, score, doc);
+                    }
+                }
+                best.into_sorted().get(k - 1).map(|&(_, kth)| kth)
+            }
+        };
+        if let Some(kth) = kth {
             seed = seed.max(kth.next_down());
         }
     }
