@@ -2248,12 +2248,6 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
         let both = cursors[0].df.saturating_add(cursors[1].df);
         return both.saturating_sub(count_and_planned(cursors));
     }
-    // Fast path: when one term's list dwarfs the rest, count it as
-    // `df(dominant) + |others \ dominant|` instead of walking the
-    // dominant term's whole posting list. See `or_count_anchored`.
-    if let Some(anchor) = dominant_anchor_index(&cursors) {
-        return or_count_anchored(cursors, anchor);
-    }
     // Dense union (no dominant term, but the terms together cover a large
     // fraction of the corpus — e.g. a 3-4 common-word title): OR all doc
     // ids into one doc-space bitset and popcount. Avoids the per-window
@@ -2267,6 +2261,12 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
         .unwrap_or(0);
     if total_df.saturating_mul(OR_COUNT_BITSET_DENSITY_DIVISOR) >= u64::from(max_doc) {
         return or_count_bitset(cursors, max_doc);
+    }
+    // Fast path: when one term's list dwarfs the rest, count it as
+    // `df(dominant) + |others \ dominant|` instead of walking the
+    // dominant term's whole posting list. See `or_count_anchored`.
+    if let Some(anchor) = dominant_anchor_index(&cursors) {
+        return or_count_anchored(cursors, anchor);
     }
     if or_count_prefers_heap(cursors.len(), total_df, max_doc) {
         let mut n = 0u64;
