@@ -158,13 +158,12 @@ impl PhraseMember {
 /// never decoded. `order` lists the query positions of one member
 /// consecutively, so its positions are read once. Returns the surviving
 /// starts: the phrase's tf at the doc.
-fn verify_members(
+fn verify_members<const FIRST_ONLY: bool>(
     members: &mut [PhraseMember],
     member_at: &[usize],
     order: &[usize],
     offsets: &[u32],
     starts: &mut Vec<u32>,
-    first_only: bool,
     mut positions_of: impl FnMut(&mut PhraseMember, usize) -> Result<(), FtsError>,
 ) -> Result<u32, FtsError> {
     let anchor = order[0];
@@ -198,7 +197,7 @@ fn verify_members(
         // Settling at the first start pays only when there are many: with
         // one or two the test per start costs more than the search it
         // skips, so those keep the loop below exactly as it is.
-        if first_only && i == last && starts.len() >= SETTLE_AT_FIRST_MIN_STARTS {
+        if FIRST_ONLY && i == last && starts.len() >= SETTLE_AT_FIRST_MIN_STARTS {
             let hit = starts.iter().position(|&s| {
                 s.checked_add(off)
                     .is_some_and(|want| plist.binary_search(&want).is_ok())
@@ -721,18 +720,31 @@ impl PhraseCursor {
     /// through a walk cursor.
     fn verify_located(&mut self, c: usize) -> Result<u32, FtsError> {
         let locs = &self.cand_locs;
-        self.current_tf = verify_members(
-            &mut self.members,
-            &self.member_at,
-            &self.verify_order,
-            &self.position_offsets,
-            &mut self.verify_scratch,
-            self.idf_weight == 0.0,
-            |m, j| {
-                let (b, p) = locs[j][c];
-                m.located_positions(b as usize, p as usize)
-            },
-        )?;
+        let positions_of = |m: &mut PhraseMember, j: usize| {
+            let (b, p) = locs[j][c];
+            m.located_positions(b as usize, p as usize)
+        };
+        // An unscored phrase takes the instantiation that settles a doc at
+        // its first confirmed start; a scored one, which needs the count,
+        // takes the one whose code is unchanged by it.
+        self.current_tf = match self.idf_weight == 0.0 {
+            true => verify_members::<true>(
+                &mut self.members,
+                &self.member_at,
+                &self.verify_order,
+                &self.position_offsets,
+                &mut self.verify_scratch,
+                positions_of,
+            )?,
+            false => verify_members::<false>(
+                &mut self.members,
+                &self.member_at,
+                &self.verify_order,
+                &self.position_offsets,
+                &mut self.verify_scratch,
+                positions_of,
+            )?,
+        };
         Ok(self.current_tf)
     }
 
@@ -750,18 +762,28 @@ impl PhraseCursor {
         // and `decode_current_positions` needs the whole block (its pair
         // index and tf run). Only a plain walk leaves the block decoded,
         // so these calls are not optional.
-        self.current_tf = verify_members(
-            &mut self.members,
-            &self.member_at,
-            &self.verify_order,
-            &self.position_offsets,
-            &mut self.verify_scratch,
-            self.idf_weight == 0.0,
-            |m, _| {
-                m.cursor.materialize_at(aligned);
-                m.decode_current_positions()
-            },
-        )?;
+        let positions_of = |m: &mut PhraseMember, _: usize| {
+            m.cursor.materialize_at(aligned);
+            m.decode_current_positions()
+        };
+        self.current_tf = match self.idf_weight == 0.0 {
+            true => verify_members::<true>(
+                &mut self.members,
+                &self.member_at,
+                &self.verify_order,
+                &self.position_offsets,
+                &mut self.verify_scratch,
+                positions_of,
+            )?,
+            false => verify_members::<false>(
+                &mut self.members,
+                &self.member_at,
+                &self.verify_order,
+                &self.position_offsets,
+                &mut self.verify_scratch,
+                positions_of,
+            )?,
+        };
         Ok(self.current_tf)
     }
 
