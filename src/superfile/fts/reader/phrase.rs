@@ -39,6 +39,17 @@ pub(crate) mod diag {
     pub static FILTER_BLOCKS: AtomicU64 = AtomicU64::new(0);
     pub static FILTER_DENSE: AtomicU64 = AtomicU64::new(0);
     pub static FILTER_DECODES: AtomicU64 = AtomicU64::new(0);
+    pub static T_FILTER: AtomicU64 = AtomicU64::new(0);
+    pub static T_TFS: AtomicU64 = AtomicU64::new(0);
+    pub static T_LOCATE: AtomicU64 = AtomicU64::new(0);
+    pub static T_VERIFY: AtomicU64 = AtomicU64::new(0);
+    pub static T_REFILL: AtomicU64 = AtomicU64::new(0);
+    pub static T_TOTAL: AtomicU64 = AtomicU64::new(0);
+    #[inline(always)]
+    pub fn now() -> u64 {
+        // SAFETY: rdtsc has no preconditions.
+        unsafe { std::arch::x86_64::_rdtsc() }
+    }
     pub fn bump(c: &AtomicU64, n: u64) {
         c.fetch_add(n, Relaxed);
     }
@@ -116,6 +127,7 @@ impl PhraseMember {
             return;
         }
         diag::bump(&diag::TF_DECODES, 1);
+        let t0 = diag::now();
         let c = &self.cursor;
         if !c.predecoded && c.decoded_block == block && c.tf_decoded_block == block {
             // The walk cursor already holds this block's tfs.
@@ -125,6 +137,7 @@ impl PhraseMember {
             c.block_tfs_into(block, &mut self.tfs);
         }
         self.tfs_block = block;
+        diag::bump(&diag::T_TFS, diag::now() - t0);
     }
 
     /// The member's tf in its `pair`-th posting of block `block`, a location
@@ -151,6 +164,7 @@ impl PhraseMember {
         let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
         if self.group_block != block {
             diag::bump(&diag::LOCATES, 1);
+            let t0 = diag::now();
             let mut at =
                 term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
             self.group_index
@@ -161,6 +175,7 @@ impl PhraseMember {
                     ))
                 })?;
             self.group_block = block;
+            diag::bump(&diag::T_LOCATE, diag::now() - t0);
         }
         diag::bump(&diag::RUNS, 1);
         diag::bump(&diag::LANES, u64::from(self.tfs[pair]));
@@ -342,6 +357,11 @@ pub(super) struct PhraseCursor {
 impl Drop for PhraseCursor {
     fn drop(&mut self) {
         let names: Vec<String> = self.members.iter().map(|m| format!("{}blk", m.cursor.block_count())).collect();
+        eprintln!(
+            "PHRASE_TIME total={} refill={} filter={} tfs={} locate={} verify={}",
+            diag::take(&diag::T_TOTAL), diag::take(&diag::T_REFILL), diag::take(&diag::T_FILTER),
+            diag::take(&diag::T_TFS), diag::take(&diag::T_LOCATE), diag::take(&diag::T_VERIFY),
+        );
         eprintln!(
             "PHRASE_DIAG members={} driver_blocks={} cands={} survivors={} verified={} matches={} locates={} tf_decodes={} runs={} lanes={} filter_blocks={} filter_dense={} filter_decodes={}",
             names.join("/"),
@@ -623,6 +643,18 @@ impl PhraseCursor {
         bar: f32,
         dl_norm_k1: Option<&NormTable>,
     ) -> Result<(), FtsError> {
+        let t_total = diag::now();
+        let r = self.seek_match_timed(from, bar, dl_norm_k1);
+        diag::bump(&diag::T_TOTAL, diag::now() - t_total);
+        r
+    }
+
+    fn seek_match_timed(
+        &mut self,
+        from: u32,
+        bar: f32,
+        dl_norm_k1: Option<&NormTable>,
+    ) -> Result<(), FtsError> {
         debug_assert!(
             bar == f32::NEG_INFINITY || dl_norm_k1.is_some(),
             "a finite bar needs the norms"
@@ -652,7 +684,9 @@ impl PhraseCursor {
                     }
                 }
                 diag::bump(&diag::VERIFIED, 1);
+                let t0 = diag::now();
                 let tf = self.verify_located(c)?;
+                diag::bump(&diag::T_VERIFY, diag::now() - t0);
                 if tf > 0 {
                     diag::bump(&diag::MATCHES, 1);
                     self.current_doc = s;
@@ -668,6 +702,7 @@ impl PhraseCursor {
                 return Ok(());
             };
             let start = refill.max(from);
+            let t_refill = diag::now();
             let d = source_cursor(&mut self.members, &mut self.filters, driver, true);
             d.skip_to(start);
             if d.is_exhausted() {
@@ -696,6 +731,7 @@ impl PhraseCursor {
             self.cand_next = 0;
             diag::bump(&diag::DRIVER_BLOCKS, 1);
             diag::bump(&diag::CANDS, self.cands.len() as u64);
+            diag::bump(&diag::T_REFILL, diag::now() - t_refill);
             // A driving member's candidates sit at their own pair indices in
             // its decoded block; each other member's filter records where it
             // holds the survivors, and the earlier members' locations are
@@ -717,8 +753,10 @@ impl PhraseCursor {
                     true => take(&mut self.cand_locs[si]),
                     false => take(&mut self.filter_locs),
                 };
+                let t_f = diag::now();
                 source_cursor(&mut self.members, &mut self.filters, si, false)
                     .retain_contained_located(&mut self.cands, &mut locs, &mut self.kept);
+                diag::bump(&diag::T_FILTER, diag::now() - t_f);
                 match si < n_members {
                     true => self.cand_locs[si] = locs,
                     false => self.filter_locs = locs,
