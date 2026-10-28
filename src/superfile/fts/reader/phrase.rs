@@ -131,6 +131,7 @@ impl PhraseMember {
     /// Start [`Self::seek`] on the member's run in its `pair`-th posting of
     /// block `block`, returning the run's tf.
     fn start_seek(&mut self, block: usize, pair: usize) -> Result<u32, FtsError> {
+        self.pos_scratch.clear();
         if let Some(p) = self.inline_position {
             self.seek = RunSeek::single(p);
             return Ok(1);
@@ -147,7 +148,12 @@ impl PhraseMember {
     /// Move [`Self::seek`] to its first position at or past `target`.
     fn seek_to(&mut self, target: u32) -> Result<u32, FtsError> {
         self.group_index
-            .seek_in_run(&self.positions, &mut self.seek, target)
+            .seek_in_run(
+                &self.positions,
+                &mut self.seek,
+                &mut self.pos_scratch,
+                target,
+            )
             .ok_or_else(malformed_run)
     }
 
@@ -198,21 +204,18 @@ fn malformed_run() -> FtsError {
 /// first, is walked forward to where that start needs it. A member found
 /// past that point moves the start up to it, so the lead skips every start
 /// before it; and no walk ever goes back, so a long run is read only as
-/// far as the last start checked, never whole. With `first_only` the walk
-/// stops at the first occurrence, all a match or count needs. `order` is
-/// scratch.
+/// far as the phrase's first occurrence, never whole. Whether the phrase
+/// occurs, all a match or a count needs. `order` is scratch.
 fn leapfrog(
     members: &mut [PhraseMember],
     offsets: &[u32],
     tfs: &[u32],
     order: &mut Vec<usize>,
-    first_only: bool,
-) -> Result<u32, FtsError> {
+) -> Result<bool, FtsError> {
     order.clear();
     order.extend(0..members.len());
     order.sort_by_key(|&m| tfs[m]);
     let lead = order[0];
-    let mut found = 0u32;
     let mut p = members[lead].seek.position();
     'starts: while p != RUN_END {
         let Some(start) = p.checked_sub(offsets[lead]) else {
@@ -236,13 +239,9 @@ fn leapfrog(
                 continue 'starts;
             }
         }
-        found += 1;
-        if first_only {
-            break;
-        }
-        p = members[lead].seek_to(p + 1)?;
+        return Ok(true);
     }
-    Ok(found)
+    Ok(false)
 }
 
 /// The phrase's occurrences at one aligned doc, verified in stages,
@@ -795,24 +794,31 @@ impl PhraseCursor {
         }
     }
 
-    /// [`leapfrog`] over the members' walks, started at one doc: to the
-    /// first occurrence only when the phrase is unscored (a match or a
-    /// count needs no more), else every occurrence, its tf.
+    /// Whether a doc is matched by [`leapfrog`]: the phrase repeats no term,
+    /// and it is unscored, so a match or a count needs only its first
+    /// occurrence. A scored phrase needs every occurrence, which a whole
+    /// decode of each run finds for less ([`verify_members`]).
+    fn leaps(&self) -> bool {
+        self.distinct && self.idf_weight == 0.0
+    }
+
+    /// [`leapfrog`] over the members' walks, started at one doc: 1 when the
+    /// phrase occurs there, else 0, standing for its tf.
     fn leapfrog(&mut self) -> Result<u32, FtsError> {
         leapfrog(
             &mut self.members,
             &self.position_offsets,
             &self.leap_tfs,
             &mut self.leap_order,
-            self.idf_weight == 0.0,
         )
+        .map(u32::from)
     }
 
     /// [`Self::verify_at_aligned`] for candidate `c` of the current batch,
     /// reading each member's positions at its recorded location rather than
     /// through a walk cursor.
     fn verify_located(&mut self, c: usize) -> Result<u32, FtsError> {
-        if self.distinct {
+        if self.leaps() {
             self.leap_tfs.clear();
             for (m, locs) in self.members.iter_mut().zip(&self.cand_locs) {
                 let (b, p) = locs[c];
@@ -841,7 +847,7 @@ impl PhraseCursor {
     /// for every `i`. Member position lists are ascending, so each
     /// probe is a binary search over a per-doc-tf-sized slice.
     pub(super) fn verify_at_aligned(&mut self, aligned: u32) -> Result<u32, FtsError> {
-        if self.distinct {
+        if self.leaps() {
             self.leap_tfs.clear();
             for m in &mut self.members {
                 m.cursor.materialize_at(aligned);

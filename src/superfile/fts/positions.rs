@@ -659,6 +659,7 @@ impl GroupIndex {
 
     /// A [`RunSeek`] on the first position of pair `pair` (whose term
     /// frequency is `tf`), the rest of the run left unread.
+    /// The caller's gap buffer must start empty.
     pub(crate) fn seek_run(&mut self, bytes: &[u8], pair: usize, tf: u32) -> Option<RunSeek> {
         let start = *self.starts.get(pair)? as usize;
         self.serve(bytes, pair)?;
@@ -676,18 +677,28 @@ impl GroupIndex {
     }
 
     /// Move `run` to its first position at or past `target` and return it,
-    /// or [`RUN_END`] when the run holds none. Reads the run's gaps only as
-    /// far as that position, [`SEEK_CHUNK`] at a time. `None` on a gap
-    /// past the group or an overflowing position.
-    pub(crate) fn seek_in_run(&self, bytes: &[u8], run: &mut RunSeek, target: u32) -> Option<u32> {
+    /// or [`RUN_END`] when the run holds none. Reads the run's gaps into
+    /// `buf` only as far as that position, in chunks that start at
+    /// [`SEEK_CHUNK`] and double, so a walk that stops early reads little
+    /// and one that goes far pays the reader's setup a few times, not once
+    /// per chunk. `None` on a gap past the group or an overflowing position.
+    pub(crate) fn seek_in_run(
+        &self,
+        bytes: &[u8],
+        run: &mut RunSeek,
+        buf: &mut Vec<u32>,
+        target: u32,
+    ) -> Option<u32> {
         while run.at < target {
-            if run.buf_at == run.buf_len {
+            if run.buf_at == buf.len() {
                 if run.left == 0 {
                     run.at = RUN_END;
                     break;
                 }
-                let take = SEEK_CHUNK.min(run.left);
-                let chunk = &mut run.buf[..take];
+                let take = (SEEK_CHUNK << run.chunks.min(SEEK_MAX_DOUBLINGS)).min(run.left);
+                run.chunks += 1;
+                buf.resize(take, 0);
+                let chunk = &mut buf[..];
                 match self.kind {
                     GroupKind::Leb128 => {
                         chunk.copy_from_slice(self.values.get(run.next..run.next + take)?)
@@ -705,17 +716,19 @@ impl GroupIndex {
                 run.next += take;
                 run.left -= take;
                 run.buf_at = 0;
-                run.buf_len = take;
             }
-            run.at = run.at.checked_add(run.buf[run.buf_at])?;
+            run.at = run.at.checked_add(buf[run.buf_at])?;
             run.buf_at += 1;
         }
         Some(run.at)
     }
 }
 
-/// Gaps a [`RunSeek`] reads at a time: one group of the lane unpacker's.
+/// Gaps a [`RunSeek`] reads in its first chunk: one group of the lane
+/// unpacker's. Each later chunk doubles, up to [`SEEK_MAX_DOUBLINGS`] times.
 const SEEK_CHUNK: usize = 8;
+/// See [`SEEK_CHUNK`]: chunks stop growing at 256 gaps.
+const SEEK_MAX_DOUBLINGS: u32 = 5;
 
 /// What [`GroupIndex::seek_in_run`] returns past a run's last position.
 /// A position is a token's index in its document, so none reaches it.
@@ -733,10 +746,9 @@ pub(crate) struct RunSeek {
     /// the decoded gaps or values), and how many are left.
     next: usize,
     left: usize,
-    /// Gaps read but not yet added.
-    buf: [u32; SEEK_CHUNK],
+    /// Chunks read so far, and the next unread gap of the caller's buffer.
+    chunks: u32,
     buf_at: usize,
-    buf_len: usize,
 }
 
 impl RunSeek {
@@ -879,6 +891,7 @@ mod tests {
                     positions_from_run_values(&vals[start..start + tf as usize], &mut full)
                         .expect("sums");
                     let mut walk = index.seek_run(&out, pair, tf).expect("starts");
+                    let mut buf = Vec::new();
                     assert_eq!(walk.position(), full[0]);
                     // Targets ascend, as a phrase's do: each position, one
                     // past it, and a few between.
@@ -892,7 +905,9 @@ mod tests {
                             .copied()
                             .find(|&p| p >= target)
                             .unwrap_or(RUN_END);
-                        let got = index.seek_in_run(&out, &mut walk, target).expect("walks");
+                        let got = index
+                            .seek_in_run(&out, &mut walk, &mut buf, target)
+                            .expect("walks");
                         assert_eq!(got, want, "leb128 {leb128} pair {pair} target {target}");
                     }
                 }
