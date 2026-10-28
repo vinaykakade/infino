@@ -1135,7 +1135,9 @@ impl TermCursor {
             let block = self.blocks[self.current_block];
             let block_last = block.last_doc_id;
             let hdr = self.current_header();
+            super::phrase::diag::bump(&super::phrase::diag::FILTER_BLOCKS, 1);
             if is_dense_encoding(hdr.encoding) {
+                super::phrase::diag::bump(&super::phrase::diag::FILTER_DENSE, 1);
                 let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
                 while r < n && docs[r] <= block_last {
                     let d = docs[r];
@@ -1149,6 +1151,7 @@ impl TermCursor {
                 }
             } else {
                 if self.decoded_block != self.current_block {
+                    super::phrase::diag::bump(&super::phrase::diag::FILTER_DECODES, 1);
                     self.decode_current_block();
                 }
                 let ids = &self.block_doc_ids[..self.block_n];

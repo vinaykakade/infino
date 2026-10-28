@@ -23,6 +23,30 @@ use crate::superfile::{
     fts::{bm25, positions::GroupIndex},
 };
 
+/// Diagnostic work counters (not for merge): per phrase cursor, printed when
+/// it is dropped.
+pub(crate) mod diag {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static DRIVER_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    pub static CANDS: AtomicU64 = AtomicU64::new(0);
+    pub static SURVIVORS: AtomicU64 = AtomicU64::new(0);
+    pub static VERIFIED: AtomicU64 = AtomicU64::new(0);
+    pub static MATCHES: AtomicU64 = AtomicU64::new(0);
+    pub static LOCATES: AtomicU64 = AtomicU64::new(0);
+    pub static TF_DECODES: AtomicU64 = AtomicU64::new(0);
+    pub static RUNS: AtomicU64 = AtomicU64::new(0);
+    pub static LANES: AtomicU64 = AtomicU64::new(0);
+    pub static FILTER_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    pub static FILTER_DENSE: AtomicU64 = AtomicU64::new(0);
+    pub static FILTER_DECODES: AtomicU64 = AtomicU64::new(0);
+    pub fn bump(c: &AtomicU64, n: u64) {
+        c.fetch_add(n, Relaxed);
+    }
+    pub fn take(c: &AtomicU64) -> u64 {
+        c.swap(0, Relaxed)
+    }
+}
+
 /// One distinct term of a [`PhraseCursor`] ([`distinct_members`]): its
 /// posting cursor, its fetched position groups, and the current block's
 /// group located for per-pair access.
@@ -91,6 +115,7 @@ impl PhraseMember {
         if self.tfs_block == block {
             return;
         }
+        diag::bump(&diag::TF_DECODES, 1);
         let c = &self.cursor;
         if !c.predecoded && c.decoded_block == block && c.tf_decoded_block == block {
             // The walk cursor already holds this block's tfs.
@@ -125,6 +150,7 @@ impl PhraseMember {
         self.ensure_tfs(block);
         let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
         if self.group_block != block {
+            diag::bump(&diag::LOCATES, 1);
             let mut at =
                 term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
             self.group_index
@@ -136,6 +162,8 @@ impl PhraseMember {
                 })?;
             self.group_block = block;
         }
+        diag::bump(&diag::RUNS, 1);
+        diag::bump(&diag::LANES, u64::from(self.tfs[pair]));
         self.group_index
             .run_positions(&self.positions, pair, self.tfs[pair], &mut self.pos_scratch)
             .ok_or_else(|| {
@@ -309,6 +337,20 @@ pub(super) struct PhraseCursor {
     batch_order: Vec<usize>,
     /// Scratch: a filter's locations, which no verification reads.
     filter_locs: Vec<(u32, u32)>,
+}
+
+impl Drop for PhraseCursor {
+    fn drop(&mut self) {
+        let names: Vec<String> = self.members.iter().map(|m| format!("{}blk", m.cursor.block_count())).collect();
+        eprintln!(
+            "PHRASE_DIAG members={} driver_blocks={} cands={} survivors={} verified={} matches={} locates={} tf_decodes={} runs={} lanes={} filter_blocks={} filter_dense={} filter_decodes={}",
+            names.join("/"),
+            diag::take(&diag::DRIVER_BLOCKS), diag::take(&diag::CANDS), diag::take(&diag::SURVIVORS),
+            diag::take(&diag::VERIFIED), diag::take(&diag::MATCHES), diag::take(&diag::LOCATES),
+            diag::take(&diag::TF_DECODES), diag::take(&diag::RUNS), diag::take(&diag::LANES),
+            diag::take(&diag::FILTER_BLOCKS), diag::take(&diag::FILTER_DENSE), diag::take(&diag::FILTER_DECODES),
+        );
+    }
 }
 
 /// The cursor batch source `s` reads from, in [`PhraseCursor::batch_order`]
@@ -609,8 +651,10 @@ impl PhraseCursor {
                         continue;
                     }
                 }
+                diag::bump(&diag::VERIFIED, 1);
                 let tf = self.verify_located(c)?;
                 if tf > 0 {
+                    diag::bump(&diag::MATCHES, 1);
                     self.current_doc = s;
                     self.current_tf = tf;
                     return Ok(());
@@ -650,6 +694,8 @@ impl PhraseCursor {
             self.cands
                 .extend_from_slice(&d.block_doc_ids[d.pos..d.block_n]);
             self.cand_next = 0;
+            diag::bump(&diag::DRIVER_BLOCKS, 1);
+            diag::bump(&diag::CANDS, self.cands.len() as u64);
             // A driving member's candidates sit at their own pair indices in
             // its decoded block; each other member's filter records where it
             // holds the survivors, and the earlier members' locations are
@@ -683,6 +729,7 @@ impl PhraseCursor {
                     }
                 }
             }
+            diag::bump(&diag::SURVIVORS, self.cands.len() as u64);
         }
     }
 
