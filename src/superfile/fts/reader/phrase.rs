@@ -91,12 +91,23 @@ impl PhraseMember {
         if self.tfs_block == block {
             return;
         }
-        let c = &self.cursor;
-        if !c.predecoded && c.decoded_block == block && c.tf_decoded_block == block {
-            // The walk cursor already holds this block's tfs.
+        // The walk cursor holds the block when it walked or drove there, the
+        // probe when it just filtered there; reuse whichever already decoded
+        // the tfs or parsed the header rather than redo that work.
+        let holds_tfs = |c: &TermCursor| {
+            !c.predecoded && c.decoded_block == block && c.tf_decoded_block == block
+        };
+        if let Some(c) = [&self.cursor, &self.probe]
+            .into_iter()
+            .find(|c| holds_tfs(c))
+        {
             self.tfs.clear();
             self.tfs.extend_from_slice(&c.block_tfs[..c.block_n]);
         } else {
+            let c = match self.cursor.caches_header(block) {
+                true => &self.cursor,
+                false => &self.probe,
+            };
             c.block_tfs_into(block, &mut self.tfs);
         }
         self.tfs_block = block;

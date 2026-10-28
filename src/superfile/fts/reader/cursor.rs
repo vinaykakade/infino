@@ -1192,9 +1192,16 @@ impl TermCursor {
         docs.truncate(w);
     }
 
+    /// Whether the header cache holds block `b`'s parsed header.
+    pub(super) fn caches_header(&self, b: usize) -> bool {
+        matches!(self.header_cache, Some((cached, _)) if cached == b)
+    }
+
     /// Block `b`'s tfs, decoded into `out` (resized to the block's count)
     /// without expanding its doc ids. A pre-decoded cursor's single block is
-    /// its buffer.
+    /// its buffer. The header comes from the cache when it names `b`: a
+    /// phrase reads tfs right after the candidate filter parsed that block's
+    /// header on the same cursor.
     pub(super) fn block_tfs_into(&self, b: usize, out: &mut Vec<u32>) {
         if self.predecoded {
             out.clear();
@@ -1202,7 +1209,10 @@ impl TermCursor {
             return;
         }
         let block = self.blocks[b];
-        let hdr = self.block_header(b);
+        let hdr = match self.header_cache {
+            Some((cached, hdr)) if cached == b => hdr,
+            _ => self.block_header(b),
+        };
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
         out.clear();
         out.resize(BLOCK_LEN, 0);
@@ -2959,6 +2969,85 @@ mod tests {
         for pick in [0u32, 1, 63, 64, 127] {
             let targets = boundary_targets(c, &walked, pick);
             assert_seeks_match_walk(c, &walked, &targets);
+        }
+    }
+
+    /// `block_tfs_into` reads the same tfs whether it parses the block's
+    /// header or takes it from the cache a filter left behind, on every
+    /// block of a list holding all four encodings. The cache is primed by
+    /// a membership probe on a clone, then read for every block — the one
+    /// it names and every other — so a cached header served for the wrong
+    /// block fails here.
+    #[tokio::test]
+    async fn block_tfs_into_from_a_cached_header_matches_a_fresh_parse() {
+        let mut list: Planted = Vec::new();
+        // Run: 200 consecutive docs.
+        let mut d = 10u32;
+        for _ in 0..200 {
+            list.push((d, 1 + d % 3));
+            d += 1;
+        }
+        // Bitset: 256 docs at alternating gaps of 1 and 2.
+        for i in 0..256u32 {
+            d += 1 + i % 2;
+            list.push((d, 1 + i % 5));
+        }
+        // Patched: 2 blocks with one gap and one tf outlier each.
+        for blk in 0..2u32 {
+            for lane in 0..128u32 {
+                let tf = if lane == 40 + blk {
+                    OUTLIER_TF
+                } else {
+                    1 + lane % 4
+                };
+                d += if lane == 90 { OUTLIER_GAP } else { 3 };
+                list.push((d, tf));
+            }
+        }
+        // Packed, with a partial last block.
+        for i in 0..200u32 {
+            d += 37;
+            list.push((d, 1 + i % 7));
+        }
+        let view = planted_reader(&[list.clone()], d + 1);
+        let cursors = view
+            .build_term_cursors(
+                0,
+                &SEEK_TERMS[..1],
+                QueryIdf::ThisFile,
+                CursorUse::Count,
+                None,
+                None,
+            )
+            .await
+            .expect("cursors");
+        let c = &cursors[0];
+        let encodings = block_encodings(c);
+        for (enc, name) in [
+            (ENCODING_RUN, "run"),
+            (ENCODING_BITSET, "bitset"),
+            (ENCODING_PATCHED, "patched"),
+            (ENCODING_PACKED, "packed"),
+        ] {
+            assert!(encodings.contains(&enc), "premise: a {name} block");
+        }
+        let mut fresh = Vec::new();
+        let mut cached = Vec::new();
+        let mut start = 0usize;
+        for (b, block) in c.blocks.iter().enumerate() {
+            let end = list.partition_point(|(d, _)| *d <= block.last_doc_id);
+            let tfs: Vec<u32> = list[start..end].iter().map(|(_, tf)| *tf).collect();
+            c.block_tfs_into(b, &mut fresh);
+            assert_eq!(fresh, tfs, "block {b}: tfs from a fresh parse");
+            let mut probed = c.clone();
+            assert!(probed.contains(list[start].0), "block {b}: first doc");
+            assert!(probed.caches_header(b), "block {b}: the probe cached it");
+            for other in 0..c.blocks.len() {
+                c.block_tfs_into(other, &mut fresh);
+                probed.block_tfs_into(other, &mut cached);
+                assert_eq!(cached, fresh, "cache on {b}, block {other}");
+            }
+            start = end;
         }
     }
 
