@@ -164,6 +164,7 @@ fn verify_members(
     order: &[usize],
     offsets: &[u32],
     starts: &mut Vec<u32>,
+    first_only: bool,
     mut positions_of: impl FnMut(&mut PhraseMember, usize) -> Result<(), FtsError>,
 ) -> Result<u32, FtsError> {
     let anchor = order[0];
@@ -176,7 +177,8 @@ fn verify_members(
             .iter()
             .filter_map(|&p| p.checked_sub(offsets[anchor])),
     );
-    for &q in &order[1..] {
+    let last = order.len() - 1;
+    for (i, &q) in order.iter().enumerate().skip(1) {
         if starts.is_empty() {
             break;
         }
@@ -187,6 +189,24 @@ fn verify_members(
         }
         let plist = &members[m].pos_scratch;
         let off = offsets[q];
+        // An unscored phrase needs one anchor at the doc, not how many: on
+        // the last member the first start it confirms settles the doc, and
+        // the other starts — dozens when both words are common — are not
+        // searched. Only the last member may stop early: a start an earlier
+        // member confirms could still fall at a later one while a dropped
+        // start would have passed.
+        if first_only && i == last {
+            let hit = starts
+                .iter()
+                .find(|&&s| {
+                    s.checked_add(off)
+                        .is_some_and(|want| plist.binary_search(&want).is_ok())
+                })
+                .copied();
+            starts.clear();
+            starts.extend(hit);
+            break;
+        }
         // Compacted in place without a branch on the outcome, which on a
         // common member is close to a coin flip; the search per start stays,
         // as it beat a merge on every lane measured.
@@ -697,6 +717,7 @@ impl PhraseCursor {
             &self.verify_order,
             &self.position_offsets,
             &mut self.verify_scratch,
+            self.idf_weight == 0.0,
             |m, j| {
                 let (b, p) = locs[j][c];
                 m.located_positions(b as usize, p as usize)
@@ -725,6 +746,7 @@ impl PhraseCursor {
             &self.verify_order,
             &self.position_offsets,
             &mut self.verify_scratch,
+            self.idf_weight == 0.0,
             |m, _| {
                 m.cursor.materialize_at(aligned);
                 m.decode_current_positions()
