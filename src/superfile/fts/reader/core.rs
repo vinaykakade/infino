@@ -3846,6 +3846,7 @@ mod tests {
 
         // Build A from text.
         let mut a = FtsBuilder::new();
+        a.sign_every_term = true;
         a.register_column("body".into(), true).expect("register a");
         a.add_doc(0, 0, "a b a").expect("a doc 0");
         a.add_doc(0, 1, "b a c").expect("a doc 1");
@@ -3854,6 +3855,7 @@ mod tests {
         // Build B by streaming A's postings straight into the prebuilt path —
         // no re-tokenization. Doc lengths carried over ("a b a"/"b a c" = 3/3).
         let mut b = FtsBuilder::new();
+        b.sign_every_term = true;
         b.register_column("body".into(), true).expect("register b");
         ra.for_each_term_posting(0, |term, doc_id, tf, positions, sig| {
             let term_str = std::str::from_utf8(term).expect("utf8 term");
@@ -3899,6 +3901,8 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
 
         let mut a = FtsBuilder::new();
+
+        a.sign_every_term = true;
         a.register_column("body".into(), true).expect("register a");
         a.add_doc(0, 0, "a b c a").expect("a doc 0");
         a.add_doc(0, 1, "b c d").expect("a doc 1");
@@ -3909,6 +3913,7 @@ mod tests {
         // prebuilt push spills the column, so the rest exercise the transition
         // + push_prebuilt_spilled (partition + position-blob writes).
         let mut b = FtsBuilder::new();
+        b.sign_every_term = true;
         b.register_column("body".into(), true).expect("register b");
         b.set_spill_threshold_bytes(1);
         ra.for_each_term_posting(0, |term, doc_id, tf, positions, sig| {

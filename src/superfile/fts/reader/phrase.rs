@@ -1770,6 +1770,7 @@ mod tests {
     fn open_signature_index(docs: &[Vec<&str>], omit: bool, spill: bool) -> FtsReader {
         let mut b = FtsBuilder::new();
         b.omit_signatures = omit;
+        b.sign_every_term = true;
         if spill {
             b.set_spill_threshold_bytes(1);
         }

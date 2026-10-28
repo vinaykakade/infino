@@ -190,6 +190,17 @@ type DocPosHeadMap = HbHashMap<&'static str, (u32, u8), FxBuildHasher>;
 /// side, which a signature names on both of its sides.
 const SIGNED_DF_DIVISOR: u64 = 100;
 
+/// The document frequency a column of `n_scored_docs` documents signs the
+/// postings of terms below ([`SIGNED_DF_DIVISOR`]); every term under test
+/// with `sign_every_term`.
+fn signed_below_df(n_scored_docs: u32, #[cfg(test)] sign_every_term: bool) -> u64 {
+    #[cfg(test)]
+    if sign_every_term {
+        return u64::MAX;
+    }
+    u64::from(n_scored_docs).div_ceil(SIGNED_DF_DIVISOR)
+}
+
 /// Chain terminator for the per-doc position chains
 /// (`FtsBuilder::doc_pos_chain`): no previous occurrence.
 const CHAIN_END: u32 = u32::MAX;
@@ -1467,6 +1478,10 @@ pub struct FtsBuilder {
     /// merge as an older input.
     #[cfg(test)]
     pub(crate) omit_signatures: bool,
+    /// Sign every term's postings, however common: a test corpus is too
+    /// small for any of its words to be rare.
+    #[cfg(test)]
+    pub(crate) sign_every_term: bool,
 }
 
 /// Receives each term's facts as the blob is written: what a table-level
@@ -1634,6 +1649,8 @@ impl FtsBuilder {
             head_depth: 0,
             #[cfg(test)]
             omit_signatures: false,
+            #[cfg(test)]
+            sign_every_term: false,
         }
     }
 
@@ -2847,6 +2864,8 @@ impl FtsBuilder {
             head_depth,
             #[cfg(test)]
                 omit_signatures: _,
+            #[cfg(test)]
+            sign_every_term,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -2917,6 +2936,11 @@ impl FtsBuilder {
                 avgdl,
                 params,
                 n_scored_docs: n_scored,
+                signed_below_df: signed_below_df(
+                    n_scored,
+                    #[cfg(test)]
+                    sign_every_term,
+                ),
                 heads: head_sink.is_some(),
                 head_depth,
                 rows: doc_map.as_deref(),
@@ -3038,6 +3062,8 @@ impl FtsBuilder {
             head_depth,
             #[cfg(test)]
                 omit_signatures: _,
+            #[cfg(test)]
+            sign_every_term,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -3147,6 +3173,11 @@ impl FtsBuilder {
                 avgdl,
                 params,
                 n_scored_docs: n_scored,
+                signed_below_df: signed_below_df(
+                    n_scored,
+                    #[cfg(test)]
+                    sign_every_term,
+                ),
                 heads: head_sink.is_some(),
                 head_depth,
                 rows: doc_map.as_deref(),
@@ -4271,6 +4302,9 @@ struct TermEncoding<'a> {
     avgdl: f32,
     params: bm25::Bm25Params,
     n_scored_docs: u32,
+    /// Terms with fewer docs than this sign their postings
+    /// ([`signed_below_df`]).
+    signed_below_df: u64,
     /// Whether a head is gathered for each term, and how deep.
     heads: bool,
     head_depth: usize,
@@ -4314,6 +4348,7 @@ fn encode_term(
         avgdl,
         params,
         n_scored_docs,
+        signed_below_df,
         ..
     } = *enc;
     scratch.term_buf.clear();
@@ -4326,7 +4361,7 @@ fn encode_term(
 
     let df = pairs.len() as u64;
     // A common term's postings go unsigned (see `SIGNED_DF_DIVISOR`).
-    let signed = df.saturating_mul(SIGNED_DF_DIVISOR) < u64::from(n_scored_docs);
+    let signed = df < signed_below_df;
     let sign = |sig: u8| match signed {
         true => sig,
         false => SIG_UNKNOWN,
@@ -5707,6 +5742,7 @@ mod tests {
         let json = r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true,"stopwords":"english"}]"#;
         for spill in [false, true] {
             let mut b = FtsBuilder::new();
+            b.sign_every_term = true;
             b.register_column_with_tokenizer(
                 "title".into(),
                 true,
@@ -5731,6 +5767,38 @@ mod tests {
             .expect("walk");
             assert_eq!(got, want, "spill {spill}");
         }
+    }
+
+    /// A term in at least one of `SIGNED_DF_DIVISOR` docs writes its
+    /// postings unsigned; a rarer one signs them.
+    #[test]
+    fn only_a_rare_terms_postings_are_signed() {
+        const DOCS: u32 = 3 * SIGNED_DF_DIVISOR as u32;
+        let mut b = FtsBuilder::new();
+        b.register_column("title".into(), true).expect("register");
+        for i in 0..DOCS {
+            // Two docs, not one: a one-doc term is stored inline, which
+            // carries no signature.
+            let text = match i {
+                0 | 1 => "common rare",
+                _ => "common other",
+            };
+            b.add_doc(0, i, text).expect("add doc");
+        }
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+        let r =
+            FtsReader::open(bytes::Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let mut sigs: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        r.for_each_term_posting(0, |term, _, _, _, sig| {
+            sigs.entry(term.to_vec()).or_default().push(sig);
+            Ok(())
+        })
+        .expect("walk");
+        let bits = |t: &str| adjacency_bits(t.as_bytes());
+        assert_eq!(sigs[&b"rare"[..]], [bits("common") & LEAD_BITS; 2]);
+        assert!(sigs[&b"common"[..]].iter().all(|&s| s == SIG_UNKNOWN));
+        assert!(sigs[&b"other"[..]].iter().all(|&s| s == SIG_UNKNOWN));
     }
 
     fn build_title_blob(docs: &[String], positional: bool) -> bytes::Bytes {
