@@ -195,7 +195,23 @@ fn verify_members(
         // searched. Only the last member may stop early: a start an earlier
         // member confirms could still fall at a later one while a dropped
         // start would have passed.
-        let settle_at_first = first_only && i == last;
+        // Settling at the first start pays only when there are many: with
+        // one or two the test per start costs more than the search it
+        // skips, so those keep the loop below exactly as it is.
+        if first_only && i == last && starts.len() >= SETTLE_AT_FIRST_MIN_STARTS {
+            let hit = starts.iter().position(|&s| {
+                s.checked_add(off)
+                    .is_some_and(|want| plist.binary_search(&want).is_ok())
+            });
+            match hit {
+                Some(r) => {
+                    starts.swap(0, r);
+                    starts.truncate(1);
+                }
+                None => starts.clear(),
+            }
+            break;
+        }
         // Compacted in place without a branch on the outcome, which on a
         // common member is close to a coin flip; the search per start stays,
         // as it beat a merge on every lane measured.
@@ -207,9 +223,6 @@ fn verify_members(
                 .is_some_and(|want| plist.binary_search(&want).is_ok());
             starts[w] = s;
             w += usize::from(found);
-            if settle_at_first && w == 1 {
-                break;
-            }
         }
         starts.truncate(w);
     }
@@ -233,6 +246,11 @@ pub(super) fn distinct_members(terms: &[String]) -> (Vec<&str>, Vec<usize>) {
         .collect();
     (distinct, member_at)
 }
+
+/// Candidate starts at which an unscored phrase's last member stops at the
+/// first one it confirms rather than searching them all: below this the
+/// test per start would cost more than the searches it saves.
+const SETTLE_AT_FIRST_MIN_STARTS: usize = 8;
 
 /// Compact `locs` to the entries at `kept` (ascending indices into it).
 fn compact_locs(locs: &mut Vec<(u32, u32)>, kept: &[u32]) {
