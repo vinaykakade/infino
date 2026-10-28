@@ -171,7 +171,7 @@ const CACHE_LINE: usize = 64;
 /// Most lines fetched ahead per position group: a common word's group for
 /// one block is a few hundred bytes to a couple of kilobytes; a group far
 /// larger (a stopword's) is read run by run and is not worth streaming.
-const GROUP_PREFETCH_MAX_LINES: usize = 24;
+const GROUP_PREFETCH_MAX_LINES: usize = 48;
 /// Lines fetched ahead at a posting block's head (header and presence
 /// bits) and at its tail (the tfs).
 const BLOCK_PREFETCH_LINES: usize = 2;
