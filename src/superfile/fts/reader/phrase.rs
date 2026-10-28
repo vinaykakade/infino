@@ -50,6 +50,11 @@ pub(crate) mod diag {
             _ => 2,
         }
     }
+    pub static T_ANCHOR: AtomicU64 = AtomicU64::new(0);
+    pub static T_OTHER: AtomicU64 = AtomicU64::new(0);
+    pub static T_CMP: AtomicU64 = AtomicU64::new(0);
+    pub static T_PARSE: AtomicU64 = AtomicU64::new(0);
+    pub static T_STARTS: AtomicU64 = AtomicU64::new(0);
     pub static T_FILTER: AtomicU64 = AtomicU64::new(0);
     pub static T_TFS: AtomicU64 = AtomicU64::new(0);
     pub static T_LOCATE: AtomicU64 = AtomicU64::new(0);
@@ -222,7 +227,9 @@ fn verify_members(
 ) -> Result<u32, FtsError> {
     let anchor = order[0];
     let mut read = member_at[anchor];
+    let t_a = diag::now();
     positions_of(&mut members[read], read)?;
+    diag::bump(&diag::T_ANCHOR, diag::now() - t_a);
     starts.clear();
     starts.extend(
         members[read]
@@ -236,9 +243,12 @@ fn verify_members(
         }
         let m = member_at[q];
         if m != read {
+            let t_o = diag::now();
             positions_of(&mut members[m], m)?;
+            diag::bump(&diag::T_OTHER, diag::now() - t_o);
             read = m;
         }
+        let t_c = diag::now();
         let plist = &members[m].pos_scratch;
         let off = offsets[q];
         // Compacted in place without a branch on the outcome, which on a
@@ -254,6 +264,7 @@ fn verify_members(
             w += usize::from(found);
         }
         starts.truncate(w);
+        diag::bump(&diag::T_CMP, diag::now() - t_c);
     }
     Ok(starts.len() as u32)
 }
@@ -375,9 +386,11 @@ impl Drop for PhraseCursor {
             diag::take(&diag::EXC_STREAMS), diag::take(&diag::STREAMS)
         );
         eprintln!(
-            "PHRASE_TIME total={} refill={} filter={} tfs={} locate={} verify={}",
+            "PHRASE_TIME total={} refill={} filter={} tfs={} locate={} verify={} anchor={} other={} cmp={} parse={} starts={}",
             diag::take(&diag::T_TOTAL), diag::take(&diag::T_REFILL), diag::take(&diag::T_FILTER),
             diag::take(&diag::T_TFS), diag::take(&diag::T_LOCATE), diag::take(&diag::T_VERIFY),
+            diag::take(&diag::T_ANCHOR), diag::take(&diag::T_OTHER), diag::take(&diag::T_CMP),
+            diag::take(&diag::T_PARSE), diag::take(&diag::T_STARTS),
         );
         eprintln!(
             "PHRASE_DIAG members={} driver_blocks={} cands={} survivors={} verified={} matches={} locates={} tf_decodes={} runs={} lanes={} filter_blocks={} filter_dense={} filter_decodes={}",

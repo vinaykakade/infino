@@ -565,8 +565,13 @@ impl GroupIndex {
                 let fixed = header == GROUP_PACKED_FIXED;
                 self.kind = GroupKind::Packed;
                 let n_gaps = n.checked_sub(tfs.len())?;
+                let t_p = crate::superfile::fts::reader::phrase::diag::now();
                 self.first.parse_into(bytes, at, tfs.len(), fixed)?;
                 self.gap.parse_into(bytes, at, n_gaps, fixed)?;
+                crate::superfile::fts::reader::phrase::diag::bump(
+                    &crate::superfile::fts::reader::phrase::diag::T_PARSE,
+                    crate::superfile::fts::reader::phrase::diag::now() - t_p,
+                );
                 // Every gap is at least one (a doc's positions strictly
                 // increase), so a zero-width gap stream carries each gap as
                 // an exception. One that does not is corrupt; refusing it
@@ -584,6 +589,7 @@ impl GroupIndex {
         u32::try_from(n).ok()?;
         // Sized once and filled with the running sum in a register: pushing
         // grew the vector through memory for every pair of every block.
+        let t_s = crate::superfile::fts::reader::phrase::diag::now();
         self.starts.clear();
         self.starts.resize(tfs.len() + 1, 0);
         let mut acc = 0u32;
@@ -595,6 +601,10 @@ impl GroupIndex {
             acc += lanes_per_pair(tf);
             *slot = acc;
         }
+        crate::superfile::fts::reader::phrase::diag::bump(
+            &crate::superfile::fts::reader::phrase::diag::T_STARTS,
+            crate::superfile::fts::reader::phrase::diag::now() - t_s,
+        );
         Some(())
     }
 
