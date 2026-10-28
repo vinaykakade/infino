@@ -339,6 +339,10 @@ struct StreamIndex {
     lanes: usize,
     payload: Range<usize>,
     exceptions: Vec<(u32, u32)>,
+    /// One bit per lane, set for the lanes with an exception, so a lane
+    /// read tests a bit and searches the table only on a hit. Empty for a
+    /// stream without exceptions.
+    exception_lanes: Vec<u64>,
 }
 
 impl StreamIndex {
@@ -400,6 +404,13 @@ impl StreamIndex {
             }
             prev = Some(lane);
         }
+        self.exception_lanes.clear();
+        if !tables.is_empty() {
+            self.exception_lanes.resize(n.div_ceil(64), 0);
+            for &(lane, _) in tables.iter() {
+                self.exception_lanes[lane as usize / 64] |= 1u64 << (lane % 64);
+            }
+        }
         self.width = width;
         self.lanes = n;
         self.payload = payload;
@@ -410,7 +421,9 @@ impl StreamIndex {
     #[inline]
     fn lane(&self, bytes: &[u8], i: usize) -> Option<u32> {
         let low = u32::try_from(get_bits(&bytes[self.payload.clone()], i, self.width)?).ok()?;
-        if self.exceptions.is_empty() {
+        // Most lanes have no exception: one bit says so, and only the few
+        // that do pay the search over the table.
+        if self.exceptions.is_empty() || (self.exception_lanes.get(i / 64)? >> (i % 64)) & 1 == 0 {
             return Some(low);
         }
         let hi = match self
