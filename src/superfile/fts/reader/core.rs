@@ -56,7 +56,7 @@ use crate::{
             analysis::{chain_tokenizer, check_recorded_tokenizer},
             bm25,
             builder::doc_lengths_entry_size,
-            positions::{GroupIndex, SIG_UNKNOWN, next_bit},
+            positions::{GroupIndex, SIG_UNKNOWN, adjacency_bits},
             posting::{BLOCK_LEN, ENCODING_BITSET, ENCODING_RUN, decode_block_doc_ids},
             short::{SHORT_MAX_DF, decode_short},
             tokenize::{Phrase, Tokenizer},
@@ -1561,14 +1561,17 @@ impl FtsReader {
             for (member, group) in inline_groups {
                 positions[member] = group;
             }
-            let next_bits = member_refs.iter().map(|t| next_bit(t.as_bytes())).collect();
+            let adjacency_bits = member_refs
+                .iter()
+                .map(|t| adjacency_bits(t.as_bytes()))
+                .collect();
             out.push(Some(AnyCursor::Phrase(PhraseCursor::new(
                 cursors,
                 positions,
                 positional,
                 member_at,
                 phrase.offsets().to_vec(),
-                next_bits,
+                adjacency_bits,
             )?)));
         }
         Ok((out, dict_ranges))
@@ -3000,7 +3003,13 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::{
         BytesLazyByteSource, LazyByteSourceError,
-        fts::{bm25, builder::FtsBuilder, reader::BoolMode, tokenize::StandardTokenizer},
+        fts::{
+            bm25,
+            builder::FtsBuilder,
+            positions::{FOLLOW_BITS, LEAD_BITS},
+            reader::BoolMode,
+            tokenize::StandardTokenizer,
+        },
     };
 
     /// Byte offset of the blob's version field.
@@ -3871,13 +3880,14 @@ mod tests {
         };
         let carried = collect(&ra);
         assert_eq!(carried, collect(&rb), "prebuilt-fed postings must match");
-        // "a" is followed by "b" in doc 0 and by "c" in doc 1: real
-        // signatures were carried, not the unknown one.
+        // "a" sits on either side of "b" in doc 0 and between "b" and "c"
+        // in doc 1: real signatures were carried, not the unknown one.
         let a_sigs: Vec<u8> = carried[&b"a"[..]].iter().map(|e| e.3).collect();
+        let (b_bits, c_bits) = (adjacency_bits(b"b"), adjacency_bits(b"c"));
         assert_eq!(
             a_sigs,
-            [next_bit(b"b"), next_bit(b"c")],
-            "a's signatures name its followers"
+            [b_bits, (c_bits & FOLLOW_BITS) | (b_bits & LEAD_BITS)],
+            "a's signatures name its neighbours"
         );
         assert_eq!(rb.n_docs(), 2);
         assert_eq!(rb.n_terms(), ra.n_terms());

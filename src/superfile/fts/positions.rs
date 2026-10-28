@@ -10,7 +10,7 @@
 //! terms). A run's varint count equals the posting's `tf`, so runs
 //! need no length framing — the decoder reads exactly `tf` values. The
 //! build accumulator stores each run behind the posting's one-byte
-//! [adjacency signature](next_bit).
+//! [adjacency signature](adjacency_bits).
 //!
 //! The positions region of the FTS blob holds, per term, one **position
 //! group** per posting block ([`encode_group`]); the skip table records
@@ -36,65 +36,88 @@ use crate::{
 /// to say which token follows which.
 pub(crate) const SIG_UNKNOWN: u8 = 0xFF;
 
-/// Bits in a signature: one byte.
-const SIG_BITS: u64 = 8;
+/// The low nibble of a signature: the bits of the words that follow.
+pub(crate) const FOLLOW_BITS: u8 = 0x0F;
+/// The high nibble of a signature: the bits of the words that precede.
+pub(crate) const LEAD_BITS: u8 = 0xF0;
+/// Bits in each nibble of a signature.
+const NIBBLE_BITS: u64 = 4;
 
-/// The signature bit standing for `term` as a **follower**: one of eight,
-/// chosen by a hash of the term's bytes.
+/// The two signature bits standing for `term`: one in [`FOLLOW_BITS`] for
+/// it as a word that **follows** another, one in [`LEAD_BITS`] for it as a
+/// word that **precedes** another, each chosen by a hash of its bytes.
 ///
 /// A posting `(t, d)` of a positional column stores the signature
-/// `sig(t, d)`: the OR of `next_bit(u)` over every token `u` at position
-/// `p + 1` for some occurrence of `t` at `p` in `d`. An exact phrase `t u`
-/// can only match `d` if `sig(t, d)` has `next_bit(u)`, so a candidate
-/// whose signature lacks it is rejected without decoding a position. A
-/// signature with the bit set proves nothing; the positions still decide.
+/// `sig(t, d)`: the OR, over every occurrence of `t` at `p` in `d`, of the
+/// follow bits of the tokens at `p + 1` and the lead bits of the tokens at
+/// `p - 1`. An exact phrase `t u` can only match `d` if `sig(t, d)` has
+/// `u`'s follow bit and `sig(u, d)` has `t`'s lead bit, so a candidate
+/// either signature rules out is rejected without decoding a position.
+/// The two sides fail on different words: a common word is followed (and
+/// preceded) by most words somewhere in a long doc, while the word next to
+/// it seldom is. A signature with the bits set proves nothing; the
+/// positions still decide.
 ///
 /// The hash is written into every blob, so it must not change: XXH3-64,
 /// which is specified and identical on every platform, of the term's
-/// bytes, its low three bits picking the bit.
+/// bytes, its low two bits picking the follow bit and the next two the
+/// lead bit.
 #[inline]
-pub(crate) fn next_bit(term: &[u8]) -> u8 {
-    1u8 << (xxh3_64(term) % SIG_BITS)
+pub(crate) fn adjacency_bits(term: &[u8]) -> u8 {
+    let h = xxh3_64(term);
+    (1u8 << (h % NIBBLE_BITS)) | (1u8 << (NIBBLE_BITS + (h >> 2) % NIBBLE_BITS))
 }
 
-/// Every token's **follower mask** in one document: entry `k` is the OR of
-/// `bits[j]` over the tokens `j` at position `position(k) + 1`, zero when
-/// that position holds no token (the doc's last token, or a gap a dropped
-/// word left). Tokens are given in emission order, `n` of them; `bits[k]`
-/// is token `k`'s [`next_bit`]. A term's signature in the doc is then the
-/// OR of its occurrences' masks.
+/// Every token's **adjacency mask** in one document: entry `k` is the OR
+/// of the [`FOLLOW_BITS`] of the tokens at `position(k) + 1` and the
+/// [`LEAD_BITS`] of the tokens at `position(k) - 1`, with no bits from a
+/// side that holds no token (the doc's ends, or a gap a dropped word
+/// left). Tokens are given in emission order, `n` of them; `bits[k]` is
+/// token `k`'s [`adjacency_bits`]. A term's signature in the doc is then
+/// the OR of its occurrences' masks.
 ///
 /// Emission order puts positions in non-decreasing order for every
 /// tokenizer this crate ships, so one forward pass finds each token's
-/// followers. A tokenizer that reports a position below its predecessor's
+/// neighbours. A tokenizer that reports a position below its predecessor's
 /// leaves the order unknown, and every mask is [`SIG_UNKNOWN`] rather than
 /// a guess that could reject a real match.
-pub(crate) fn follower_masks(
+pub(crate) fn adjacency_masks(
     n: usize,
     position: impl Fn(usize) -> u32,
     bits: &[u8],
     out: &mut Vec<u8>,
 ) {
-    debug_assert_eq!(bits.len(), n, "one bit per token");
+    debug_assert_eq!(bits.len(), n, "two bits per token");
     out.clear();
     if (1..n).any(|k| position(k) < position(k - 1)) {
         out.resize(n, SIG_UNKNOWN);
         return;
     }
-    // `j` is the first token past `k` whose position is not below
-    // `position(k) + 1`; it only moves forward as `k` does.
-    let mut j = 0usize;
-    for k in 0..n {
-        let want = u64::from(position(k)) + 1;
-        j = j.max(k + 1);
-        while j < n && u64::from(position(j)) < want {
-            j += 1;
-        }
+    // `next` is the first token whose position is not below
+    // `position(k) + 1`, `prev` the first not below `position(k) - 1`;
+    // both only move forward as `k` does.
+    let (mut next, mut prev) = (0usize, 0usize);
+    let mask_of = |from: usize, at: u64, side: u8| {
         let mut mask = 0u8;
-        let mut m = j;
-        while m < n && u64::from(position(m)) == want {
-            mask |= bits[m];
+        let mut m = from;
+        while m < n && u64::from(position(m)) == at {
+            mask |= bits[m] & side;
             m += 1;
+        }
+        mask
+    };
+    for k in 0..n {
+        let at = u64::from(position(k));
+        next = next.max(k + 1);
+        while next < n && u64::from(position(next)) < at + 1 {
+            next += 1;
+        }
+        let mut mask = mask_of(next, at + 1, FOLLOW_BITS);
+        if at > 0 {
+            while u64::from(position(prev)) < at - 1 {
+                prev += 1;
+            }
+            mask |= mask_of(prev, at - 1, LEAD_BITS);
         }
         out.push(mask);
     }
@@ -228,7 +251,7 @@ pub(crate) const GROUP_PACKED: u8 = 1;
 /// `VERSION_V10`.
 pub(crate) const GROUP_PACKED_FIXED: u8 = 2;
 /// Group header value for a [`GROUP_PACKED_FIXED`] group that carries its
-/// pairs' adjacency signatures ([`next_bit`]): one byte per pair, in pair
+/// pairs' adjacency signatures ([`adjacency_bits`]): one byte per pair, in pair
 /// order, right after the header, then the two streams exactly as
 /// [`GROUP_PACKED_FIXED`] lays them out. A phrase reads a candidate's
 /// signature at a fixed offset and rejects the candidate before any
@@ -868,8 +891,8 @@ pub(crate) fn positions_from_run_values(values: &[u32], out: &mut Vec<u32>) -> O
 mod tests {
     use super::*;
 
-    /// [`next_bit`] of `american`, `south`, `the`, the empty term and `x`.
-    const PINNED_BITS: [u8; 5] = [1, 4, 32, 4, 2];
+    /// [`adjacency_bits`] of `american`, `south`, `the`, the empty term and `x`.
+    const PINNED_BITS: [u8; 5] = [65, 68, 130, 20, 18];
 
     /// The decoded form of a term's runs reads, and re-encodes, exactly as
     /// the LEB128 form does, whatever order the postings' runs sit in.
@@ -1422,34 +1445,42 @@ mod tests {
         }
     }
 
-    /// The bit a term hashes to is written into every blob and read by
-    /// every later reader: it must never change.
+    /// The bits a term hashes to are written into every blob and read by
+    /// every later reader: they must never change.
     #[test]
-    fn next_bit_is_pinned() {
+    fn adjacency_bits_are_pinned() {
         let got: Vec<u8> = ["american", "south", "the", "", "x"]
             .iter()
-            .map(|t| next_bit(t.as_bytes()))
+            .map(|t| adjacency_bits(t.as_bytes()))
             .collect();
         assert_eq!(got, PINNED_BITS);
-        assert!(got.iter().all(|b| b.count_ones() == 1), "one bit each");
+        assert!(
+            got.iter()
+                .all(|b| (b & FOLLOW_BITS).count_ones() == 1 && (b & LEAD_BITS).count_ones() == 1),
+            "one bit on each side"
+        );
     }
 
-    /// Follower masks of `positions` with token `k`'s bit `1 << k`.
+    /// Adjacency masks of `positions` with token `k`'s follow bit `1 << k`
+    /// and lead bit `0x10 << k`.
     fn masks(positions: &[u32]) -> Vec<u8> {
-        let bits: Vec<u8> = (0..positions.len()).map(|k| 1u8 << k).collect();
+        let bits: Vec<u8> = (0..positions.len())
+            .map(|k| (1u8 << k) | (0x10 << k))
+            .collect();
         let mut out = vec![0xAA; 3];
-        follower_masks(positions.len(), |k| positions[k], &bits, &mut out);
+        adjacency_masks(positions.len(), |k| positions[k], &bits, &mut out);
         out
     }
 
     #[test]
-    fn follower_masks_name_the_tokens_one_position_on() {
+    fn adjacency_masks_name_the_tokens_on_either_side() {
         // A hole at position 2 (a dropped word): the token before it has no
-        // follower, and the last token never does.
-        assert_eq!(masks(&[0, 1, 3, 4]), [0b10, 0, 0b1000, 0]);
+        // follower and the one after it no predecessor; the first token
+        // never has a predecessor, nor the last a follower.
+        assert_eq!(masks(&[0, 1, 3, 4]), [0x02, 0x10, 0x08, 0x40]);
         // Two tokens stacked at one position both follow the one before,
-        // and are both followed by the next.
-        assert_eq!(masks(&[0, 1, 1, 2]), [0b110, 0b1000, 0b1000, 0]);
+        // and both precede the next.
+        assert_eq!(masks(&[0, 1, 1, 2]), [0x06, 0x18, 0x18, 0x60]);
         // Far apart: nobody follows anybody.
         assert_eq!(masks(&[0, 5, 9]), [0, 0, 0]);
         assert_eq!(masks(&[]), [0u8; 0]);
