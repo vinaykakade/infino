@@ -20,7 +20,10 @@ use super::{
 use crate::superfile::{
     ReadError,
     error::FtsError,
-    fts::{bm25, positions::GroupIndex},
+    fts::{
+        bm25,
+        positions::{GroupIndex, RUN_END, RunSeek},
+    },
 };
 
 /// One distinct term of a [`PhraseCursor`]: its posting cursor, its
@@ -60,6 +63,8 @@ pub(super) struct PhraseMember {
     /// candidates by located pair ([`Self::located_positions`]).
     tfs: Vec<u32>,
     tfs_block: usize,
+    /// The member's walk over its run at the doc [`leapfrog`] is matching.
+    seek: RunSeek,
 }
 
 /// Sentinel for [`PhraseMember::group_block`]: no block located.
@@ -103,6 +108,49 @@ impl PhraseMember {
         self.tfs_block = block;
     }
 
+    /// Locate block `block`'s position group (and read its tfs), unless it
+    /// is the one located.
+    fn locate_group(&mut self, block: usize) -> Result<(), FtsError> {
+        self.ensure_tfs(block);
+        if self.group_block == block {
+            return Ok(());
+        }
+        let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
+        let mut at = term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
+        self.group_index
+            .locate(&self.positions, &mut at, &self.tfs)
+            .ok_or_else(|| {
+                FtsError::Read(ReadError::Malformed(
+                    "position group truncated or undecodable".into(),
+                ))
+            })?;
+        self.group_block = block;
+        Ok(())
+    }
+
+    /// Start [`Self::seek`] on the member's run in its `pair`-th posting of
+    /// block `block`, returning the run's tf.
+    fn start_seek(&mut self, block: usize, pair: usize) -> Result<u32, FtsError> {
+        if let Some(p) = self.inline_position {
+            self.seek = RunSeek::single(p);
+            return Ok(1);
+        }
+        self.locate_group(block)?;
+        let tf = self.tfs[pair];
+        self.seek = self
+            .group_index
+            .seek_run(&self.positions, pair, tf)
+            .ok_or_else(malformed_run)?;
+        Ok(tf)
+    }
+
+    /// Move [`Self::seek`] to its first position at or past `target`.
+    fn seek_to(&mut self, target: u32) -> Result<u32, FtsError> {
+        self.group_index
+            .seek_in_run(&self.positions, &mut self.seek, target)
+            .ok_or_else(malformed_run)
+    }
+
     /// The member's tf in its `pair`-th posting of block `block`, a location
     /// from [`TermCursor::retain_contained_located`].
     fn located_tf(&mut self, block: usize, pair: usize) -> u32 {
@@ -123,20 +171,7 @@ impl PhraseMember {
             self.pos_scratch.push(p);
             return Ok(());
         }
-        self.ensure_tfs(block);
-        let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
-        if self.group_block != block {
-            let mut at =
-                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
-            self.group_index
-                .locate(&self.positions, &mut at, &self.tfs)
-                .ok_or_else(|| {
-                    FtsError::Read(ReadError::Malformed(
-                        "position group truncated or undecodable".into(),
-                    ))
-                })?;
-            self.group_block = block;
-        }
+        self.locate_group(block)?;
         self.group_index
             .run_positions(&self.positions, pair, self.tfs[pair], &mut self.pos_scratch)
             .ok_or_else(|| {
@@ -146,6 +181,68 @@ impl PhraseMember {
             })?;
         Ok(())
     }
+}
+
+/// The error for a position run that cannot be read.
+fn malformed_run() -> FtsError {
+    FtsError::Read(ReadError::Malformed(
+        "position run truncated or overflowing".into(),
+    ))
+}
+
+/// The phrase's occurrences at one doc, for a phrase of distinct members
+/// whose walks ([`PhraseMember::seek`]) are started there, member `m` at
+/// `offsets[m]` from the phrase's start and with `tfs[m]` positions. The
+/// member with the fewest positions in this doc leads: each of its
+/// positions proposes a start, and each other member, fewest positions
+/// first, is walked forward to where that start needs it. A member found
+/// past that point moves the start up to it, so the lead skips every start
+/// before it; and no walk ever goes back, so a long run is read only as
+/// far as the last start checked, never whole. With `first_only` the walk
+/// stops at the first occurrence, all a match or count needs. `order` is
+/// scratch.
+fn leapfrog(
+    members: &mut [PhraseMember],
+    offsets: &[u32],
+    tfs: &[u32],
+    order: &mut Vec<usize>,
+    first_only: bool,
+) -> Result<u32, FtsError> {
+    order.clear();
+    order.extend(0..members.len());
+    order.sort_by_key(|&m| tfs[m]);
+    let lead = order[0];
+    let mut found = 0u32;
+    let mut p = members[lead].seek.position();
+    'starts: while p != RUN_END {
+        let Some(start) = p.checked_sub(offsets[lead]) else {
+            p = members[lead].seek_to(offsets[lead])?;
+            continue;
+        };
+        for &m in &order[1..] {
+            let Some(want) = start.checked_add(offsets[m]) else {
+                break 'starts;
+            };
+            let got = members[m].seek_to(want)?;
+            if got == RUN_END {
+                break 'starts;
+            }
+            if got != want {
+                // No start before `got - offsets[m]` can hold the phrase.
+                match (got - offsets[m]).checked_add(offsets[lead]) {
+                    Some(next) => p = members[lead].seek_to(next)?,
+                    None => break 'starts,
+                }
+                continue 'starts;
+            }
+        }
+        found += 1;
+        if first_only {
+            break;
+        }
+        p = members[lead].seek_to(p + 1)?;
+    }
+    Ok(found)
 }
 
 /// The phrase's occurrences at one aligned doc, verified in stages,
@@ -285,6 +382,11 @@ pub(super) struct PhraseCursor {
     /// phrase-start positions as they are filtered member by member —
     /// avoids a per-doc allocation on the hot verify path.
     pub(super) verify_scratch: Vec<u32>,
+    /// Whether no term repeats in the phrase, so each member stands at one
+    /// offset and the phrase is matched by [`leapfrog`]; and its scratch.
+    distinct: bool,
+    leap_tfs: Vec<u32>,
+    leap_order: Vec<usize>,
     /// Docs of the rarest member's current block that every other member
     /// contains, awaiting the ranked bound and adjacency verification;
     /// `cand_next` is the first not yet served. Filled a block at a time
@@ -384,6 +486,7 @@ impl PhraseCursor {
                     group_block: NO_BLOCK_CACHED,
                     tfs: Vec::new(),
                     tfs_block: NO_BLOCK_CACHED,
+                    seek: RunSeek::default(),
                 }
             })
             .collect();
@@ -399,6 +502,7 @@ impl PhraseCursor {
         let mut verify_order: Vec<usize> = (0..member_at.len()).collect();
         verify_order.sort_by_key(|&q| rank[member_at[q]]);
         let batch_order = align_order.clone();
+        let distinct = n_members == member_at.len();
         let mut cursor = Self {
             idf_weight: idf_sum,
             // An unscored phrase has no idf, so no bound either.
@@ -414,6 +518,9 @@ impl PhraseCursor {
             current_doc: 0,
             current_tf: 0,
             verify_scratch: Vec::new(),
+            distinct,
+            leap_tfs: Vec::new(),
+            leap_order: Vec::new(),
             cands: Vec::new(),
             cand_next: 0,
             cand_locs: vec![Vec::new(); n_members],
@@ -688,10 +795,32 @@ impl PhraseCursor {
         }
     }
 
+    /// [`leapfrog`] over the members' walks, started at one doc: to the
+    /// first occurrence only when the phrase is unscored (a match or a
+    /// count needs no more), else every occurrence, its tf.
+    fn leapfrog(&mut self) -> Result<u32, FtsError> {
+        leapfrog(
+            &mut self.members,
+            &self.position_offsets,
+            &self.leap_tfs,
+            &mut self.leap_order,
+            self.idf_weight == 0.0,
+        )
+    }
+
     /// [`Self::verify_at_aligned`] for candidate `c` of the current batch,
     /// reading each member's positions at its recorded location rather than
     /// through a walk cursor.
     fn verify_located(&mut self, c: usize) -> Result<u32, FtsError> {
+        if self.distinct {
+            self.leap_tfs.clear();
+            for (m, locs) in self.members.iter_mut().zip(&self.cand_locs) {
+                let (b, p) = locs[c];
+                self.leap_tfs.push(m.start_seek(b as usize, p as usize)?);
+            }
+            self.current_tf = self.leapfrog()?;
+            return Ok(self.current_tf);
+        }
         let locs = &self.cand_locs;
         self.current_tf = verify_members(
             &mut self.members,
@@ -712,6 +841,16 @@ impl PhraseCursor {
     /// for every `i`. Member position lists are ascending, so each
     /// probe is a binary search over a per-doc-tf-sized slice.
     pub(super) fn verify_at_aligned(&mut self, aligned: u32) -> Result<u32, FtsError> {
+        if self.distinct {
+            self.leap_tfs.clear();
+            for m in &mut self.members {
+                m.cursor.materialize_at(aligned);
+                let (b, p) = (m.cursor.current_block, m.cursor.pos);
+                self.leap_tfs.push(m.start_seek(b, p)?);
+            }
+            self.current_tf = self.leapfrog()?;
+            return Ok(self.current_tf);
+        }
         // Staged, rarest first: see [`verify_members`].
         //
         // `materialize_at` decodes each member's block only now: on the

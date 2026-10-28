@@ -598,21 +598,7 @@ impl GroupIndex {
         out: &mut Vec<u32>,
     ) -> Option<()> {
         let start = *self.starts.get(pair)? as usize;
-        if self.kind == GroupKind::Packed
-            && self.served >= BULK_AFTER_RUNS
-            && pair < self.served as usize * BULK_MAX_STRIDE
-        {
-            let n_pairs = self.starts.len() - 1;
-            let n_gaps = *self.starts.last()? as usize;
-            // Sized, not cleared: every lane is overwritten, so only growth
-            // past the last group's length is zero-filled.
-            self.firsts.resize(n_pairs, 0);
-            self.gaps.resize(n_gaps, 0);
-            self.first.read_lanes_into(bytes, 0, &mut self.firsts)?;
-            self.gap.read_lanes_into(bytes, 0, &mut self.gaps)?;
-            self.kind = GroupKind::Bulk;
-        }
-        self.served += 1;
+        self.serve(bytes, pair)?;
         match self.kind {
             GroupKind::Leb128 => {
                 positions_from_run_values(self.values.get(start..start + tf as usize)?, out)
@@ -646,6 +632,125 @@ impl GroupIndex {
                 prefix_sum_in_place(&mut out[base..])
             }
         }
+    }
+}
+
+impl GroupIndex {
+    /// Count a run served at `pair`, first decoding a packed group whole
+    /// once the block proves dense ([`BULK_AFTER_RUNS`]).
+    fn serve(&mut self, bytes: &[u8], pair: usize) -> Option<()> {
+        if self.kind == GroupKind::Packed
+            && self.served >= BULK_AFTER_RUNS
+            && pair < self.served as usize * BULK_MAX_STRIDE
+        {
+            let n_pairs = self.starts.len() - 1;
+            let n_gaps = *self.starts.last()? as usize;
+            // Sized, not cleared: every lane is overwritten, so only growth
+            // past the last group's length is zero-filled.
+            self.firsts.resize(n_pairs, 0);
+            self.gaps.resize(n_gaps, 0);
+            self.first.read_lanes_into(bytes, 0, &mut self.firsts)?;
+            self.gap.read_lanes_into(bytes, 0, &mut self.gaps)?;
+            self.kind = GroupKind::Bulk;
+        }
+        self.served += 1;
+        Some(())
+    }
+
+    /// A [`RunSeek`] on the first position of pair `pair` (whose term
+    /// frequency is `tf`), the rest of the run left unread.
+    pub(crate) fn seek_run(&mut self, bytes: &[u8], pair: usize, tf: u32) -> Option<RunSeek> {
+        let start = *self.starts.get(pair)? as usize;
+        self.serve(bytes, pair)?;
+        let (first, next) = match self.kind {
+            GroupKind::Leb128 => (*self.values.get(start)?, start + 1),
+            GroupKind::Packed => (self.first.lane(bytes, pair)?, start),
+            GroupKind::Bulk => (*self.firsts.get(pair)?, start),
+        };
+        Some(RunSeek {
+            at: first,
+            next,
+            left: (tf as usize).checked_sub(1)?,
+            ..RunSeek::default()
+        })
+    }
+
+    /// Move `run` to its first position at or past `target` and return it,
+    /// or [`RUN_END`] when the run holds none. Reads the run's gaps only as
+    /// far as that position, [`SEEK_CHUNK`] at a time. `None` on a gap
+    /// past the group or an overflowing position.
+    pub(crate) fn seek_in_run(&self, bytes: &[u8], run: &mut RunSeek, target: u32) -> Option<u32> {
+        while run.at < target {
+            if run.buf_at == run.buf_len {
+                if run.left == 0 {
+                    run.at = RUN_END;
+                    break;
+                }
+                let take = SEEK_CHUNK.min(run.left);
+                let chunk = &mut run.buf[..take];
+                match self.kind {
+                    GroupKind::Leb128 => {
+                        chunk.copy_from_slice(self.values.get(run.next..run.next + take)?)
+                    }
+                    GroupKind::Bulk => {
+                        chunk.copy_from_slice(self.gaps.get(run.next..run.next + take)?)
+                    }
+                    GroupKind::Packed => {
+                        if run.next + take > self.gap.lanes {
+                            return None;
+                        }
+                        self.gap.read_lanes_into(bytes, run.next, chunk)?
+                    }
+                }
+                run.next += take;
+                run.left -= take;
+                run.buf_at = 0;
+                run.buf_len = take;
+            }
+            run.at = run.at.checked_add(run.buf[run.buf_at])?;
+            run.buf_at += 1;
+        }
+        Some(run.at)
+    }
+}
+
+/// Gaps a [`RunSeek`] reads at a time: one group of the lane unpacker's.
+const SEEK_CHUNK: usize = 8;
+
+/// What [`GroupIndex::seek_in_run`] returns past a run's last position.
+/// A position is a token's index in its document, so none reaches it.
+pub(crate) const RUN_END: u32 = u32::MAX;
+
+/// A forward-only walk over one run's positions, reading its gaps only as
+/// far as it is asked to go ([`GroupIndex::seek_in_run`]): a phrase that
+/// finds, or rules out, its match early in a common word's long run never
+/// decodes the rest of it.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct RunSeek {
+    /// The position the walk is on, [`RUN_END`] past the run.
+    at: u32,
+    /// The next gap to read, as a lane of the gap stream (or an index into
+    /// the decoded gaps or values), and how many are left.
+    next: usize,
+    left: usize,
+    /// Gaps read but not yet added.
+    buf: [u32; SEEK_CHUNK],
+    buf_at: usize,
+    buf_len: usize,
+}
+
+impl RunSeek {
+    /// A run of one position, held without a group.
+    pub(crate) fn single(position: u32) -> Self {
+        Self {
+            at: position,
+            ..Self::default()
+        }
+    }
+
+    /// The position the walk is on, [`RUN_END`] past the run.
+    pub(crate) fn position(&self) -> u32 {
+        self.at
     }
 }
 
@@ -737,6 +842,62 @@ mod tests {
     /// Encode a group with fresh scratch.
     fn group(out: &mut Vec<u8>, tfs: &[u32], values: &[u32], allow_leb128: bool) {
         encode_group(out, tfs, values, allow_leb128, &mut PackScratch::default());
+    }
+
+    /// A walk over a run stops at its first position at or past each target
+    /// it is given, and past the run at [`RUN_END`], however long the run,
+    /// wherever its wide gaps fall, and whether the group is read run by
+    /// run, decoded whole once dense, or stored as LEB128.
+    #[test]
+    fn a_run_walk_stops_at_the_first_position_at_or_past_each_target() {
+        let tfs: Vec<u32> = (0..40u32)
+            .map(|d| [1, 3, 9, 17, 40, 70][d as usize % 6])
+            .collect();
+        let mut vals = Vec::new();
+        for (d, &tf) in tfs.iter().enumerate() {
+            vals.push(5 * d as u32 + 1);
+            vals.extend((1..tf).map(|g| 1 + (g * 13 + d as u32) % 9));
+        }
+        // Gaps wide enough to be exceptions.
+        vals[60] = 1 << 20;
+        vals[400] = 1 << 18;
+        for leb128 in [false, true] {
+            let mut out = Vec::new();
+            group(&mut out, &tfs, &vals, leb128);
+            // Every pair in order (which turns a packed group to a whole
+            // decode partway through), then every other pair afresh.
+            for pairs in [
+                (0..tfs.len()).collect::<Vec<_>>(),
+                (0..tfs.len()).step_by(2).collect(),
+            ] {
+                let mut index = GroupIndex::default();
+                index.locate(&out, &mut 0, &tfs).expect("locates");
+                for pair in pairs {
+                    let tf = tfs[pair];
+                    let start: usize = tfs[..pair].iter().map(|&t| t as usize).sum();
+                    let mut full = Vec::new();
+                    positions_from_run_values(&vals[start..start + tf as usize], &mut full)
+                        .expect("sums");
+                    let mut walk = index.seek_run(&out, pair, tf).expect("starts");
+                    assert_eq!(walk.position(), full[0]);
+                    // Targets ascend, as a phrase's do: each position, one
+                    // past it, and a few between.
+                    let targets = full.iter().flat_map(|&p| [p.saturating_sub(1), p, p + 1]);
+                    let mut last = 0;
+                    for target in targets.chain([u32::MAX - 1]) {
+                        let target = target.max(last);
+                        last = target;
+                        let want = full
+                            .iter()
+                            .copied()
+                            .find(|&p| p >= target)
+                            .unwrap_or(RUN_END);
+                        let got = index.seek_in_run(&out, &mut walk, target).expect("walks");
+                        assert_eq!(got, want, "leb128 {leb128} pair {pair} target {target}");
+                    }
+                }
+            }
+        }
     }
 
     /// Decode every pair of a group through the per-run index into
