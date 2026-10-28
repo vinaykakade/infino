@@ -270,6 +270,12 @@ pub(super) struct PhraseCursor {
     /// Query positions in the order [`verify_members`] checks them: their
     /// members' `align_order`, a repeated term's positions together.
     verify_order: Vec<usize>,
+    /// Scratch for [`Self::verify_located`]: the members as (tf at the
+    /// candidate, `align_order` rank, member), sorted, and the query
+    /// positions they expand to. Reused so the per-doc order allocates
+    /// nothing.
+    tf_members: Vec<(u32, usize, usize)>,
+    doc_order: Vec<usize>,
     /// Σ member idf — the phrase's scoring constant, and the factor a
     /// bound in the "scaled" form is multiplied back up by.
     pub(super) idf_weight: f32,
@@ -409,6 +415,8 @@ impl PhraseCursor {
             position_offsets: offsets,
             align_order,
             verify_order,
+            tf_members: Vec::with_capacity(n_members),
+            doc_order: Vec::new(),
             current_doc: 0,
             current_tf: 0,
             verify_scratch: Vec::new(),
@@ -689,12 +697,33 @@ impl PhraseCursor {
     /// [`Self::verify_at_aligned`] for candidate `c` of the current batch,
     /// reading each member's positions at its recorded location rather than
     /// through a walk cursor.
+    ///
+    /// The order is chosen per doc, by each member's tf here (fewest
+    /// positions first, ties in `align_order`), not by global rarity: a word
+    /// rare across the corpus can repeat in this doc while a common one
+    /// appears once. Anchoring on the fewest positions seeds the fewest
+    /// starts, so a doc that fails exits before the long runs are decoded.
+    /// The tfs are cheap here: their block's tfs are decoded anyway to find
+    /// a position run. A member's query positions stay consecutive, so its
+    /// run is still read once; the count is order-independent.
     fn verify_located(&mut self, c: usize) -> Result<u32, FtsError> {
+        self.tf_members.clear();
+        for (rank, &m) in self.align_order.iter().enumerate() {
+            let (b, p) = self.cand_locs[m][c];
+            let tf = self.members[m].located_tf(b as usize, p as usize);
+            self.tf_members.push((tf, rank, m));
+        }
+        self.tf_members.sort_unstable();
+        self.doc_order.clear();
+        for &(_, _, m) in &self.tf_members {
+            let at = &self.member_at;
+            self.doc_order.extend((0..at.len()).filter(|&q| at[q] == m));
+        }
         let locs = &self.cand_locs;
         self.current_tf = verify_members(
             &mut self.members,
             &self.member_at,
-            &self.verify_order,
+            &self.doc_order,
             &self.position_offsets,
             &mut self.verify_scratch,
             |m, j| {
@@ -2204,6 +2233,140 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Docs in the per-doc-order corpus: enough that the common word spans
+    /// many posting blocks and the rare one few.
+    const TF_ORDER_DOCS: u64 = 3_000;
+
+    /// One doc in this many holds the globally rare word.
+    const TF_ORDER_RARE_EVERY: u64 = 9;
+
+    /// The batched walk orders a doc's verification by the members' tf there,
+    /// not their global rarity. Here the globally rare word repeats many
+    /// times in the docs that hold it while the common word appears once or
+    /// twice, so the per-doc order flips; every phrase's (doc, tf) pairs,
+    /// match count and ranked scores must still equal a token scan.
+    #[tokio::test]
+    async fn per_doc_tf_order_matches_a_token_scan_when_the_rare_word_repeats() {
+        let mut next = xorshift(0x7F4A_7C15_9E37_79B9);
+        let mut rng = move |m: u64| next() % m;
+        let docs: Vec<Vec<&str>> = (0..TF_ORDER_DOCS)
+            .map(|_| {
+                let mut d: Vec<&str> = vec!["common"; 1 + rng(2) as usize];
+                d.extend((0..rng(4)).map(|_| "x"));
+                if rng(TF_ORDER_RARE_EVERY) == 0 {
+                    for _ in 0..3 + rng(8) {
+                        let at = rng(d.len() as u64 + 1) as usize;
+                        d.insert(at, "rare");
+                    }
+                }
+                d
+            })
+            .collect();
+        let tf_of = |d: &[&str], w: &str| d.iter().filter(|t| **t == w).count();
+        assert!(
+            docs.iter()
+                .any(|d| tf_of(d, "rare") > tf_of(d, "common") && tf_of(d, "common") > 0),
+            "premise: the rare word outnumbers the common one in some doc"
+        );
+        let r = open_positional(docs.iter().map(|d| d.join(" ")));
+        let norms = r.columns[0].dl_norm_k1();
+        let phrases: [&[&str]; 5] = [
+            &["rare", "common"],
+            &["common", "rare"],
+            &["rare", "rare", "common"],
+            &["rare", "common", "rare"],
+            &["common", "rare", "rare", "x"],
+        ];
+        for terms in phrases {
+            let label = format!("{terms:?}");
+            let expected: Vec<(u32, u32)> = docs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, d)| {
+                    let tf = d.windows(terms.len()).filter(|w| *w == terms).count() as u32;
+                    (tf > 0).then_some((i as u32, tf))
+                })
+                .collect();
+            assert!(!expected.is_empty(), "{label} occurs");
+            let mut scored = phrase_cursor(&r, terms, CursorUse::Score).await;
+            let owned: Vec<String> = terms.iter().map(|t| t.to_string()).collect();
+            let (distinct, _) = distinct_members(&owned);
+            let rare_member = distinct.iter().position(|t| *t == "rare");
+            assert_eq!(
+                Some(scored.align_order[0]),
+                rare_member,
+                "premise: {label}: the rare word is globally rarest"
+            );
+            let mut seen = Vec::new();
+            while !scored.is_exhausted() {
+                seen.push((scored.current_doc_id(), scored.current_tf));
+                // The doc's order: every query position once, a member's
+                // positions consecutive, members by ascending tf here.
+                let order = &scored.doc_order;
+                let mut sorted = order.clone();
+                sorted.sort_unstable();
+                assert_eq!(sorted, (0..terms.len()).collect::<Vec<_>>(), "{label}");
+                let runs = order
+                    .windows(2)
+                    .filter(|w| scored.member_at[w[0]] != scored.member_at[w[1]])
+                    .count();
+                assert_eq!(runs + 1, scored.members.len(), "grouped, {label}");
+                let doc = &docs[scored.current_doc_id() as usize];
+                let tfs: Vec<usize> = order.iter().map(|&q| tf_of(doc, terms[q])).collect();
+                assert!(tfs.is_sorted(), "{label}: tf order {tfs:?}");
+                let next = scored.current_doc_id() + 1;
+                scored
+                    .seek_match(next, f32::NEG_INFINITY, Some(norms))
+                    .expect("seek");
+            }
+            assert_eq!(seen, expected, "scored walk, {label}");
+
+            let one = phrase(terms);
+            let (count, _) = r
+                .atoms_match_count("title", &[], &one, BoolMode::And, &[], &[])
+                .await
+                .expect("count");
+            assert_eq!(count, expected.len() as u64, "count, {label}");
+
+            let idf = scored.idf_weight;
+            let mut want: Vec<(u32, u32)> = expected
+                .iter()
+                .map(|&(d, tf)| {
+                    (
+                        d,
+                        bm25::score_with_dl_norm_k1(idf, tf, norms.get(d)).to_bits(),
+                    )
+                })
+                .collect();
+            want.sort_by(|a, b| {
+                f32::from_bits(b.1)
+                    .total_cmp(&f32::from_bits(a.1))
+                    .then(a.0.cmp(&b.0))
+            });
+            for k in [1usize, 10, expected.len()] {
+                let hits = r
+                    .search_excluding(
+                        "title",
+                        ClauseLists {
+                            should_phrases: &one,
+                            ..ClauseLists::default()
+                        },
+                        k,
+                        f32::NEG_INFINITY,
+                    )
+                    .await
+                    .expect("phrase search");
+                let mut got = bits(&hits);
+                got.sort_by(|a, b| {
+                    f32::from_bits(b.1)
+                        .total_cmp(&f32::from_bits(a.1))
+                        .then(a.0.cmp(&b.0))
+                });
+                assert_eq!(got, want[..k], "ranked top-{k}, {label}");
             }
         }
     }
