@@ -689,6 +689,7 @@ impl PhraseCursor {
     /// [`Self::verify_at_aligned`] for candidate `c` of the current batch,
     /// reading each member's positions at its recorded location rather than
     /// through a walk cursor.
+    #[inline(never)]
     fn verify_located(&mut self, c: usize) -> Result<u32, FtsError> {
         let locs = &self.cand_locs;
         self.current_tf = verify_members(
