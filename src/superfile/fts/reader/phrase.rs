@@ -189,6 +189,12 @@ impl PhraseMember {
     }
 }
 
+/// Positions a member must have at a doc before an unscored phrase is
+/// matched there by [`leapfrog`]: a run this long takes the walk a few
+/// chunks to cross, which a match found early skips. Shorter runs decode
+/// whole for less than the walk's setup.
+const LEAP_MIN_TF: u32 = 32;
+
 /// The error for a position run that cannot be read.
 fn malformed_run() -> FtsError {
     FtsError::Read(ReadError::Malformed(
@@ -818,7 +824,15 @@ impl PhraseCursor {
     /// reading each member's positions at its recorded location rather than
     /// through a walk cursor.
     fn verify_located(&mut self, c: usize) -> Result<u32, FtsError> {
-        if self.leaps() {
+        let long_run = self.leaps()
+            && self
+                .members
+                .iter_mut()
+                .zip(&self.cand_locs)
+                .any(|(m, locs)| {
+                    m.located_tf(locs[c].0 as usize, locs[c].1 as usize) >= LEAP_MIN_TF
+                });
+        if long_run {
             self.leap_tfs.clear();
             for (m, locs) in self.members.iter_mut().zip(&self.cand_locs) {
                 let (b, p) = locs[c];
@@ -847,16 +861,6 @@ impl PhraseCursor {
     /// for every `i`. Member position lists are ascending, so each
     /// probe is a binary search over a per-doc-tf-sized slice.
     pub(super) fn verify_at_aligned(&mut self, aligned: u32) -> Result<u32, FtsError> {
-        if self.leaps() {
-            self.leap_tfs.clear();
-            for m in &mut self.members {
-                m.cursor.materialize_at(aligned);
-                let (b, p) = (m.cursor.current_block, m.cursor.pos);
-                self.leap_tfs.push(m.start_seek(b, p)?);
-            }
-            self.current_tf = self.leapfrog()?;
-            return Ok(self.current_tf);
-        }
         // Staged, rarest first: see [`verify_members`].
         //
         // `materialize_at` decodes each member's block only now: on the
