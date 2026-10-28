@@ -195,18 +195,7 @@ fn verify_members(
         // searched. Only the last member may stop early: a start an earlier
         // member confirms could still fall at a later one while a dropped
         // start would have passed.
-        if first_only && i == last {
-            let hit = starts
-                .iter()
-                .find(|&&s| {
-                    s.checked_add(off)
-                        .is_some_and(|want| plist.binary_search(&want).is_ok())
-                })
-                .copied();
-            starts.clear();
-            starts.extend(hit);
-            break;
-        }
+        let settle_at_first = first_only && i == last;
         // Compacted in place without a branch on the outcome, which on a
         // common member is close to a coin flip; the search per start stays,
         // as it beat a merge on every lane measured.
@@ -218,6 +207,9 @@ fn verify_members(
                 .is_some_and(|want| plist.binary_search(&want).is_ok());
             starts[w] = s;
             w += usize::from(found);
+            if settle_at_first && w == 1 {
+                break;
+            }
         }
         starts.truncate(w);
     }
