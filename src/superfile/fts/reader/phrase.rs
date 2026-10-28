@@ -609,6 +609,10 @@ impl PhraseCursor {
                         continue;
                     }
                 }
+                // Diagnostic: verify every candidate twice. The second pass
+                // reads lines the first just brought in, so the lane's rise
+                // is the verification's instruction cost without its stalls.
+                let _ = self.verify_located(c)?;
                 let tf = self.verify_located(c)?;
                 if tf > 0 {
                     self.current_doc = s;
