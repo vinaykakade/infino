@@ -403,6 +403,16 @@ impl StreamIndex {
         self.width = width;
         self.lanes = n;
         self.payload = payload;
+        crate::superfile::fts::reader::phrase::diag::bump(
+            &crate::superfile::fts::reader::phrase::diag::STREAMS,
+            1,
+        );
+        if !tables.is_empty() {
+            crate::superfile::fts::reader::phrase::diag::bump(
+                &crate::superfile::fts::reader::phrase::diag::EXC_STREAMS,
+                1,
+            );
+        }
         Some(())
     }
 

@@ -39,6 +39,17 @@ pub(crate) mod diag {
     pub static FILTER_BLOCKS: AtomicU64 = AtomicU64::new(0);
     pub static FILTER_DENSE: AtomicU64 = AtomicU64::new(0);
     pub static FILTER_DECODES: AtomicU64 = AtomicU64::new(0);
+    /// Survivors by (anchor tf, other tf) class: 1 / 2–4 / >4 each.
+    pub static TF_CLASS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+    pub static EXC_STREAMS: AtomicU64 = AtomicU64::new(0);
+    pub static STREAMS: AtomicU64 = AtomicU64::new(0);
+    pub fn class(tf: u32) -> usize {
+        match tf {
+            1 => 0,
+            2..=4 => 1,
+            _ => 2,
+        }
+    }
     pub static T_FILTER: AtomicU64 = AtomicU64::new(0);
     pub static T_TFS: AtomicU64 = AtomicU64::new(0);
     pub static T_LOCATE: AtomicU64 = AtomicU64::new(0);
@@ -357,6 +368,12 @@ pub(super) struct PhraseCursor {
 impl Drop for PhraseCursor {
     fn drop(&mut self) {
         let names: Vec<String> = self.members.iter().map(|m| format!("{}blk", m.cursor.block_count())).collect();
+        let cls: Vec<String> = diag::TF_CLASS.iter().map(|c| diag::take(c).to_string()).collect();
+        eprintln!(
+            "PHRASE_TFCLASS anchor1/other1={} a1/o2-4={} a1/o>4={} a2-4/o1={} a2-4/o2-4={} a2-4/o>4={} a>4/o1={} a>4/o2-4={} a>4/o>4={} exc_streams={}/{}",
+            cls[0], cls[1], cls[2], cls[3], cls[4], cls[5], cls[6], cls[7], cls[8],
+            diag::take(&diag::EXC_STREAMS), diag::take(&diag::STREAMS)
+        );
         eprintln!(
             "PHRASE_TIME total={} refill={} filter={} tfs={} locate={} verify={}",
             diag::take(&diag::T_TOTAL), diag::take(&diag::T_REFILL), diag::take(&diag::T_FILTER),
@@ -684,6 +701,15 @@ impl PhraseCursor {
                     }
                 }
                 diag::bump(&diag::VERIFIED, 1);
+                if self.members.len() == 2 && self.member_at.len() == 2 {
+                    let (qa, qo) = (self.verify_order[0], self.verify_order[1]);
+                    let (ma, mo) = (self.member_at[qa], self.member_at[qo]);
+                    let (ba, pa) = self.cand_locs[ma][c];
+                    let (bo, po) = self.cand_locs[mo][c];
+                    let ta = self.members[ma].located_tf(ba as usize, pa as usize);
+                    let to = self.members[mo].located_tf(bo as usize, po as usize);
+                    diag::bump(&diag::TF_CLASS[diag::class(ta) * 3 + diag::class(to)], 1);
+                }
                 let t0 = diag::now();
                 let tf = self.verify_located(c)?;
                 diag::bump(&diag::T_VERIFY, diag::now() - t0);

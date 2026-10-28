@@ -15,7 +15,7 @@ mod metadata;
 mod options;
 #[cfg(test)]
 mod oracle_scale;
-mod phrase;
+pub(crate) mod phrase;
 mod scorers;
 mod search;
 mod sink;
