@@ -1222,6 +1222,26 @@ impl TermCursor {
         let p = seek_sorted::<false>(ids, self.pos.min(ids.len()), doc);
         self.pos = p.min(ids.len().saturating_sub(1));
         (p < ids.len() && ids[p] == doc).then_some((b as u32, p as u32))
+    /// The blocks this term would enter for docs in `lo..=hi`, from the
+    /// first that can hold `lo`: their indices, at most `cap` of them. Reads
+    /// the block table only and moves nothing.
+    pub(super) fn blocks_spanning(&self, lo: u32, hi: u32, cap: usize) -> std::ops::Range<usize> {
+        if self.predecoded {
+            return 0..0;
+        }
+        let mut b = self.current_block;
+        while b < self.blocks.len() && self.blocks[b].last_doc_id < lo {
+            b += 1;
+        }
+        let mut e = b;
+        while e < self.blocks.len() && e - b < cap && self.blocks[e].last_doc_id <= hi {
+            e += 1;
+        }
+        // The block holding `hi` itself, when it ends past it.
+        if e < self.blocks.len() && e - b < cap {
+            e += 1;
+        }
+        b..e
     }
 
     /// Block `b`'s tfs, decoded into `out` (resized to the block's count)

@@ -147,6 +147,83 @@ impl PhraseMember {
     }
 }
 
+/// Ask the CPU to bring the cache line holding `bytes[at]` in ahead of a
+/// read that is still some work away. A hint only: a position past the
+/// slice is ignored, and nothing is read.
+#[inline(always)]
+fn prefetch(bytes: &[u8], at: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if at < bytes.len() {
+        // SAFETY: a prefetch dereferences nothing; the address is inside
+        // `bytes`, whose borrow outlives the call.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                bytes.as_ptr().add(at) as *const i8,
+            );
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (bytes, at);
+}
+
+/// Bytes per cache line, for stepping a prefetch over a region.
+const CACHE_LINE: usize = 64;
+/// Most lines fetched ahead per position group: a common word's group for
+/// one block is a few hundred bytes to a couple of kilobytes; a group far
+/// larger (a stopword's) is read run by run and is not worth streaming.
+const GROUP_PREFETCH_MAX_LINES: usize = 24;
+/// Lines fetched ahead at a posting block's head (header and presence
+/// bits) and at its tail (the tfs).
+const BLOCK_PREFETCH_LINES: usize = 2;
+/// Most blocks of a filtering member fetched ahead per batch.
+const PREFETCH_BLOCKS: usize = 12;
+
+impl PhraseMember {
+    /// Fetch ahead the memory this member will read while a batch of the
+    /// driver's docs `lo..=hi` is filtered and verified: for each posting
+    /// block the range can land in, the block's head (its header and
+    /// presence bits, which the filter reads first), its tail (the tfs the
+    /// group is located with) and its whole position group. A filtering
+    /// member enters each of those blocks once per batch, scattered across
+    /// its postings, and every first touch stalled the walk; issued before
+    /// the filter runs, the lines are in flight while the earlier blocks
+    /// are worked.
+    fn prefetch_span(&self, lo: u32, hi: u32) {
+        let Some(term_meta) = self.term_meta.as_ref() else {
+            return;
+        };
+        if self.probe.predecoded {
+            return;
+        }
+        let postings = self.probe.bytes.as_ref();
+        let blocks = self.probe.blocks_spanning(lo, hi, PREFETCH_BLOCKS);
+        let n_blocks = self.probe.blocks.len();
+        for b in blocks {
+            let block = &self.probe.blocks[b];
+            for line in 0..BLOCK_PREFETCH_LINES {
+                prefetch(postings, block.block_byte_offset + line * CACHE_LINE);
+            }
+            prefetch(postings, block.block_byte_end.saturating_sub(1));
+            prefetch(
+                postings,
+                block.block_byte_end.saturating_sub(1 + CACHE_LINE),
+            );
+            let at = term_meta.positions_block_offset(postings, b) as usize;
+            let end = match b + 1 < n_blocks {
+                true => term_meta.positions_block_offset(postings, b + 1) as usize,
+                false => self.positions.len(),
+            };
+            let lines = end
+                .saturating_sub(at)
+                .div_ceil(CACHE_LINE)
+                .min(GROUP_PREFETCH_MAX_LINES);
+            for line in 0..lines.max(1) {
+                prefetch(&self.positions, at + line * CACHE_LINE);
+            }
+        }
+    }
+}
+
 /// The phrase's occurrences at one aligned doc, verified in stages,
 /// rarest member first. A phrase starting at position `s` has query
 /// position `q`'s term (member `member_at[q]`) at `s + offsets[q]`, so the
@@ -700,6 +777,14 @@ impl PhraseCursor {
             // any of its docs is aligned or its positions read.
             if bar_norm.is_some() && self.block_max_in_range(first, block_last) < bar {
                 continue;
+            }
+            // Every other member's lines for this batch's span, asked for
+            // before the filter so they arrive while it works; the driver's
+            // blocks stream in on their own, read in order.
+            for (mi, m) in self.members.iter().enumerate() {
+                if mi != driver {
+                    m.prefetch_span(first, block_last);
+                }
             }
             let d = source_cursor(&mut self.members, &mut self.filters, driver, true);
             self.cands.clear();
