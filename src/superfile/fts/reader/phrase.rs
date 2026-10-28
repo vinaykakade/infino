@@ -147,6 +147,63 @@ impl PhraseMember {
     }
 }
 
+/// Ask the CPU to bring the cache line holding `bytes[at]` in ahead of a
+/// read that is still some work away. A hint only: a position past the
+/// slice is ignored, and nothing is read.
+#[inline(always)]
+fn prefetch(bytes: &[u8], at: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if at < bytes.len() {
+        // SAFETY: a prefetch dereferences nothing; the address is inside
+        // `bytes`, whose borrow outlives the call.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                bytes.as_ptr().add(at) as *const i8,
+            );
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (bytes, at);
+}
+
+/// Cache lines a position group is fetched ahead by: its header, the first
+/// stream's width and payload, and in most blocks its exception tables and
+/// the gap stream's header.
+const GROUP_PREFETCH_LINES: usize = 4;
+
+impl PhraseMember {
+    /// Fetch ahead, for the batch's survivors at `locs` (ascending blocks),
+    /// the memory this member's verification is about to read in each of
+    /// those blocks: the head of its position group, and the end of its
+    /// posting block, where a dense block keeps the tfs the group is located
+    /// with. A member that filters a batch lands in each block once per
+    /// batch, scattered across its postings, so the walk would otherwise
+    /// stall on every block's first touch while the verification waits.
+    fn prefetch_blocks(&self, locs: &[(u32, u32)]) {
+        let Some(term_meta) = self.term_meta.as_ref() else {
+            return;
+        };
+        if self.cursor.predecoded {
+            return;
+        }
+        let postings = self.cursor.bytes.as_ref();
+        let mut last = u32::MAX;
+        for &(b, _) in locs {
+            if b == last {
+                continue;
+            }
+            last = b;
+            let at = term_meta.positions_block_offset(postings, b as usize) as usize;
+            for line in 0..GROUP_PREFETCH_LINES {
+                prefetch(&self.positions, at + line * 64);
+            }
+            if let Some(block) = self.cursor.blocks.get(b as usize) {
+                prefetch(postings, block.block_byte_end.saturating_sub(1));
+            }
+        }
+    }
+}
+
 /// The phrase's occurrences at one aligned doc, verified in stages,
 /// rarest member first. A phrase starting at position `s` has query
 /// position `q`'s term (member `member_at[q]`) at `s + offsets[q]`, so the
@@ -681,6 +738,14 @@ impl PhraseCursor {
                     if pj < n_members {
                         compact_locs(&mut self.cand_locs[pj], &self.kept);
                     }
+                }
+            }
+            // The driver's blocks are read in order and stream in on their
+            // own; every other member's are scattered, so their lines are
+            // asked for now, while the first candidates are verified.
+            for (mi, m) in self.members.iter().enumerate() {
+                if mi != driver {
+                    m.prefetch_blocks(&self.cand_locs[mi]);
                 }
             }
         }
