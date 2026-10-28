@@ -20,8 +20,18 @@ use super::{
 use crate::superfile::{
     ReadError,
     error::FtsError,
-    fts::{bm25, positions::GroupIndex},
+    fts::{
+        bm25,
+        positions::{GroupIndex, SIG_UNKNOWN, group_signatures_at},
+    },
 };
+
+#[cfg(test)]
+thread_local! {
+    /// Phrase candidates this thread rejected by adjacency signature, so a
+    /// test can tell the filter fired rather than only that results agree.
+    pub(crate) static SIG_REJECTS: Cell<u64> = const { Cell::new(0) };
+}
 
 /// One distinct term of a [`PhraseCursor`]: its posting cursor, its
 /// fetched position groups, and the current block's group located for
@@ -60,6 +70,10 @@ pub(super) struct PhraseMember {
     /// candidates by located pair ([`Self::located_positions`]).
     tfs: Vec<u32>,
     tfs_block: usize,
+    /// Where block `sig_block`'s group keeps its pair signatures, `None`
+    /// when it keeps none.
+    sig_base: Option<usize>,
+    sig_block: usize,
 }
 
 /// Sentinel for [`PhraseMember::group_block`]: no block located.
@@ -111,6 +125,25 @@ impl PhraseMember {
         }
         self.ensure_tfs(block);
         self.tfs[pair]
+    }
+
+    /// The member's adjacency signature in its `pair`-th posting of block
+    /// `block`: two byte reads at a block it has seen, one skip-table read
+    /// more at a new one, and no position group parsed.
+    /// [`SIG_UNKNOWN`] for an inline member or a group without signatures.
+    fn located_sig(&mut self, block: usize, pair: usize) -> u8 {
+        if self.inline_position.is_some() {
+            return SIG_UNKNOWN;
+        }
+        if self.sig_block != block {
+            let term_meta = self.term_meta.as_ref().expect("PFOR member has term meta");
+            let at = term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
+            self.sig_base = group_signatures_at(&self.positions, at);
+            self.sig_block = block;
+        }
+        self.sig_base
+            .and_then(|base| self.positions.get(base + pair).copied())
+            .unwrap_or(SIG_UNKNOWN)
     }
 
     /// The member's positions in its `pair`-th posting of block `block`,
@@ -224,12 +257,12 @@ pub(super) fn distinct_members(terms: &[String]) -> (Vec<&str>, Vec<usize>) {
     (distinct, member_at)
 }
 
-/// Compact `locs` to the entries at `kept` (ascending indices into it).
-fn compact_locs(locs: &mut Vec<(u32, u32)>, kept: &[u32]) {
+/// Compact `items` to the entries at `kept` (ascending indices into it).
+fn compact<T: Copy>(items: &mut Vec<T>, kept: &[u32]) {
     for (i, &k) in kept.iter().enumerate() {
-        locs[i] = locs[k as usize];
+        items[i] = items[k as usize];
     }
-    locs.truncate(kept.len());
+    items.truncate(kept.len());
 }
 
 /// Doc-at-a-time cursor over an exact phrase: the members'
@@ -296,6 +329,14 @@ pub(super) struct PhraseCursor {
     cand_locs: Vec<Vec<(u32, u32)>>,
     /// Scratch: which candidates a member's filter kept.
     kept: Vec<u32>,
+    /// `(m, bit)` per query position of member `m` whose successor sits
+    /// one position after it: a candidate whose signature for member `m`
+    /// lacks `bit`, the successor's
+    /// [`next_bit`](crate::superfile::fts::positions::next_bit), cannot
+    /// hold the phrase. Positions whose gap a removed stopword widened are
+    /// absent: what follows them in a match is the hole, not the successor.
+    /// So are inline members, which carry no signature.
+    adjacent_sigs: Vec<(usize, u8)>,
     /// Where the next block refill starts: one past the last block
     /// batched. `None` once the driver's last block is batched.
     refill_from: Option<u32>,
@@ -332,16 +373,19 @@ fn source_cursor<'a>(
 
 impl PhraseCursor {
     /// Build from one cursor per distinct member term (see
-    /// [`distinct_members`]), their fetched position runs, and their
+    /// [`distinct_members`]), their fetched position runs, their
     /// positional metadata — `(term_meta, inline_position)` per member,
-    /// exactly one of the two present — plus each query position's member
-    /// (`member_at`) and offset, then seek to the first matching doc.
+    /// exactly one of the two present — and signature bits
+    /// ([`next_bit`](crate::superfile::fts::positions::next_bit)), plus
+    /// each query position's member (`member_at`) and offset, then seek to
+    /// the first matching doc.
     pub(super) fn new(
         cursors: Vec<TermCursor>,
         positions: Vec<Bytes>,
         positional: Vec<(Option<TermMeta>, Option<u32>)>,
         member_at: Vec<usize>,
         offsets: Vec<u32>,
+        next_bits: Vec<u8>,
     ) -> Result<Self, FtsError> {
         debug_assert!(
             member_at.len() >= 2,
@@ -351,6 +395,7 @@ impl PhraseCursor {
         debug_assert_eq!(cursors.len(), positional.len());
         debug_assert_eq!(member_at.len(), offsets.len());
         debug_assert!(member_at.iter().all(|&m| m < cursors.len()));
+        debug_assert_eq!(cursors.len(), next_bits.len());
         debug_assert_eq!(offsets.first(), Some(&0), "offsets are normalized");
         debug_assert!(
             offsets.windows(2).all(|w| w[0] < w[1]),
@@ -384,9 +429,20 @@ impl PhraseCursor {
                     group_block: NO_BLOCK_CACHED,
                     tfs: Vec::new(),
                     tfs_block: NO_BLOCK_CACHED,
+                    sig_base: None,
+                    sig_block: NO_BLOCK_CACHED,
                 }
             })
             .collect();
+        // Each query-adjacent pair checks its first member's signature for
+        // the second's bit; a repeated term's pairs are checked once.
+        let mut adjacent_sigs: Vec<(usize, u8)> = (0..member_at.len() - 1)
+            .filter(|&q| offsets[q + 1] == offsets[q] + 1)
+            .map(|q| (member_at[q], next_bits[member_at[q + 1]]))
+            .filter(|&(m, _)| members[m].inline_position.is_none())
+            .collect();
+        adjacent_sigs.sort_unstable();
+        adjacent_sigs.dedup();
         // Rarest-first probe order for alignment: fewest posting blocks
         // (shortest list) first. Query order is preserved in `members`.
         let n_members = members.len();
@@ -418,6 +474,7 @@ impl PhraseCursor {
             cand_next: 0,
             cand_locs: vec![Vec::new(); n_members],
             kept: Vec::new(),
+            adjacent_sigs,
             refill_from: Some(0),
             filters: Vec::new(),
             batch_order,
@@ -681,10 +738,42 @@ impl PhraseCursor {
                 }
                 for &pj in &self.batch_order[..oi] {
                     if pj < n_members {
-                        compact_locs(&mut self.cand_locs[pj], &self.kept);
+                        compact(&mut self.cand_locs[pj], &self.kept);
                     }
                 }
             }
+            self.reject_by_signatures();
+        }
+    }
+
+    /// Drop the batch's candidates that a query-adjacent member pair rules
+    /// out by signature: member `i`'s signature at the candidate lacks the
+    /// next member's bit, so no occurrence of member `i` there is followed
+    /// by the next member's term, and the phrase cannot be in the doc. Most
+    /// candidates of a phrase of common words hold every member but not
+    /// the phrase, and each one dropped here is a doc whose positions are
+    /// never decoded. Runs before the ranked prescreen and verification,
+    /// which see the survivors exactly as they would have.
+    fn reject_by_signatures(&mut self) {
+        if self.adjacent_sigs.is_empty() || self.cands.is_empty() {
+            return;
+        }
+        let (members, locs, pairs) = (&mut self.members, &self.cand_locs, &self.adjacent_sigs);
+        self.kept.clear();
+        self.kept.extend((0..self.cands.len() as u32).filter(|&c| {
+            pairs.iter().all(|&(i, bit)| {
+                let (b, p) = locs[i][c as usize];
+                members[i].located_sig(b as usize, p as usize) & bit != 0
+            })
+        }));
+        if self.kept.len() == self.cands.len() {
+            return;
+        }
+        #[cfg(test)]
+        SIG_REJECTS.with(|n| n.set(n.get() + (self.cands.len() - self.kept.len()) as u64));
+        compact(&mut self.cands, &self.kept);
+        for member_locs in &mut self.cand_locs {
+            compact(member_locs, &self.kept);
         }
     }
 
@@ -949,6 +1038,7 @@ mod tests {
     use crate::{
         superfile::{
             fts::{
+                analysis::{Stemmer, Stopwords, chain_tokenizer},
                 builder::FtsBuilder,
                 reader::{BoolMode, FtsReader, QueryIdf, core::ClauseLists, cursor::CursorUse},
                 tokenize::Phrase,
@@ -1040,14 +1130,28 @@ mod tests {
                 false => vec![0, 1 << 20],
             };
             let beta: Vec<u32> = alpha.iter().map(|p| p + 1).collect();
-            b.add_prebuilt_term_posting(0, "alpha", FtsDocId::new(d), alpha.len() as u32, &alpha)
-                .expect("alpha");
-            b.add_prebuilt_term_posting(0, "beta", FtsDocId::new(d), beta.len() as u32, &beta)
-                .expect("beta");
+            b.add_prebuilt_term_posting(
+                0,
+                "alpha",
+                FtsDocId::new(d),
+                alpha.len() as u32,
+                &alpha,
+                SIG_UNKNOWN,
+            )
+            .expect("alpha");
+            b.add_prebuilt_term_posting(
+                0,
+                "beta",
+                FtsDocId::new(d),
+                beta.len() as u32,
+                &beta,
+                SIG_UNKNOWN,
+            )
+            .expect("beta");
             if d < 3 {
                 // Short-form member (df = 3) with two positions each.
                 let rare = [beta[0] + 1, beta[0] + 7];
-                b.add_prebuilt_term_posting(0, "rare", FtsDocId::new(d), 2, &rare)
+                b.add_prebuilt_term_posting(0, "rare", FtsDocId::new(d), 2, &rare, SIG_UNKNOWN)
                     .expect("rare");
             }
         }
@@ -1302,9 +1406,9 @@ mod tests {
             .collect();
         let filler: Vec<u32> = alpha.iter().map(|p| p + 1).collect();
         for d in 0..N_DOCS {
-            b.add_prebuilt_term_posting(0, "alpha", FtsDocId::new(d), TF, &alpha)
+            b.add_prebuilt_term_posting(0, "alpha", FtsDocId::new(d), TF, &alpha, SIG_UNKNOWN)
                 .expect("alpha");
-            b.add_prebuilt_term_posting(0, "filler", FtsDocId::new(d), TF, &filler)
+            b.add_prebuilt_term_posting(0, "filler", FtsDocId::new(d), TF, &filler, SIG_UNKNOWN)
                 .expect("filler");
         }
         b.append_prebuilt_doc_lengths(0, &vec![2 * TF + OUTLIER_GAP; N_DOCS as usize]);
@@ -1608,6 +1712,232 @@ mod tests {
             let expected_docs: Vec<u32> = expected.iter().map(|&(d, _)| d).collect();
             assert_eq!(docs_seen, expected_docs, "unscored {terms:?}");
         }
+    }
+
+    /// Docs in the signature corpus: both common words span many blocks.
+    const SIG_DOCS: u32 = 4_000;
+
+    /// The signature corpus: `american` and `south` each in about a third
+    /// of the docs, mostly apart, sometimes as the phrase; `delta` in a few
+    /// dozen (a short-form term); `unique` once (an inline term).
+    fn signature_corpus() -> Vec<Vec<&'static str>> {
+        const FILLER: [&str; 8] = [
+            "river", "city", "state", "wind", "road", "north", "lake", "hill",
+        ];
+        let mut x: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut rng = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let mut docs: Vec<Vec<&str>> = (0..SIG_DOCS)
+            .map(|_| {
+                let len = 3 + rng(30) as usize;
+                let mut d: Vec<&str> = (0..len)
+                    .map(|_| match rng(20) {
+                        0..=1 => "american",
+                        2..=3 => "south",
+                        r => FILLER[r as usize % FILLER.len()],
+                    })
+                    .collect();
+                if rng(25) == 0 {
+                    let at = rng(d.len() as u64) as usize;
+                    d.splice(at..at, ["american", "south"]);
+                }
+                if rng(80) == 0 {
+                    let at = rng(d.len() as u64) as usize;
+                    d.insert(at, "delta");
+                }
+                d
+            })
+            .collect();
+        docs[17].extend(["american", "unique", "south"]);
+        docs
+    }
+
+    /// `docs` built positional, its signatures written unless `omit`, the
+    /// accumulator spilled from the first doc when `spill`.
+    fn open_signature_index(docs: &[Vec<&str>], omit: bool, spill: bool) -> FtsReader {
+        let mut b = FtsBuilder::new();
+        b.omit_signatures = omit;
+        if spill {
+            b.set_spill_threshold_bytes(1);
+        }
+        b.register_column("title".into(), true).expect("register");
+        for (i, d) in docs.iter().enumerate() {
+            b.add_doc(0, i as u32, &d.join(" ")).expect("add doc");
+        }
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// The phrase's `(doc, tf)` through the scored walk and its docs
+    /// through the unscored one, each checked against `expected`.
+    async fn walk_phrase(r: &FtsReader, terms: &[&str], expected: &[(u32, u32)]) {
+        let norms = r.columns[0].dl_norm_k1();
+        let mut scored = phrase_cursor(r, terms, CursorUse::Score).await;
+        let mut seen = Vec::new();
+        while !scored.is_exhausted() {
+            seen.push((scored.current_doc_id(), scored.current_tf));
+            let next = scored.current_doc_id() + 1;
+            scored
+                .seek_match(next, f32::NEG_INFINITY, Some(norms))
+                .expect("seek");
+        }
+        assert_eq!(seen, expected, "scored {terms:?}");
+        let mut matched = phrase_cursor(r, terms, CursorUse::Match).await;
+        let mut docs_seen = Vec::new();
+        while !matched.is_exhausted() {
+            docs_seen.push(matched.current_doc_id());
+            let next = matched.current_doc_id() + 1;
+            matched.skip_to(next).expect("skip");
+        }
+        let expected_docs: Vec<u32> = expected.iter().map(|&(d, _)| d).collect();
+        assert_eq!(docs_seen, expected_docs, "unscored {terms:?}");
+    }
+
+    /// The phrase's ranked top `k` hits, scores as bits, and its match
+    /// count.
+    async fn ranked(r: &FtsReader, terms: &[&str], k: usize) -> (Vec<(u32, u32)>, u64) {
+        let phrases = phrase(terms);
+        let (hits, count) = r
+            .search_excluding_with_count(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                k,
+            )
+            .await
+            .expect("ranked phrase search");
+        let hits = hits.iter().map(|&(d, s)| (d.get(), s.to_bits())).collect();
+        (hits, count)
+    }
+
+    /// Candidates rejected by signature on this thread while `f` runs.
+    async fn sig_rejects(f: impl Future<Output = ()>) -> u64 {
+        SIG_REJECTS.with(|n| n.set(0));
+        f.await;
+        SIG_REJECTS.with(|n| n.get())
+    }
+
+    /// Phrases over common words spanning many blocks, with rare, short-form
+    /// and inline members, a repeated word and three-word phrases: matches,
+    /// tfs, ranked scores to the bit and counts are what a text scan and an
+    /// index without signatures give, built in RAM or spilled — and the
+    /// signatures do reject most of the docs that hold the words apart.
+    #[tokio::test]
+    async fn adjacency_signatures_reject_candidates_and_change_no_result() {
+        let docs = signature_corpus();
+        let signed = open_signature_index(&docs, false, false);
+        let spilled = open_signature_index(&docs, false, true);
+        let unsigned = open_signature_index(&docs, true, false);
+        let expected_of = |terms: &[&str]| -> Vec<(u32, u32)> {
+            docs.iter()
+                .enumerate()
+                .filter_map(|(i, d)| {
+                    let tf = d.windows(terms.len()).filter(|w| *w == terms).count() as u32;
+                    (tf > 0).then_some((i as u32, tf))
+                })
+                .collect()
+        };
+        let phrases: [&[&str]; 10] = [
+            &["american", "south"],
+            &["south", "american", "south"],
+            &["south", "american"],
+            &["american", "south", "river"],
+            &["river", "american", "south"],
+            &["american", "american"],
+            &["delta", "south"],
+            &["american", "delta"],
+            &["american", "unique", "south"],
+            &["unique", "south"],
+        ];
+        for terms in phrases {
+            let expected = expected_of(terms);
+            assert!(!expected.is_empty(), "{terms:?} occurs");
+            for r in [&signed, &spilled, &unsigned] {
+                walk_phrase(r, terms, &expected).await;
+            }
+            let want = ranked(&unsigned, terms, 50).await;
+            assert_eq!(want.1, expected.len() as u64, "count {terms:?}");
+            assert_eq!(ranked(&signed, terms, 50).await, want, "ranked {terms:?}");
+            assert_eq!(ranked(&spilled, terms, 50).await, want, "spilled {terms:?}");
+        }
+
+        // The filter fires: of the docs holding both words but not the
+        // phrase, most are rejected by signature (one whose `american` is
+        // followed only by other words keeps `south`'s bit only by a hash
+        // collision); without signatures, none are.
+        let terms: &[&str] = &["american", "south"];
+        let expected = expected_of(terms);
+        let apart = docs
+            .iter()
+            .filter(|d| d.contains(&"american") && d.contains(&"south"))
+            .count()
+            - expected.len();
+        assert!(apart > 1_000, "premise: many docs hold the words apart");
+        for r in [&signed, &spilled] {
+            // The scored and the unscored walk each reject at least half.
+            let rejected = sig_rejects(walk_phrase(r, terms, &expected)).await;
+            assert!(
+                rejected >= apart as u64,
+                "rejected {rejected} of 2 x {apart}"
+            );
+        }
+        assert_eq!(
+            sig_rejects(walk_phrase(&unsigned, terms, &expected)).await,
+            0
+        );
+    }
+
+    /// Members a removed stopword holds apart are not checked by signature:
+    /// what follows the first in a match is the hole, never the second, so
+    /// a check there would reject every match. Only the adjacent pair is.
+    #[tokio::test]
+    async fn a_stopword_gap_is_not_checked_by_signature() {
+        let docs = ["x the y z", "x y z", "x a y", "y x the z", "x the y w"];
+        let mut b = FtsBuilder::new();
+        b.register_column_with_tokenizer(
+            "title".into(),
+            true,
+            chain_tokenizer(Stopwords::English, Stemmer::None),
+            bm25::Bm25Params::STANDARD,
+        )
+        .expect("register");
+        for (i, text) in docs.iter().enumerate() {
+            b.add_doc(0, i as u32, text).expect("add doc");
+        }
+        let json = r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true,"stopwords":"english"}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let search = async |terms: &[&str], offsets: Vec<u32>| {
+            let phrases = vec![Phrase {
+                terms: terms.iter().map(|t| t.to_string()).collect(),
+                offsets,
+            }];
+            let hits = r
+                .search_excluding(
+                    "title",
+                    ClauseLists {
+                        should_phrases: &phrases,
+                        ..ClauseLists::default()
+                    },
+                    10,
+                    f32::NEG_INFINITY,
+                )
+                .await
+                .expect("phrase search");
+            let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
+            ids.sort_unstable();
+            ids
+        };
+        // "x the y": x and y two apart, nothing at the hole.
+        assert_eq!(search(&["x", "y"], vec![0, 2]).await, [0, 2, 4]);
+        // "x the y z": the gap pair is skipped, the adjacent pair checked.
+        assert_eq!(search(&["x", "y", "z"], vec![0, 2, 3]).await, [0]);
     }
 
     /// A phrase built to match, not rank, carries no idf and a 0 bound:

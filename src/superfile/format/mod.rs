@@ -158,6 +158,31 @@ pub mod fts {
     /// fail mid-query.
     pub const VERSION_V10: u32 = 10;
 
+    /// The version written once a positional column's position groups may
+    /// carry each posting's **adjacency signature**: one byte per posting,
+    /// right after the group header, under group headers of their own (3
+    /// for a fixed-table packed group, 4 for a LEB128 one). Bit `b` of the
+    /// signature of `(term, doc)` is set when some occurrence of the term is
+    /// immediately followed, one position on, by a token whose hash picks
+    /// `b`.
+    ///
+    /// An exact phrase `t u` can only match a document whose signature for
+    /// `t` has `u`'s bit. Most documents holding every word of a phrase do
+    /// not hold the phrase, and each of them used to cost a decode of every
+    /// member's positions before verification rejected it; the signature
+    /// rejects most of them from one byte per member, before any position
+    /// is read. A set bit proves nothing, so verification still decides
+    /// every survivor, and results are what they were.
+    ///
+    /// Like `V10`, the change lives inside a group that says which form it
+    /// takes: a `V11` reader reads a `V10` file's groups unchanged, finding
+    /// no signatures and filtering nothing, and a merge carries each
+    /// posting's signature across, or the unknown signature that never
+    /// rejects where an older input has none. The version moves because a
+    /// `V10` reader would reject a group header it does not know, and
+    /// should refuse the file whole rather than fail mid-query.
+    pub const VERSION_V11: u32 = 11;
+
     /// Whether `version` stores the scorer's length buckets and the widened
     /// doc-lengths directory entry that describes them.
     pub const fn has_stored_buckets(version: u32) -> bool {
@@ -188,7 +213,7 @@ pub mod fts {
     /// from the highest known version would mark every plain file stale and
     /// have a reindex re-emit the same version forever. It is the version a
     /// plain build writes, which is what the builder's own test asserts.
-    pub const VERSION_CURRENT: u32 = VERSION_V10;
+    pub const VERSION_CURRENT: u32 = VERSION_V11;
 
     /// Bytes per stored document length: a `u16`, saturating at
     /// [`DOC_LENGTH_STORED_MAX`]. The scorer reads a one-byte bucket of
@@ -766,7 +791,7 @@ mod tests {
     fn the_current_version_is_readable_and_below_the_newest() {
         const {
             assert!(fts::VERSION_MIN <= fts::VERSION_CURRENT);
-            assert!(fts::VERSION_CURRENT <= fts::VERSION_V10);
+            assert!(fts::VERSION_CURRENT <= fts::VERSION_V11);
         }
     }
 
