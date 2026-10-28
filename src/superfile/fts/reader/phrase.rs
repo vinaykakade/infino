@@ -112,19 +112,12 @@ impl PhraseMember {
         self.tfs[pair]
     }
 
-    /// The member's positions in its `pair`-th posting of block `block`,
-    /// decoded into `pos_scratch`. Reads the block's tfs and position group
-    /// once per block and the posting's run alone: the doc ids are never
-    /// expanded, and no cursor is walked to the doc.
-    fn located_positions(&mut self, block: usize, pair: usize) -> Result<(), FtsError> {
-        self.pos_scratch.clear();
-        if let Some(p) = self.inline_position {
-            self.pos_scratch.push(p);
-            return Ok(());
-        }
+    /// Block `block`'s tfs and position group located for per-run access,
+    /// once per block. A PFOR member only; an inline member has neither.
+    fn locate_group(&mut self, block: usize) -> Result<(), FtsError> {
         self.ensure_tfs(block);
-        let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
         if self.group_block != block {
+            let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
             let mut at =
                 term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
             self.group_index
@@ -136,6 +129,20 @@ impl PhraseMember {
                 })?;
             self.group_block = block;
         }
+        Ok(())
+    }
+
+    /// The member's positions in its `pair`-th posting of block `block`,
+    /// decoded into `pos_scratch`. Reads the block's tfs and position group
+    /// once per block and the posting's run alone: the doc ids are never
+    /// expanded, and no cursor is walked to the doc.
+    fn located_positions(&mut self, block: usize, pair: usize) -> Result<(), FtsError> {
+        self.pos_scratch.clear();
+        if let Some(p) = self.inline_position {
+            self.pos_scratch.push(p);
+            return Ok(());
+        }
+        self.locate_group(block)?;
         self.group_index
             .run_positions(&self.positions, pair, self.tfs[pair], &mut self.pos_scratch)
             .ok_or_else(|| {
@@ -145,6 +152,44 @@ impl PhraseMember {
             })?;
         Ok(())
     }
+
+    /// Keep the phrase starts (ascending, in place) that this member
+    /// confirms at its `pair`-th posting of block `block`: those with
+    /// `start + off` among the posting's positions. The run is merged
+    /// against the targets as it is summed ([`GroupIndex::retain_matching`]),
+    /// never decoded past the last target, nor past the first confirmed start
+    /// when `first_only`.
+    fn retain_located(
+        &mut self,
+        block: usize,
+        pair: usize,
+        off: u32,
+        starts: &mut Vec<u32>,
+        first_only: bool,
+    ) -> Result<(), FtsError> {
+        if let Some(p) = self.inline_position {
+            starts.retain(|&s| s.checked_add(off) == Some(p));
+            if first_only {
+                starts.truncate(1);
+            }
+            return Ok(());
+        }
+        self.locate_group(block)?;
+        self.group_index
+            .retain_matching(
+                &self.positions,
+                pair,
+                self.tfs[pair],
+                off,
+                starts,
+                first_only,
+            )
+            .ok_or_else(|| {
+                FtsError::Read(ReadError::Malformed(
+                    "position run truncated or overflowing".into(),
+                ))
+            })
+    }
 }
 
 /// The phrase's occurrences at one aligned doc, verified in stages,
@@ -152,19 +197,31 @@ impl PhraseMember {
 /// position `q`'s term (member `member_at[q]`) at `s + offsets[q]`, so the
 /// rarest query position (`order[0]`) seeds the candidate starts and each
 /// other one, in `order`, keeps the starts it confirms, compacted in place
-/// in `starts`. A member's positions are only read (`positions_of`, which
-/// fills its `pos_scratch`) once some start survives every rarer member, so
-/// on the many docs a rare member rejects the common members' runs are
-/// never decoded. `order` lists the query positions of one member
-/// consecutively, so its positions are read once. Returns the surviving
-/// starts: the phrase's tf at the doc.
+/// in `starts`. A member's positions are only read once some start survives
+/// every rarer member, so on the many docs a rare member rejects the common
+/// members' runs are never decoded.
+///
+/// A phrase of distinct terms confirms each later member by `retain`, which
+/// merges its run against the starts' targets as the run is summed and
+/// stops at the last target — and, with `first_only`, at the first start
+/// the last member confirms, since an unscored phrase needs one anchor, not
+/// its count. Only the last member may stop early: a start it confirms is
+/// the phrase, but a start an earlier member confirms could still fall at
+/// a later one while a dropped start would have passed. A phrase that
+/// repeats a term reads each member's positions once (`positions_of`,
+/// filling its `pos_scratch`) and searches them per query position;
+/// `order` lists a member's query positions consecutively for that.
+/// Returns the surviving starts: the phrase's tf at the doc, or 1 for a
+/// match settled early.
 fn verify_members(
     members: &mut [PhraseMember],
     member_at: &[usize],
     order: &[usize],
     offsets: &[u32],
     starts: &mut Vec<u32>,
+    first_only: bool,
     mut positions_of: impl FnMut(&mut PhraseMember, usize) -> Result<(), FtsError>,
+    mut retain: impl FnMut(&mut PhraseMember, usize, u32, &mut Vec<u32>, bool) -> Result<(), FtsError>,
 ) -> Result<u32, FtsError> {
     let anchor = order[0];
     let mut read = member_at[anchor];
@@ -176,6 +233,23 @@ fn verify_members(
             .iter()
             .filter_map(|&p| p.checked_sub(offsets[anchor])),
     );
+    if members.len() == member_at.len() {
+        let last = order.len() - 1;
+        for (i, &q) in order.iter().enumerate().skip(1) {
+            if starts.is_empty() {
+                break;
+            }
+            let m = member_at[q];
+            retain(
+                &mut members[m],
+                m,
+                offsets[q],
+                starts,
+                first_only && i == last,
+            )?;
+        }
+        return Ok(starts.len() as u32);
+    }
     for &q in &order[1..] {
         if starts.is_empty() {
             break;
@@ -697,9 +771,14 @@ impl PhraseCursor {
             &self.verify_order,
             &self.position_offsets,
             &mut self.verify_scratch,
+            self.idf_weight == 0.0,
             |m, j| {
                 let (b, p) = locs[j][c];
                 m.located_positions(b as usize, p as usize)
+            },
+            |m, j, off, starts, first_only| {
+                let (b, p) = locs[j][c];
+                m.retain_located(b as usize, p as usize, off, starts, first_only)
             },
         )?;
         Ok(self.current_tf)
@@ -725,9 +804,15 @@ impl PhraseCursor {
             &self.verify_order,
             &self.position_offsets,
             &mut self.verify_scratch,
+            self.idf_weight == 0.0,
             |m, _| {
                 m.cursor.materialize_at(aligned);
                 m.decode_current_positions()
+            },
+            |m, _, off, starts, first_only| {
+                m.cursor.materialize_at(aligned);
+                let (b, p) = (m.cursor.current_block, m.cursor.pos);
+                m.retain_located(b, p, off, starts, first_only)
             },
         )?;
         Ok(self.current_tf)

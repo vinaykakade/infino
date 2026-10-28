@@ -576,28 +576,25 @@ impl GroupIndex {
         // grew the vector through memory for every pair of every block.
         self.starts.clear();
         self.starts.resize(tfs.len() + 1, 0);
+        // A packed pair's lanes are its gaps (its first position is in the
+        // other stream); a LEB128 pair's are all its values. Decided once:
+        // a match inside the loop kept it from running as a plain sum.
+        let gaps_only = self.kind == GroupKind::Packed;
         let mut acc = 0u32;
-        let lanes_per_pair = |tf: u32| match self.kind {
-            GroupKind::Packed => tf.saturating_sub(1),
-            _ => tf,
-        };
         for (slot, &tf) in self.starts[1..].iter_mut().zip(tfs) {
-            acc += lanes_per_pair(tf);
+            acc += match gaps_only {
+                true => tf.saturating_sub(1),
+                false => tf,
+            };
             *slot = acc;
         }
         Some(())
     }
 
-    /// The absolute positions of pair `pair` (whose term frequency is
-    /// `tf`), appended to `out`. `None` on an overflowing gap.
-    pub(crate) fn run_positions(
-        &mut self,
-        bytes: &[u8],
-        pair: usize,
-        tf: u32,
-        out: &mut Vec<u32>,
-    ) -> Option<()> {
-        let start = *self.starts.get(pair)? as usize;
+    /// Switch to the bulk decode once the block proves dense (see
+    /// [`BULK_AFTER_RUNS`]). `None` when a stream does not read whole.
+    #[inline]
+    fn maybe_bulk(&mut self, bytes: &[u8], pair: usize) -> Option<()> {
         if self.kind == GroupKind::Packed
             && self.served >= BULK_AFTER_RUNS
             && pair < self.served as usize * BULK_MAX_STRIDE
@@ -612,6 +609,188 @@ impl GroupIndex {
             self.gap.read_lanes_into(bytes, 0, &mut self.gaps)?;
             self.kind = GroupKind::Bulk;
         }
+        Some(())
+    }
+
+    /// Keep, in place, the ascending `starts` whose `start + off` is a
+    /// position of pair `pair` (term frequency `tf`). The run is read once
+    /// as a running sum merged against those targets, so it is never decoded
+    /// past the last target, nor, with `first_only`, past the first kept
+    /// start: an unscored phrase needs one anchor at the doc, not how many.
+    /// `None` on an overflowing gap or a pair past the block, after which
+    /// `starts` is unspecified.
+    pub(crate) fn retain_matching(
+        &mut self,
+        bytes: &[u8],
+        pair: usize,
+        tf: u32,
+        off: u32,
+        starts: &mut Vec<u32>,
+        first_only: bool,
+    ) -> Option<()> {
+        let start = *self.starts.get(pair)? as usize;
+        self.maybe_bulk(bytes, pair)?;
+        self.served += 1;
+        let mut merge = TargetMerge::new(starts, off, first_only);
+        match self.kind {
+            GroupKind::Leb128 => {
+                let (first, gaps) = self.values.get(start..start + tf as usize)?.split_first()?;
+                merge.first(*first);
+                merge.gaps(gaps)?;
+            }
+            GroupKind::Bulk => {
+                merge.first(*self.firsts.get(pair)?);
+                merge.gaps(self.gaps.get(start..start + tf as usize - 1)?)?;
+            }
+            GroupKind::Packed => {
+                merge.first(self.first.lane(bytes, pair)?);
+                let n = tf as usize - 1;
+                if n < SMALL_TF {
+                    // A short run: its lanes straight out of the payload.
+                    for k in 0..n {
+                        if merge.done() {
+                            break;
+                        }
+                        merge.gap(self.gap.lane(bytes, start + k)?)?;
+                    }
+                } else {
+                    // A long run, a group of lanes at a time, so a match near
+                    // its head leaves the rest of it packed.
+                    let mut chunk = [0u32; RETAIN_CHUNK];
+                    let mut k = 0usize;
+                    while k < n && !merge.done() {
+                        let len = RETAIN_CHUNK.min(n - k);
+                        self.gap
+                            .read_lanes_into(bytes, start + k, &mut chunk[..len])?;
+                        merge.gaps(&chunk[..len])?;
+                        k += len;
+                    }
+                }
+            }
+        }
+        merge.finish();
+        Some(())
+    }
+}
+
+/// Gap lanes a long run is read in per step by [`GroupIndex::retain_matching`]:
+/// one unpack group, so each step is one straight unpack.
+const RETAIN_CHUNK: usize = 8;
+
+/// The merge of a run's positions, fed as a running sum, against the
+/// ascending targets `start + off` of a phrase's candidate starts, which it
+/// compacts in place to the starts it confirms.
+struct TargetMerge<'a> {
+    starts: &'a mut Vec<u32>,
+    off: u32,
+    first_only: bool,
+    /// Next start to confirm, and where the next confirmed one is written.
+    read: usize,
+    write: usize,
+    /// The last position fed.
+    pos: u32,
+    done: bool,
+}
+
+impl<'a> TargetMerge<'a> {
+    fn new(starts: &'a mut Vec<u32>, off: u32, first_only: bool) -> Self {
+        let done = starts.is_empty();
+        Self {
+            starts,
+            off,
+            first_only,
+            read: 0,
+            write: 0,
+            pos: 0,
+            done,
+        }
+    }
+
+    /// Whether the run can settle no further start.
+    #[inline(always)]
+    fn done(&self) -> bool {
+        self.done
+    }
+
+    /// The target the next unconfirmed start asks for, or `None` past the
+    /// last start or on an overflowing one (every later start overflows
+    /// too, as they ascend).
+    #[inline(always)]
+    fn target(&self) -> Option<u32> {
+        self.starts.get(self.read)?.checked_add(self.off)
+    }
+
+    /// One position of the run, in ascending order.
+    #[inline(always)]
+    fn at(&mut self, p: u32) {
+        // Pass the targets the run has moved beyond: they are not in it.
+        loop {
+            match self.target() {
+                Some(t) if t < p => self.read += 1,
+                Some(t) if t == p => {
+                    self.starts[self.write] = self.starts[self.read];
+                    self.write += 1;
+                    self.read += 1;
+                    if self.first_only {
+                        self.done = true;
+                    }
+                    break;
+                }
+                Some(_) => break,
+                None => {
+                    self.done = true;
+                    break;
+                }
+            }
+        }
+        if !self.done && self.target().is_none() {
+            self.done = true;
+        }
+    }
+
+    #[inline(always)]
+    fn first(&mut self, p: u32) {
+        self.pos = p;
+        self.at(p);
+    }
+
+    #[inline(always)]
+    fn gap(&mut self, g: u32) -> Option<()> {
+        self.pos = self.pos.checked_add(g)?;
+        self.at(self.pos);
+        Some(())
+    }
+
+    /// Gaps fed until the merge is done; the rest are not summed.
+    #[inline(always)]
+    fn gaps(&mut self, gaps: &[u32]) -> Option<()> {
+        for &g in gaps {
+            if self.done {
+                break;
+            }
+            self.gap(g)?;
+        }
+        Some(())
+    }
+
+    fn finish(self) {
+        let w = self.write;
+        self.starts.truncate(w);
+    }
+}
+
+impl GroupIndex {
+    /// The absolute positions of pair `pair` (whose term frequency is
+    /// `tf`), appended to `out`. `None` on an overflowing gap.
+    pub(crate) fn run_positions(
+        &mut self,
+        bytes: &[u8],
+        pair: usize,
+        tf: u32,
+        out: &mut Vec<u32>,
+    ) -> Option<()> {
+        let start = *self.starts.get(pair)? as usize;
+        self.maybe_bulk(bytes, pair)?;
         self.served += 1;
         match self.kind {
             GroupKind::Leb128 => {
