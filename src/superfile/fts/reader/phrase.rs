@@ -557,7 +557,63 @@ impl PhraseCursor {
     /// ≥ `from`: the block-batched walk of [`Self::seek_match`] with no bar,
     /// so no tf is compared and no doc is pre-screened.
     pub(super) fn seek_match_unranked(&mut self, from: u32) -> Result<(), FtsError> {
+        if self.members.len() == 2 && self.member_at.len() == 2 && self.filters.is_empty() {
+            return self.seek_match_pairwise(from);
+        }
         self.seek_match(from, f32::NEG_INFINITY, None)
+    }
+
+    /// The unranked walk for a phrase of two distinct words with no filter
+    /// terms, a doc at a time: the rarer member's cursor walks its docs, the
+    /// other member locates each one by its probe cursor (a rank on a dense
+    /// block, a step on a decoded one), and the two located pairs are
+    /// verified there. No candidate list, no locations recorded or
+    /// compacted: a count keeps nothing from one doc to the next, so the
+    /// batch's bookkeeping is pure cost here. Leaves the cursors as the
+    /// batched walk would: the driver's walk cursor and the other member's
+    /// probe moved.
+    fn seek_match_pairwise(&mut self, from: u32) -> Result<(), FtsError> {
+        let (ma, mo) = (self.align_order[0], self.align_order[1]);
+        self.members[ma].cursor.skip_to(from);
+        loop {
+            let d = &self.members[ma].cursor;
+            if d.is_exhausted() {
+                break;
+            }
+            let doc = d.current_doc_id();
+            let Some((bo, po)) = self.members[mo].probe.locate_doc(doc) else {
+                if self.members[mo].probe.is_exhausted() {
+                    break;
+                }
+                self.members[ma].cursor.next();
+                continue;
+            };
+            // The driver may hold a dense block lazily; its pair index needs
+            // the whole block.
+            let d = &mut self.members[ma].cursor;
+            d.hold_whole_block();
+            let (ba, pa) = (d.current_block, d.pos);
+            let tf = verify_members(
+                &mut self.members,
+                &self.member_at,
+                &self.verify_order,
+                &self.position_offsets,
+                &mut self.verify_scratch,
+                |m, j| match j == ma {
+                    true => m.located_positions(ba, pa),
+                    false => m.located_positions(bo as usize, po as usize),
+                },
+            )?;
+            if tf > 0 {
+                self.current_doc = doc;
+                self.current_tf = tf;
+                return Ok(());
+            }
+            self.members[ma].cursor.next();
+        }
+        self.current_doc = u32::MAX;
+        self.current_tf = 0;
+        Ok(())
     }
 
     /// Advance to the first verified phrase match at doc ≥ `from`, a block
@@ -1733,13 +1789,9 @@ mod tests {
             pc.members[1].inline_position.is_some(),
             "premise: an inline member"
         );
-        // Construction verified the one candidate unranked; rewind the batch
-        // so the ranked walk reads it again, now under a bar at half its
-        // score.
-        assert_eq!(
-            (pc.current_doc_id(), pc.cands.as_slice()),
-            (150, &[150][..])
-        );
+        // Construction verified the one match unranked; rewind so the
+        // ranked walk reads it again, now under a bar at half its score.
+        assert_eq!(pc.current_doc_id(), 150);
         let bar = pc.score_current(norms.get(150)) / 2.0;
         pc.cand_next = 0;
         pc.current_doc = 0;

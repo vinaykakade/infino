@@ -1192,6 +1192,38 @@ impl TermCursor {
         docs.truncate(w);
     }
 
+    /// Where this term holds `doc`, when it does: the block and the pair
+    /// index within it — the one-doc form of
+    /// [`Self::retain_contained_located`]. Docs arrive ascending: the block
+    /// cursor only moves forward, a dense block answers by rank with its
+    /// header parsed once, and a packed block is decoded once and stepped
+    /// from the last doc asked. Moves `current_block`, so a cursor probed
+    /// this way must not also be iterated.
+    #[inline]
+    pub(super) fn locate_doc(&mut self, doc: u32) -> Option<(u32, u32)> {
+        if self.predecoded {
+            let ids = &self.block_doc_ids[..self.block_n];
+            return ids.binary_search(&doc).ok().map(|p| (0, p as u32));
+        }
+        if !self.advance_current_block_to(doc) {
+            return None;
+        }
+        let b = self.current_block;
+        let block = self.blocks[b];
+        let hdr = self.current_header();
+        if is_dense_encoding(hdr.encoding) {
+            let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+            return Self::dense_rank(raw, &hdr, doc).map(|r| (b as u32, r as u32));
+        }
+        if self.decoded_block != b {
+            self.decode_current_block();
+        }
+        let ids = &self.block_doc_ids[..self.block_n];
+        let p = seek_sorted::<false>(ids, self.pos.min(ids.len()), doc);
+        self.pos = p.min(ids.len().saturating_sub(1));
+        (p < ids.len() && ids[p] == doc).then_some((b as u32, p as u32))
+    }
+
     /// Block `b`'s tfs, decoded into `out` (resized to the block's count)
     /// without expanding its doc ids. A pre-decoded cursor's single block is
     /// its buffer.
