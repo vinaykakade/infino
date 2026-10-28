@@ -20,7 +20,10 @@ use super::{
 use crate::superfile::{
     ReadError,
     error::FtsError,
-    fts::{bm25, positions::GroupIndex},
+    fts::{
+        bm25,
+        positions::{GroupIndex, SHORT_RUN_TF},
+    },
 };
 
 /// One distinct term of a [`PhraseCursor`] ([`distinct_members`]): its
@@ -112,19 +115,13 @@ impl PhraseMember {
         self.tfs[pair]
     }
 
-    /// The member's positions in its `pair`-th posting of block `block`,
-    /// decoded into `pos_scratch`. Reads the block's tfs and position group
-    /// once per block and the posting's run alone: the doc ids are never
-    /// expanded, and no cursor is walked to the doc.
-    fn located_positions(&mut self, block: usize, pair: usize) -> Result<(), FtsError> {
-        self.pos_scratch.clear();
-        if let Some(p) = self.inline_position {
-            self.pos_scratch.push(p);
-            return Ok(());
-        }
+    /// Block `block`'s tfs and position group located for per-run access,
+    /// once per block. A PFOR member only; an inline member has neither.
+    #[inline]
+    fn locate_group(&mut self, block: usize) -> Result<(), FtsError> {
         self.ensure_tfs(block);
-        let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
         if self.group_block != block {
+            let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
             let mut at =
                 term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
             self.group_index
@@ -136,6 +133,20 @@ impl PhraseMember {
                 })?;
             self.group_block = block;
         }
+        Ok(())
+    }
+
+    /// The member's positions in its `pair`-th posting of block `block`,
+    /// decoded into `pos_scratch`. Reads the block's tfs and position group
+    /// once per block and the posting's run alone: the doc ids are never
+    /// expanded, and no cursor is walked to the doc.
+    fn located_positions(&mut self, block: usize, pair: usize) -> Result<(), FtsError> {
+        self.pos_scratch.clear();
+        if let Some(p) = self.inline_position {
+            self.pos_scratch.push(p);
+            return Ok(());
+        }
+        self.locate_group(block)?;
         self.group_index
             .run_positions(&self.positions, pair, self.tfs[pair], &mut self.pos_scratch)
             .ok_or_else(|| {
@@ -609,7 +620,10 @@ impl PhraseCursor {
                         continue;
                     }
                 }
-                let tf = self.verify_located(c)?;
+                let tf = match self.verify_pair_located(c)? {
+                    Some(tf) => tf,
+                    None => self.verify_located(c)?,
+                };
                 if tf > 0 {
                     self.current_doc = s;
                     self.current_tf = tf;
@@ -684,6 +698,67 @@ impl PhraseCursor {
                 }
             }
         }
+    }
+
+    /// The common case of a two-word phrase at candidate `c`, settled with
+    /// two lane reads and no scratch: the rarer word occurs once in the doc,
+    /// so the phrase's one possible start is that position, and the other
+    /// word's run is short enough to probe for the one target in place.
+    /// `Some(tf)` (0 or 1) when it applies; `None` hands the candidate to
+    /// [`Self::verify_located`] — a longer run, a repeated anchor, a phrase
+    /// of more words, or an inline member.
+    #[inline]
+    fn verify_pair_located(&mut self, c: usize) -> Result<Option<u32>, FtsError> {
+        if self.member_at.len() != 2 || self.members.len() != 2 {
+            return Ok(None);
+        }
+        let (qa, qo) = (self.verify_order[0], self.verify_order[1]);
+        let (ma, mo) = (self.member_at[qa], self.member_at[qo]);
+        if self.members[ma].inline_position.is_some() || self.members[mo].inline_position.is_some()
+        {
+            return Ok(None);
+        }
+        let (ba, pa) = self.cand_locs[ma][c];
+        let (bo, po) = self.cand_locs[mo][c];
+        let anchor = &mut self.members[ma];
+        anchor.locate_group(ba as usize)?;
+        if anchor.tfs[pa as usize] != 1 {
+            return Ok(None);
+        }
+        let other = &mut self.members[mo];
+        other.locate_group(bo as usize)?;
+        let tf_o = other.tfs[po as usize];
+        if tf_o > SHORT_RUN_TF {
+            return Ok(None);
+        }
+        let anchor = &mut self.members[ma];
+        let at = anchor
+            .group_index
+            .first_position(&anchor.positions, pa as usize)
+            .ok_or_else(|| {
+                FtsError::Read(ReadError::Malformed(
+                    "position run truncated or overflowing".into(),
+                ))
+            })?;
+        // The phrase would start `offsets[qa]` before the anchor's position
+        // and put the other word `offsets[qo]` after that start.
+        let target = at
+            .checked_sub(self.position_offsets[qa])
+            .and_then(|start| start.checked_add(self.position_offsets[qo]));
+        let Some(target) = target else {
+            return Ok(Some(0));
+        };
+        let other = &mut self.members[mo];
+        let held = other
+            .group_index
+            .short_run_holds(&other.positions, po as usize, tf_o, target)
+            .ok_or_else(|| {
+                FtsError::Read(ReadError::Malformed(
+                    "position run truncated or overflowing".into(),
+                ))
+            })?;
+        self.current_tf = u32::from(held);
+        Ok(Some(self.current_tf))
     }
 
     /// [`Self::verify_at_aligned`] for candidate `c` of the current batch,

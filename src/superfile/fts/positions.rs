@@ -498,6 +498,9 @@ enum GroupKind {
 const BULK_AFTER_RUNS: u32 = 2;
 /// Runs up to this many positions bypass the generic lane reader.
 const SMALL_TF: usize = 4;
+/// Runs up to this many positions are probed for one target lane by lane
+/// ([`GroupIndex::short_run_holds`]); longer ones decode whole.
+pub(crate) const SHORT_RUN_TF: u32 = SMALL_TF as u32;
 const BULK_MAX_STRIDE: usize = 4;
 
 /// A position group located for **per-run** access: one pair's run is
@@ -588,6 +591,75 @@ impl GroupIndex {
         Some(())
     }
 
+    /// Switch to the bulk decode once the block proves dense (see
+    /// [`BULK_AFTER_RUNS`]). `None` when a stream does not read whole.
+    #[inline]
+    fn maybe_bulk(&mut self, bytes: &[u8], pair: usize) -> Option<()> {
+        if self.kind == GroupKind::Packed
+            && self.served >= BULK_AFTER_RUNS
+            && pair < self.served as usize * BULK_MAX_STRIDE
+        {
+            let n_pairs = self.starts.len() - 1;
+            let n_gaps = *self.starts.last()? as usize;
+            self.firsts.resize(n_pairs, 0);
+            self.gaps.resize(n_gaps, 0);
+            self.first.read_lanes_into(bytes, 0, &mut self.firsts)?;
+            self.gap.read_lanes_into(bytes, 0, &mut self.gaps)?;
+            self.kind = GroupKind::Bulk;
+        }
+        Some(())
+    }
+
+    /// The first position of pair `pair`: one lane, no run decoded. Counts
+    /// as a run served, so a densely visited block still switches to the
+    /// bulk decode. `None` for a pair past the block.
+    #[inline]
+    pub(crate) fn first_position(&mut self, bytes: &[u8], pair: usize) -> Option<u32> {
+        let start = *self.starts.get(pair)? as usize;
+        self.maybe_bulk(bytes, pair)?;
+        self.served += 1;
+        match self.kind {
+            GroupKind::Leb128 => self.values.get(start).copied(),
+            GroupKind::Packed => self.first.lane(bytes, pair),
+            GroupKind::Bulk => self.firsts.get(pair).copied(),
+        }
+    }
+
+    /// Whether pair `pair` (term frequency `tf`, at most [`SHORT_RUN_TF`])
+    /// holds position `target`: its run summed lane by lane until it reaches
+    /// or passes the target, with nothing stored. `None` on an overflowing
+    /// gap or a pair past the block.
+    #[inline]
+    pub(crate) fn short_run_holds(
+        &mut self,
+        bytes: &[u8],
+        pair: usize,
+        tf: u32,
+        target: u32,
+    ) -> Option<bool> {
+        debug_assert!(tf <= SHORT_RUN_TF);
+        let start = *self.starts.get(pair)? as usize;
+        self.maybe_bulk(bytes, pair)?;
+        self.served += 1;
+        let mut p = match self.kind {
+            GroupKind::Leb128 => *self.values.get(start)?,
+            GroupKind::Packed => self.first.lane(bytes, pair)?,
+            GroupKind::Bulk => *self.firsts.get(pair)?,
+        };
+        for k in 0..(tf as usize).saturating_sub(1) {
+            if p >= target {
+                break;
+            }
+            let g = match self.kind {
+                GroupKind::Leb128 => *self.values.get(start + 1 + k)?,
+                GroupKind::Packed => self.gap.lane(bytes, start + k)?,
+                GroupKind::Bulk => *self.gaps.get(start + k)?,
+            };
+            p = p.checked_add(g)?;
+        }
+        Some(p == target)
+    }
+
     /// The absolute positions of pair `pair` (whose term frequency is
     /// `tf`), appended to `out`. `None` on an overflowing gap.
     pub(crate) fn run_positions(
@@ -598,20 +670,7 @@ impl GroupIndex {
         out: &mut Vec<u32>,
     ) -> Option<()> {
         let start = *self.starts.get(pair)? as usize;
-        if self.kind == GroupKind::Packed
-            && self.served >= BULK_AFTER_RUNS
-            && pair < self.served as usize * BULK_MAX_STRIDE
-        {
-            let n_pairs = self.starts.len() - 1;
-            let n_gaps = *self.starts.last()? as usize;
-            // Sized, not cleared: every lane is overwritten, so only growth
-            // past the last group's length is zero-filled.
-            self.firsts.resize(n_pairs, 0);
-            self.gaps.resize(n_gaps, 0);
-            self.first.read_lanes_into(bytes, 0, &mut self.firsts)?;
-            self.gap.read_lanes_into(bytes, 0, &mut self.gaps)?;
-            self.kind = GroupKind::Bulk;
-        }
+        self.maybe_bulk(bytes, pair)?;
         self.served += 1;
         match self.kind {
             GroupKind::Leb128 => {
