@@ -1137,9 +1137,13 @@ impl TermCursor {
             let hdr = self.current_header();
             if is_dense_encoding(hdr.encoding) {
                 let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+                // The block's candidates ascend, so each one's rank is the
+                // last one's presence count carried forward over the words
+                // between them, not a count from the block's first word.
+                let mut carried = (0usize, 0u32);
                 while r < n && docs[r] <= block_last {
                     let d = docs[r];
-                    if let Some(rank) = Self::dense_rank(raw, &hdr, d) {
+                    if let Some(rank) = Self::dense_rank_carried(raw, &hdr, d, &mut carried) {
                         docs[w] = d;
                         w += 1;
                         locs.push((b, rank as u32));
@@ -1300,6 +1304,45 @@ impl TermCursor {
         let (bit, word, bitset_end) = Self::bitset_word(raw, hdr, doc)?;
         ((word >> (bit % 64)) & 1 == 1)
             .then(|| Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end) as usize)
+    }
+
+    /// [`Self::dense_rank`] for docs asked in ascending order within one
+    /// block: `carried` holds a word index and the count of presence bits
+    /// in the words before it, from the last doc ranked, and is advanced to
+    /// this doc's word, so a block of candidates costs one pass over its
+    /// bitset rather than a pass per candidate.
+    #[inline(always)]
+    fn dense_rank_carried(
+        raw: &[u8],
+        hdr: &BlockHeader,
+        doc: u32,
+        carried: &mut (usize, u32),
+    ) -> Option<usize> {
+        if hdr.encoding == ENCODING_RUN {
+            let rank = doc.checked_sub(hdr.base)? as usize;
+            return (rank < hdr.count()).then_some(rank);
+        }
+        let (bit, word, bitset_end) = Self::bitset_word(raw, hdr, doc)?;
+        if (word >> (bit % 64)) & 1 == 0 {
+            return None;
+        }
+        let word_idx = bit / 64;
+        let presence = &raw[hdr.payload()..bitset_end];
+        let (mut at, mut rank) = *carried;
+        if word_idx < at {
+            // Not ascending after all: count from the block's first word.
+            (at, rank) = (0, 0);
+        }
+        for w in presence[at * 8..word_idx * 8].chunks_exact(8) {
+            rank += u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones();
+        }
+        *carried = (word_idx, rank);
+        let below = if bit.is_multiple_of(64) {
+            0u64
+        } else {
+            (1u64 << (bit % 64)) - 1
+        };
+        Some((rank + (word & below).count_ones()) as usize)
     }
 
     /// Rank of the doc at in-block position `bit` among a bitset block's
