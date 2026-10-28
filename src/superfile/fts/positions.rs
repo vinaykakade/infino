@@ -15,7 +15,7 @@
 //! table records each 128-doc block's starting byte so a block's runs
 //! are randomly addressable without decoding its predecessors.
 
-use std::ops::Range;
+use std::{ops::Range, slice};
 
 use crate::{
     superfile::bits::{
@@ -406,21 +406,38 @@ impl StreamIndex {
         Some(())
     }
 
-    /// One lane of the stream, exception applied.
+    /// Lanes `from..from + out.len()` of a short run, one bit extraction
+    /// each: for a handful of lanes that is cheaper than the bulk unpack's
+    /// setup, and the exceptions are then searched once for the whole run
+    /// rather than once per lane.
     #[inline]
-    fn lane(&self, bytes: &[u8], i: usize) -> Option<u32> {
-        let low = u32::try_from(get_bits(&bytes[self.payload.clone()], i, self.width)?).ok()?;
-        if self.exceptions.is_empty() {
-            return Some(low);
+    fn read_few_into(&self, bytes: &[u8], from: usize, out: &mut [u32]) -> Option<()> {
+        let payload = &bytes[self.payload.clone()];
+        for (i, slot) in (from..).zip(out.iter_mut()) {
+            // `parse_into` caps the width at 32 bits, so the lane fits.
+            *slot = get_bits(payload, i, self.width)? as u32;
         }
-        let hi = match self
+        self.patch_exceptions(from, out);
+        Some(())
+    }
+
+    /// The exceptions among lanes `from..from + out.len()` applied to
+    /// their unpacked low bits in `out`: one search for the first, then a
+    /// walk, since they ascend. Nothing to do for a stream without any.
+    #[inline]
+    fn patch_exceptions(&self, from: usize, out: &mut [u32]) {
+        if self.exceptions.is_empty() {
+            return;
+        }
+        let first = self
             .exceptions
-            .binary_search_by_key(&(i as u32), |&(lane, _)| lane)
-        {
-            Ok(k) => self.exception_hi(self.exceptions[k].1),
-            Err(_) => 0,
-        };
-        Some(low | hi)
+            .partition_point(|&(lane, _)| (lane as usize) < from);
+        for &(lane, hi) in &self.exceptions[first..] {
+            let Some(slot) = out.get_mut(lane as usize - from) else {
+                break;
+            };
+            *slot |= self.exception_hi(hi);
+        }
     }
 
     /// An exception's high bits placed above the stream's packed width.
@@ -451,21 +468,8 @@ impl StreamIndex {
     /// not cleared and zero-filled again before the unpack.
     fn read_lanes_into(&self, bytes: &[u8], from: usize, out: &mut [u32]) -> Option<()> {
         let payload = &bytes[self.payload.clone()];
-        let n = out.len();
         unpack_lanes_u32(payload, from, self.width, out)?;
-        if self.exceptions.is_empty() {
-            return Some(());
-        }
-        let first = self
-            .exceptions
-            .partition_point(|&(lane, _)| (lane as usize) < from);
-        for &(lane, hi) in &self.exceptions[first..] {
-            let lane = lane as usize;
-            if lane >= from + n {
-                break;
-            }
-            out[lane - from] |= self.exception_hi(hi);
-        }
+        self.patch_exceptions(from, out);
         Some(())
     }
 }
@@ -620,17 +624,16 @@ impl GroupIndex {
             GroupKind::Packed => {
                 if tf as usize <= SMALL_TF {
                     // Most runs on a real corpus are one to three positions:
-                    // read the lanes straight out of the two payloads and
-                    // write the prefix sums, skipping the generic lane
-                    // reader and its scratch. An exception is looked up per
-                    // lane only when the stream has any.
-                    let mut p = self.first.lane(bytes, pair)?;
-                    out.push(p);
-                    for k in 0..tf as usize - 1 {
-                        p = p.checked_add(self.gap.lane(bytes, start + k)?)?;
-                        out.push(p);
-                    }
-                    return Some(());
+                    // read the lanes straight out of the two payloads into a
+                    // stack buffer, skipping the bulk unpack and its scratch,
+                    // with one exception search per stream that has any.
+                    let mut run = [0u32; SMALL_TF];
+                    let run = &mut run[..tf as usize];
+                    let (first, gaps) = run.split_first_mut()?;
+                    self.first
+                        .read_few_into(bytes, pair, slice::from_mut(first))?;
+                    self.gap.read_few_into(bytes, start, gaps)?;
+                    return positions_from_run_values(run, out);
                 }
                 // A long run: its raw values go straight into `out` and are
                 // summed there, with no staging buffer in between.
@@ -1137,6 +1140,62 @@ mod tests {
                 assert_eq!(got, want[wi..wi + tf as usize], "{label} pair {pair}");
                 wi += tf as usize;
             }
+        }
+    }
+
+    #[test]
+    fn short_runs_apply_exceptions_at_every_lane_of_the_run() {
+        // Runs of one to four positions, each read on a fresh index so the
+        // per-run path serves it (sequential reads switch to the bulk
+        // decode). Exceptions sit on a run's first position, its first gap,
+        // its last gap, on adjacent lanes across two runs, and on only one
+        // stream at a time, so both the patched and the exception-free
+        // streams are read.
+        let tfs: Vec<u32> = (0..48u32).map(|d| 1 + d % 4).collect();
+        let starts: Vec<usize> = tfs
+            .iter()
+            .scan(0usize, |acc, &tf| {
+                let s = *acc;
+                *acc += tf as usize;
+                Some(s)
+            })
+            .collect();
+        let mut vals = Vec::new();
+        for (d, &tf) in tfs.iter().enumerate() {
+            vals.push(9 * d as u32 + 2);
+            vals.extend((1..tf).map(|g| 1 + (g + d as u32) % 5));
+        }
+        // (pair, lane within its run) pairs to make exceptional.
+        let cases: [&[(usize, usize)]; 5] = [
+            &[(4, 0), (13, 0), (47, 0)],
+            &[(5, 1), (7, 1), (46, 1)],
+            &[(7, 3), (11, 3), (10, 2)],
+            &[(6, 2), (7, 1), (7, 2), (7, 3), (9, 1)],
+            &[(0, 0), (3, 1), (3, 0), (14, 2), (15, 1), (15, 0)],
+        ];
+        for (c, case) in cases.iter().enumerate() {
+            let mut v = vals.clone();
+            for (k, &(pair, lane)) in case.iter().enumerate() {
+                assert!(lane < tfs[pair] as usize, "case {c}: lane inside the run");
+                v[starts[pair] + lane] = (1 << 20) + ((k as u32) << 12);
+            }
+            let mut out = Vec::new();
+            group(&mut out, &tfs, &v, false);
+            assert_eq!(out[0], GROUP_PACKED_FIXED, "case {c}");
+            for (pair, &tf) in tfs.iter().enumerate() {
+                let mut index = GroupIndex::default();
+                index.locate(&out, &mut 0, &tfs).expect("parses");
+                let mut got = Vec::new();
+                index
+                    .run_positions(&out, pair, tf, &mut got)
+                    .expect("run decodes");
+                let mut want = Vec::new();
+                positions_from_run_values(&v[starts[pair]..starts[pair] + tf as usize], &mut want)
+                    .expect("sums");
+                assert_eq!(index.kind, GroupKind::Packed, "case {c} pair {pair}");
+                assert_eq!(got, want, "case {c} pair {pair}");
+            }
+            assert_eq!(decode_all(&out, 0, &tfs), Some(positions_of(&tfs, &v)));
         }
     }
 
