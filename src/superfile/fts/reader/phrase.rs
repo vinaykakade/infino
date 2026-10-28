@@ -80,7 +80,7 @@ impl PhraseMember {
                 "positions need the whole block decoded; call materialize_at first"
             );
         }
-        self.located_positions(self.cursor.current_block, self.cursor.pos)
+        self.located_positions(self.cursor.current_block, self.cursor.pos, 0)
     }
 }
 
@@ -115,8 +115,16 @@ impl PhraseMember {
     /// The member's positions in its `pair`-th posting of block `block`,
     /// decoded into `pos_scratch`. Reads the block's tfs and position group
     /// once per block and the posting's run alone: the doc ids are never
-    /// expanded, and no cursor is walked to the doc.
-    fn located_positions(&mut self, block: usize, pair: usize) -> Result<(), FtsError> {
+    /// expanded, and no cursor is walked to the doc. `expected` is how many
+    /// runs of this block the caller is about to ask for (the batch's
+    /// candidates in it, when known): past a threshold the group is read
+    /// whole on its first location instead of lane by lane.
+    fn located_positions(
+        &mut self,
+        block: usize,
+        pair: usize,
+        expected: usize,
+    ) -> Result<(), FtsError> {
         self.pos_scratch.clear();
         if let Some(p) = self.inline_position {
             self.pos_scratch.push(p);
@@ -129,6 +137,10 @@ impl PhraseMember {
                 term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
             self.group_index
                 .locate(&self.positions, &mut at, &self.tfs)
+                .and_then(|()| {
+                    self.group_index
+                        .read_whole_if_busy(&self.positions, expected)
+                })
                 .ok_or_else(|| {
                     FtsError::Read(ReadError::Malformed(
                         "position group truncated or undecodable".into(),
@@ -699,7 +711,14 @@ impl PhraseCursor {
             &mut self.verify_scratch,
             |m, j| {
                 let (b, p) = locs[j][c];
-                m.located_positions(b as usize, p as usize)
+                // On a block's first location only: how many of the batch's
+                // candidates from this one on share the block, which is what
+                // the member is about to serve from it.
+                let expected = match m.group_block == b as usize {
+                    true => 0,
+                    false => locs[j][c..].iter().take_while(|l| l.0 == b).count(),
+                };
+                m.located_positions(b as usize, p as usize, expected)
             },
         )?;
         Ok(self.current_tf)

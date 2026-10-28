@@ -496,6 +496,10 @@ enum GroupKind {
 /// per-run path, where decoding all 128 runs would cost more than they
 /// do.
 const BULK_AFTER_RUNS: u32 = 2;
+/// Runs a block is known to be about to serve, from a batch's located
+/// candidates, at or above which it is read whole up front
+/// ([`GroupIndex::read_whole_if_busy`]) rather than lane by lane.
+const BULK_BATCH_RUNS: usize = 12;
 /// Runs up to this many positions bypass the generic lane reader.
 const SMALL_TF: usize = 4;
 const BULK_MAX_STRIDE: usize = 4;
@@ -588,6 +592,36 @@ impl GroupIndex {
         Some(())
     }
 
+    /// Read both packed streams whole, so every later run is a slice: the
+    /// one sequential unpack of each stream beats a lane read per position
+    /// once a block serves enough runs. `None` when a stream does not read
+    /// whole. Only for a packed group that is not already bulk.
+    fn read_whole(&mut self, bytes: &[u8]) -> Option<()> {
+        let n_pairs = self.starts.len() - 1;
+        let n_gaps = *self.starts.last()? as usize;
+        // Sized, not cleared: every lane is overwritten, so only growth
+        // past the last group's length is zero-filled.
+        self.firsts.resize(n_pairs, 0);
+        self.gaps.resize(n_gaps, 0);
+        self.first.read_lanes_into(bytes, 0, &mut self.firsts)?;
+        self.gap.read_lanes_into(bytes, 0, &mut self.gaps)?;
+        self.kind = GroupKind::Bulk;
+        Some(())
+    }
+
+    /// Read the group whole now ([`Self::read_whole`]) when the caller knows
+    /// the block will serve at least `expected` runs: a batch that lands
+    /// that many candidates in one block of a member pays less for one
+    /// sequential unpack of each stream than for their lanes one by one,
+    /// each with its own exception search. Below the threshold, or for a
+    /// group that is not packed, nothing changes.
+    pub(crate) fn read_whole_if_busy(&mut self, bytes: &[u8], expected: usize) -> Option<()> {
+        if self.kind == GroupKind::Packed && expected >= BULK_BATCH_RUNS {
+            self.read_whole(bytes)?;
+        }
+        Some(())
+    }
+
     /// The absolute positions of pair `pair` (whose term frequency is
     /// `tf`), appended to `out`. `None` on an overflowing gap.
     pub(crate) fn run_positions(
@@ -602,15 +636,7 @@ impl GroupIndex {
             && self.served >= BULK_AFTER_RUNS
             && pair < self.served as usize * BULK_MAX_STRIDE
         {
-            let n_pairs = self.starts.len() - 1;
-            let n_gaps = *self.starts.last()? as usize;
-            // Sized, not cleared: every lane is overwritten, so only growth
-            // past the last group's length is zero-filled.
-            self.firsts.resize(n_pairs, 0);
-            self.gaps.resize(n_gaps, 0);
-            self.first.read_lanes_into(bytes, 0, &mut self.firsts)?;
-            self.gap.read_lanes_into(bytes, 0, &mut self.gaps)?;
-            self.kind = GroupKind::Bulk;
+            self.read_whole(bytes)?;
         }
         self.served += 1;
         match self.kind {
