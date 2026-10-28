@@ -652,12 +652,20 @@ impl PhraseCursor {
     fn seek_match_pairwise(&mut self, from: u32) -> Result<(), FtsError> {
         let (ma, mo) = (self.align_order[0], self.align_order[1]);
         self.members[ma].cursor.skip_to(from);
+        // The driver's block whose span the other member's lines were last
+        // asked for: on entering a new one, ask for the next span.
+        let mut fetched_block = usize::MAX;
         loop {
             let d = &self.members[ma].cursor;
             if d.is_exhausted() {
                 break;
             }
             let doc = d.current_doc_id();
+            if d.current_block != fetched_block {
+                fetched_block = d.current_block;
+                let hi = d.current_block_last_doc_id();
+                self.members[mo].prefetch_span(doc, hi);
+            }
             let Some((bo, po)) = self.members[mo].probe.locate_doc(doc) else {
                 if self.members[mo].probe.is_exhausted() {
                     break;
