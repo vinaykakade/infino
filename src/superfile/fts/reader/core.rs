@@ -1720,7 +1720,12 @@ impl FtsReader {
                                 Some(bytes) => {
                                     positions_buf.clear();
                                     group
-                                        .run_positions(bytes.as_ref(), i, t[i], positions_buf)
+                                        .run_positions(
+                                            bytes.as_ref(),
+                                            &t[..decoded.n],
+                                            i,
+                                            positions_buf,
+                                        )
                                         .ok_or_else(|| {
                                             FtsError::Read(ReadError::Malformed(
                                                 "position run overflowing in merge read".into(),
@@ -1787,8 +1792,8 @@ impl FtsReader {
                                     group
                                         .run_positions(
                                             bytes.as_ref(),
+                                            &cursor.block_tfs[..cursor.block_n],
                                             cursor.pos,
-                                            tf,
                                             positions_buf,
                                         )
                                         .ok_or_else(|| {

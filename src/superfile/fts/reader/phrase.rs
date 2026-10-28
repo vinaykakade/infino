@@ -137,7 +137,7 @@ impl PhraseMember {
             self.group_block = block;
         }
         self.group_index
-            .run_positions(&self.positions, pair, self.tfs[pair], &mut self.pos_scratch)
+            .run_positions(&self.positions, &self.tfs, pair, &mut self.pos_scratch)
             .ok_or_else(|| {
                 FtsError::Read(ReadError::Malformed(
                     "position run truncated or overflowing".into(),
