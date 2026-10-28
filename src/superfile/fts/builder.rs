@@ -97,7 +97,7 @@ use tempfile::{Builder, TempDir};
 use tracing::debug;
 
 #[cfg(test)]
-use crate::superfile::fts::positions::{FOLLOW_BITS, LEAD_BITS, SIG_UNKNOWN};
+use crate::superfile::fts::positions::{FOLLOW_BITS, LEAD_BITS};
 use crate::{
     config::scratch_root,
     superfile::{
@@ -112,7 +112,8 @@ use crate::{
             analysis::ChainTokenizer,
             bm25,
             positions::{
-                TermRuns, adjacency_bits, adjacency_masks, encode_group, encode_run, skip_run,
+                SIG_UNKNOWN, TermRuns, adjacency_bits, adjacency_masks, encode_group, encode_run,
+                skip_run,
             },
             posting::{BLOCK_LEN, Block, EncodedBlock, encode_block_with},
             reader::{ColumnLengthStats, TopKEntry, finish_head},
@@ -180,6 +181,14 @@ type DocTfMap = HbHashMap<&'static str, u32, FxBuildHasher>;
 /// term maps to its chain head and its [`adjacency_bits`], hashed once per
 /// document rather than once per occurrence.
 type DocPosHeadMap = HbHashMap<&'static str, (u32, u8), FxBuildHasher>;
+
+/// A term in at least one of this many of a column's documents writes its
+/// postings without adjacency signatures. A common word is followed and
+/// preceded by most words somewhere in a doc, so its signature seldom
+/// rules a doc out, and common words hold most of a column's postings: a
+/// phrase pairing one with a rarer word is checked from the rarer word's
+/// side, which a signature names on both of its sides.
+const SIGNED_DF_DIVISOR: u64 = 100;
 
 /// Chain terminator for the per-doc position chains
 /// (`FtsBuilder::doc_pos_chain`): no previous occurrence.
@@ -4316,6 +4325,12 @@ fn encode_term(
     );
 
     let df = pairs.len() as u64;
+    // A common term's postings go unsigned (see `SIGNED_DF_DIVISOR`).
+    let signed = df.saturating_mul(SIGNED_DF_DIVISOR) < u64::from(n_scored_docs);
+    let sign = |sig: u8| match signed {
+        true => sig,
+        false => SIG_UNKNOWN,
+    };
     // Every posting's score, as a reader scores it: the heads rank by it
     // and a long list's blocks take their maxima from it. A short list
     // without a head to gather is not scored.
@@ -4383,7 +4398,7 @@ fn encode_term(
                 out.clear();
                 let mut at = 0usize;
                 for (i, &(_, tf)) in pairs.iter().enumerate() {
-                    sigs.push(runs.push_run(i, tf, &mut at, vals));
+                    sigs.push(sign(runs.push_run(i, tf, &mut at, vals)));
                 }
                 debug_assert!(
                     runs.encoded().is_none_or(|bytes| at == bytes.len()),
@@ -4507,7 +4522,7 @@ fn encode_term(
                 vals.clear();
                 sigs.clear();
                 for (k, &(_, tf)) in chunk.iter().enumerate() {
-                    sigs.push(runs.push_run(c * BLOCK_LEN + k, tf, &mut at, vals));
+                    sigs.push(sign(runs.push_run(c * BLOCK_LEN + k, tf, &mut at, vals)));
                 }
                 let tfs = &mut scratch.tfs;
                 tfs.clear();
