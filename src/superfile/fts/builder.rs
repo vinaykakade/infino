@@ -282,7 +282,7 @@ const PATCHED_MAX_DF: usize = 16 * 1024;
 /// coarsens the block maxima a ranked walk prunes by; the range is the
 /// writer's policy for that trade, stated as a density so it carries
 /// across corpora. The whole range: every long term is written wide.
-const WIDE_BLOCK_MIN_DENSITY: f64 = 0.0;
+const WIDE_BLOCK_MIN_DENSITY: f64 = 0.001;
 const WIDE_BLOCK_MAX_DENSITY: f64 = 1.0;
 
 /// The block length a term of `df` postings gets in a column of `n_docs`
