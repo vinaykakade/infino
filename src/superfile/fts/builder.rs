@@ -127,6 +127,7 @@ use crate::{
     utils::{
         terms::{DictEntry, INLINE_TF_MAX, TermBlockWriter, TermDictBuilder, validate_column_name},
         trace::{detail_span, record},
+        varint::push_varint,
     },
 };
 
@@ -483,8 +484,11 @@ struct Vocab {
     /// times more. `dense_doc_tf[id] != 0` iff `id` is in
     /// `updated_terms`; the per-doc drain restores the zero.
     dense_doc_tf: Vec<u32>,
-    /// Per-doc position-chain heads indexed by id (`CHAIN_END` = no
-    /// occurrence in this doc). Empty for a positionless column.
+    /// Per-id position state for the current document, indexed by id;
+    /// empty for a positionless column. While the store is in RAM it is
+    /// the term's last position in this document (read only while the
+    /// term's tf is non-zero); once spilled it is the term's chain head
+    /// (`CHAIN_END` = no occurrence in this doc).
     dense_doc_poshead: Vec<u32>,
     /// Ids the current document touched; drained at the end of each
     /// `add_doc`. Bounded by the doc's distinct terms, reused across docs.
@@ -565,6 +569,25 @@ impl RamStore {
             }
         }
     }
+}
+
+/// Where a positional scan puts each token's position. The in-RAM store
+/// takes the position as it arrives, gap-encoded straight onto the term's
+/// run: the first occurrence of a term in a document opens its run with
+/// the absolute position and later ones append the gap from the last
+/// (`dense_doc_poshead` holds that last position while the store is in
+/// RAM). A spilled store links the occurrence into the per-document chain
+/// instead, since its run has to be written whole to the partition's blob
+/// at the end of the document.
+enum PositionSink<'a> {
+    Runs {
+        postings: &'a mut Vec<Vec<(u32, u32)>>,
+        runs: &'a mut Vec<Vec<u8>>,
+        /// Run bytes appended during this document, for the accumulator's
+        /// byte estimate.
+        bytes: usize,
+    },
+    Chain(&'a mut Vec<(u32, u32)>),
 }
 
 /// Where a column's postings live: in RAM until the column's estimated
@@ -1891,6 +1914,8 @@ impl FtsBuilder {
         } = vocab;
         updated_terms.clear();
         let mut pos_overflow = false;
+        // Run bytes the in-RAM sink appended during the scan.
+        let mut run_bytes: usize = 0;
 
         // Per-token cost: intern lookup + dense-array tf bump; the
         // positional scan also links each occurrence into the per-doc
@@ -1925,16 +1950,22 @@ impl FtsBuilder {
             }
         } else {
             self.doc_pos_chain.clear();
-            let doc_pos_chain = &mut self.doc_pos_chain;
-            // `record` interns the token, bumps its tf, and links its
-            // `position` into the per-doc chain. `position` is the
-            // gap-inclusive ordinal — a token the tokenizer drops still
-            // advances it, so a phrase never treats the tokens on either
-            // side of a dropped word as adjacent. The doc length
-            // (`tokens_in_doc`) counts only *emitted* tokens, bumped by
-            // the caller below, so it stays identical to the
-            // positionless build; the two coincide only when nothing is
-            // dropped.
+            let mut sink = match store {
+                PostingStore::Ram(ram) => PositionSink::Runs {
+                    postings: &mut ram.postings,
+                    runs: &mut ram.pos_runs,
+                    bytes: 0,
+                },
+                PostingStore::Spilled(_) => PositionSink::Chain(&mut self.doc_pos_chain),
+            };
+            // `record` interns the token, bumps its tf, and hands its
+            // `position` to the sink. `position` is the gap-inclusive
+            // ordinal — a token the tokenizer drops still advances it, so
+            // a phrase never treats the tokens on either side of a dropped
+            // word as adjacent. The doc length (`tokens_in_doc`) counts
+            // only *emitted* tokens, bumped by the caller below, so it
+            // stays identical to the positionless build; the two coincide
+            // only when nothing is dropped.
             let mut record = |tok: &str, position: u64| {
                 let (term_id, is_new) = intern_term_id(term_to_id, id_to_term, term_arena, tok);
                 let idx = term_id as usize;
@@ -1942,25 +1973,43 @@ impl FtsBuilder {
                     debug_assert_eq!(idx, dense_doc_tf.len());
                     dense_doc_tf.push(0);
                     dense_doc_poshead.push(CHAIN_END);
+                    if let PositionSink::Runs { postings, runs, .. } = &mut sink {
+                        postings.push(Vec::new());
+                        runs.push(Vec::new());
+                    }
                 }
-                // SAFETY: same lockstep invariant as the positionless
-                // closure; `dense_doc_poshead` is pushed in the same
-                // `is_new` branch so it shares the bound.
-                let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
-                if *slot == 0 {
-                    updated_terms.push(term_id);
-                }
-                *slot += 1;
                 if position > u32::MAX as u64 {
                     // Positions are u32 ordinals; checked after the
                     // scan and surfaced as a hard build error.
                     pos_overflow = true;
                     return;
                 }
-                let chain_idx = doc_pos_chain.len() as u32;
-                let head = unsafe { dense_doc_poshead.get_unchecked_mut(idx) };
-                doc_pos_chain.push((position as u32, *head));
-                *head = chain_idx;
+                let position = position as u32;
+                // SAFETY: same lockstep invariant as the positionless
+                // closure; `dense_doc_poshead` (and the in-RAM store's
+                // per-id vectors) are pushed in the same `is_new` branch
+                // so they share the bound.
+                let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
+                let first = *slot == 0;
+                if first {
+                    updated_terms.push(term_id);
+                }
+                *slot += 1;
+                let state = unsafe { dense_doc_poshead.get_unchecked_mut(idx) };
+                match &mut sink {
+                    PositionSink::Runs { runs, bytes, .. } => {
+                        let run = unsafe { runs.get_unchecked_mut(idx) };
+                        let before = run.len();
+                        push_varint(run, if first { position } else { position - *state });
+                        *bytes += run.len() - before;
+                        *state = position;
+                    }
+                    PositionSink::Chain(doc_pos_chain) => {
+                        let chain_idx = doc_pos_chain.len() as u32;
+                        doc_pos_chain.push((position, *state));
+                        *state = chain_idx;
+                    }
+                }
             };
             if let Some(standard) = standard_tok {
                 // `standard` drops nothing — every segment carrying an
@@ -1990,6 +2039,10 @@ impl FtsBuilder {
                     tokens_in_doc += 1;
                 });
             }
+            run_bytes = match sink {
+                PositionSink::Runs { bytes, .. } => bytes,
+                PositionSink::Chain(_) => 0,
+            };
         }
         if pos_overflow {
             return Err(BuildError::PositionOverflow {
@@ -2038,30 +2091,13 @@ impl FtsBuilder {
                     }
                     list.push((local_doc_id, tf));
                     new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
-                    if positional {
-                        let head_slot = unsafe { dense_doc_poshead.get_unchecked_mut(idx) };
-                        let head = *head_slot;
-                        *head_slot = CHAIN_END;
-                        pos_scratch.clear();
-                        let mut at = head;
-                        while at != CHAIN_END {
-                            let (pos, prev) = doc_pos_chain[at as usize];
-                            pos_scratch.push(pos);
-                            at = prev;
-                        }
-                        pos_scratch.reverse();
-                        debug_assert_eq!(
-                            pos_scratch.len() as u32,
-                            tf,
-                            "chain length must equal tf"
-                        );
-                        let run = &mut ram.pos_runs[idx];
-                        let before = run.len();
-                        encode_run(run, pos_scratch);
-                        new_bytes = new_bytes.saturating_add(run.len() - before);
-                    }
+                    // A positional column's run for this (term, doc) was
+                    // written by the scan, gap by gap, as the tokens came.
                 }
-                ram.bytes = ram.bytes.saturating_add(new_bytes);
+                ram.bytes = ram
+                    .bytes
+                    .saturating_add(new_bytes)
+                    .saturating_add(run_bytes);
                 if ram.bytes > self.spill_threshold_bytes {
                     // Crossed the threshold: move the postings to spill
                     // files, keyed by the ids already assigned, and run
@@ -2074,6 +2110,9 @@ impl FtsBuilder {
                         mem::replace(ram, RamStore::new()),
                     )?;
                     *store = PostingStore::Spilled(spilled);
+                    // In RAM the per-id state held last positions; the
+                    // spilled scan reads it as chain heads.
+                    dense_doc_poshead.fill(CHAIN_END);
                 }
             }
             PostingStore::Spilled(SpillStore::Plain(partitions)) => {
@@ -2193,6 +2232,7 @@ impl FtsBuilder {
                         mem::replace(ram, RamStore::new()),
                     )?;
                     *store = PostingStore::Spilled(spilled);
+                    vocab.dense_doc_poshead.fill(CHAIN_END);
                 }
             }
             PostingStore::Spilled(SpillStore::Plain(parts)) => {
