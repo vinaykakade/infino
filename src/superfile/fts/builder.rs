@@ -24,19 +24,25 @@
 //! Two-mode accumulator, threshold-based, identical in shape to
 //! `VectorBuilder`:
 //!
-//! - **In-RAM mode**: each column holds a `FxHashMap<term, Vec<(doc,
-//!   tf)>>` until total accumulated bytes cross
-//!   `spill_threshold_bytes` (default 256 MiB). Small builds never
-//!   touch the disk during `add_doc`.
-//! - **Spill mode**: once the threshold is crossed, that column's
-//!   terms are interned into a per-column `term_to_id`/`id_to_term`
-//!   pair, the in-memory map is drained into per-column hash-
-//!   partitioned spill files holding **fixed-size 12-byte
-//!   `(term_id_le, doc_id_le, tf_le)` triples**, and from then on
-//!   `add_doc` writes one triple per posting straight to the spill
-//!   files via buffered file IO. Same shape as vector's spill: no
-//!   per-record framing, no variable-length payload, no per-record
-//!   allocation on read.
+//! Every column interns its terms into a dense id space as they are
+//! tokenized (`term_to_id` / `id_to_term`, bytes in a per-column arena)
+//! and dedups a document's tokens through arrays indexed by that id.
+//! Where the postings then go depends on the column's size:
+//!
+//! - **In-RAM mode**: each id's postings and position runs sit in
+//!   per-id vectors until the column's estimated bytes cross
+//!   `spill_threshold_bytes` (default 256 MiB; a supertable commit
+//!   raises it to what the build reserved for the shard's text).
+//!   The finish sorts the ids by term bytes once and encodes each
+//!   list in place — no disk is touched during `add_doc` or the sort.
+//! - **Spill mode**: once the threshold is crossed, the per-id lists
+//!   are drained into per-column hash-partitioned spill files holding
+//!   **fixed-size 12-byte `(term_id_le, doc_id_le, tf_le)` triples**
+//!   (20-byte records with the run offset for a positional column),
+//!   and from then on `add_doc` writes one record per posting straight
+//!   to the spill files via buffered file IO. Same shape as vector's
+//!   spill: no per-record framing, no variable-length payload, no
+//!   per-record allocation on read.
 //!
 //! `finish_to<W: Write>` correspondingly has two paths:
 //!
@@ -92,7 +98,7 @@ use std::{
 use bumpalo::Bump;
 use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::FxBuildHasher;
 use tempfile::{Builder, TempDir};
 use tracing::debug;
 
@@ -128,19 +134,18 @@ use crate::{
 ///
 /// Keys are `&'static str` slices that **actually borrow from the
 /// per-column `term_arena: bumpalo::Bump`** stored alongside the
-/// map in the [`ColumnPostings::Spilled`] variant. The `'static`
+/// map in the column's [`Vocab`]. The `'static`
 /// lifetime tag is a lie maintained by `unsafe` `std::mem::
 /// transmute` at insertion (see [`intern_term_id_arena`]) and
 /// kept sound by two structural invariants:
 ///
-/// 1. The arena outlives the map. The `Spilled` variant declares
-///    `term_arena` *after* `term_to_id` and `id_to_term` so Rust
-///    drops it last (struct fields drop in declaration order, so
-///    the last-declared field is the last-dropped). The
-///    `finish_to` per-column block that destructures `Spilled`
-///    likewise puts `term_arena` last in the pattern and adds an
-///    explicit `drop(term_arena)` after the last use of
-///    `id_to_term` for the same reason.
+/// 1. The arena outlives the map. [`Vocab`] declares `term_arena`
+///    *after* `term_to_id` and `id_to_term` so Rust drops it last
+///    (struct fields drop in declaration order, so the last-declared
+///    field is the last-dropped). The `finish_to` per-column blocks
+///    that destructure a `Vocab` likewise add an explicit
+///    `drop(term_arena)` after the last use of `id_to_term` for the
+///    same reason.
 /// 2. No method on the map's keys does a deref during the map's
 ///    own `Drop`. `&str` has no `Drop` impl, so dropping the map
 ///    just deallocates the bucket table without touching the
@@ -162,18 +167,6 @@ use crate::{
 ///     instead of ~10K separate heap allocations chasing
 ///     pointers through unrelated allocator buckets).
 type TermIdMap = HbHashMap<&'static str, u32, FxBuildHasher>;
-
-/// Reusable per-document term-frequency table for the in-RAM build path.
-///
-/// Keys borrow from [`FtsBuilder::bump`] with the same lifetime-extension
-/// discipline as [`TermIdMap`]. The table is drained after every document
-/// and cleared before the arena is reset, so only its bucket allocation
-/// persists across calls.
-type DocTfMap = HbHashMap<&'static str, u32, FxBuildHasher>;
-
-/// Per-doc positional chain-head map — same key lifetime rules as
-/// [`DocTfMap`] (bump-arena keys, cleared before every arena reset).
-type DocPosHeadMap = HbHashMap<&'static str, u32, FxBuildHasher>;
 
 /// Chain terminator for the per-doc position chains
 /// (`FtsBuilder::doc_pos_chain`): no previous occurrence.
@@ -383,8 +376,8 @@ const PARTITION_BUF_SIZE: usize = 64 * 1024;
 /// accumulator. Used to drive the spill threshold; intentionally
 /// rough — the threshold is a soft budget, not a hard cap.
 ///
-/// - `~24 B`: per new term: FxHashMap entry header + `Vec<(u32,u32)>`
-///   header + `Box<str>` header + small-alloc rounding.
+/// - `~24 B`: per new term: the interner entry + the `Vec<(u32,u32)>`
+///   header + small-alloc rounding.
 /// - `+ term.len()`: term bytes.
 /// - `+ 8 B`: per added posting: `(doc_id: u32, tf: u32)`.
 const ACCUM_NEW_TERM_FIXED_BYTES: usize = 24;
@@ -475,103 +468,133 @@ impl ColumnState {
     }
 }
 
-/// Per-column posting accumulator. Starts in `InRam` mode; transitions
-/// to `Spilled` exactly once when this column's accumulated bytes
-/// cross the builder's `spill_threshold_bytes`.
-enum ColumnPostings {
-    /// In-RAM term → posting list map. Small builds stay here forever.
-    InRam {
-        terms: FxHashMap<Box<str>, Vec<(u32, u32)>>,
-        /// Per-term position runs for a **positional column**: the
-        /// concatenated [`positions`](crate::superfile::fts::positions)
-        /// varint runs, one run per `(doc, tf)` pair in `terms`, in the
-        /// same doc order — pair `i`'s run is the `i`-th run in the
-        /// buffer, delimited by its `tf`. Never populated for
-        /// positionless columns (zero cost off).
-        pos_runs: FxHashMap<Box<str>, Vec<u8>>,
-        /// Estimated bytes held by `terms` (+ `pos_runs`) — used to
-        /// drive the spill threshold check. Approximate (see
-        /// `ACCUM_*_BYTES`).
-        bytes: usize,
-    },
-    /// Hash-partitioned spill files plus the per-column term
-    /// interner. Records on disk are fixed-size 12-byte
-    /// `(term_id_le, doc_id_le, tf_le)` triples — same shape as
-    /// vector's raw-f32 spill, no per-record framing.
-    ///
-    /// `term_to_id` assigns a fresh `u32` ID to each distinct term
-    /// the first time it's seen (during the threshold flush, then
-    /// during subsequent `add_doc` calls). `id_to_term` is the
-    /// reverse map used at `finish_to` time to recover the term
-    /// bytes for dictionary emission. Both are bounded by the column's
-    /// vocabulary, which is typically O(10^4 - 10^6) even on 10M-
-    /// doc corpora — millions of bytes, not gigabytes.
-    Spilled {
-        partitions: SpillStore,
-        term_to_id: TermIdMap,
-        /// Per-id reverse lookup used by `finish_to` to recover term
-        /// bytes for dictionary emit. Entries are `&'static str` slices
-        /// borrowing from `term_arena` (see [`TermIdMap`] doc for
-        /// the lifetime-extension invariant — same arena, same
-        /// drop-order rules).
-        id_to_term: Vec<&'static str>,
-        /// Per-doc tf accumulator, indexed by `term_id`. Replaces the
-        /// previous `FxHashMap<u32, u32>` scratch: term_ids are dense
-        /// `0..vocab_size` (vocab ~10K on the bench Zipfian corpus, ≤
-        /// few M on 10M-doc corpora), so a dense `Vec<u32>` keyed on
-        /// `term_id` is a single array store per token (~5ns) vs a
-        /// hashmap probe + entry update (~25-30ns). On the 1M-doc
-        /// spill bench that's ~150M token-hits, so the per-call delta
-        /// is the dominant `add_doc` cost saving.
-        ///
-        /// Memory: 4 bytes × vocab. 40 KiB at 10K vocab; a few MiB
-        /// even at multi-M vocab — well inside the `O(max_partition_
-        /// bytes)` budget. The Vec grows monotonically as `intern_
-        /// term_id` mints new IDs; only ever read at the indices
-        /// listed in `updated_terms`, so stale entries past the
-        /// current `add_doc`'s set are ignored.
-        dense_doc_tf: Vec<u32>,
-        /// Per-doc position-chain heads, indexed by `term_id` like
-        /// `dense_doc_tf` (`CHAIN_END` = no occurrence this doc).
-        /// Allocated (and maintained) only for positional columns;
-        /// stays empty otherwise.
-        dense_doc_poshead: Vec<u32>,
-        /// Set of `term_id`s that were written in the current
-        /// `add_doc` call. Drained at the end of each call to emit
-        /// triples and zero out `dense_doc_tf` slots — bounded by
-        /// the per-doc unique-term count (≤ doc length), so a tiny
-        /// `Vec<u32>` reused across calls.
-        updated_terms: Vec<u32>,
-        /// Per-column bump arena owning the term bytes. Backing
-        /// store for the `&'static str` keys in `term_to_id` and
-        /// entries in `id_to_term` (see [`TermIdMap`] doc).
-        ///
-        /// **Declared LAST in this variant so it drops LAST.**
-        /// Rust drops struct fields in declaration order; the map
-        /// + reverse vec drop first, both of which leave their
-        ///   `&str` keys / entries bitwise-deallocated without
-        ///   dereferencing, and only then does the arena's
-        ///   `Drop` free the term bytes.
-        term_arena: Bump,
-    },
+/// Per-column vocabulary: the term interner and the per-document scratch
+/// `add_doc` dedups a document's tokens through. Both accumulators share
+/// it, so the transition from the in-RAM store to the spilled one keeps
+/// every id and rewrites no term.
+struct Vocab {
+    /// Term → dense id. Keys borrow from `term_arena` (see [`TermIdMap`]).
+    term_to_id: TermIdMap,
+    /// Id → term bytes, for the dictionary emit and the lex-rank table.
+    /// Entries borrow from `term_arena` like the map's keys.
+    id_to_term: Vec<&'static str>,
+    /// Per-doc tf accumulator indexed by id. Dense ids make this one
+    /// array store per token where a hash probe would cost several
+    /// times more. `dense_doc_tf[id] != 0` iff `id` is in
+    /// `updated_terms`; the per-doc drain restores the zero.
+    dense_doc_tf: Vec<u32>,
+    /// Per-doc position-chain heads indexed by id (`CHAIN_END` = no
+    /// occurrence in this doc). Empty for a positionless column.
+    dense_doc_poshead: Vec<u32>,
+    /// Ids the current document touched; drained at the end of each
+    /// `add_doc`. Bounded by the doc's distinct terms, reused across docs.
+    updated_terms: Vec<u32>,
+    /// Owns the term bytes behind `term_to_id` and `id_to_term`.
+    /// **Declared last so it drops last**: the map and the vec free
+    /// their tables without dereferencing a key, and only then does the
+    /// arena release the bytes (see [`TermIdMap`]).
+    term_arena: Bump,
+}
+
+impl Vocab {
+    fn new() -> Self {
+        Self {
+            term_to_id: TermIdMap::default(),
+            id_to_term: Vec::new(),
+            dense_doc_tf: Vec::new(),
+            dense_doc_poshead: Vec::new(),
+            updated_terms: Vec::new(),
+            term_arena: Bump::new(),
+        }
+    }
+
+    /// Distinct terms interned so far.
+    fn len(&self) -> usize {
+        self.id_to_term.len()
+    }
+
+    /// Intern `term`, growing the per-id arrays when it is new.
+    #[inline(always)]
+    fn intern(&mut self, term: &str, positional: bool) -> u32 {
+        let (term_id, is_new) = intern_term_id(
+            &mut self.term_to_id,
+            &mut self.id_to_term,
+            &self.term_arena,
+            term,
+        );
+        if is_new {
+            self.dense_doc_tf.push(0);
+            if positional {
+                self.dense_doc_poshead.push(CHAIN_END);
+            }
+        }
+        term_id
+    }
+}
+
+/// The in-RAM accumulator: every id's postings in arrival order (ascending
+/// doc id, by the `add_doc` contract) and, for a positional column, its
+/// concatenated position runs — one delta-varint run per `(doc, tf)`
+/// pair, delimited by the pair's `tf`. Indexed by term id, so a posting
+/// lands with one array index and one push; the finish walks the ids in
+/// dictionary order and encodes each list in place, with no sort pass.
+struct RamStore {
+    postings: Vec<Vec<(u32, u32)>>,
+    /// Empty for a positionless column.
+    pos_runs: Vec<Vec<u8>>,
+    /// Estimated bytes held (see `ACCUM_*_BYTES`); drives the spill check.
+    bytes: usize,
+}
+
+impl RamStore {
+    fn new() -> Self {
+        Self {
+            postings: Vec::new(),
+            pos_runs: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    /// Give every interned id its slot. Amortized O(1) per new id.
+    #[inline(always)]
+    fn grow_to(&mut self, n_terms: usize, positional: bool) {
+        if self.postings.len() < n_terms {
+            self.postings.resize_with(n_terms, Vec::new);
+            if positional {
+                self.pos_runs.resize_with(n_terms, Vec::new);
+            }
+        }
+    }
+}
+
+/// Where a column's postings live: in RAM until the column's estimated
+/// bytes cross the builder's `spill_threshold_bytes`, then in hash-
+/// partitioned spill files for the rest of the build. The records in
+/// the files are fixed-size `(term_id, doc_id, tf[, pos_lo, pos_hi])`
+/// lanes — same shape as the vector builder's raw-f32 spill, no framing.
+enum PostingStore {
+    Ram(RamStore),
+    Spilled(SpillStore),
+}
+
+/// Per-column posting accumulator: the vocabulary plus the store.
+struct ColumnPostings {
+    vocab: Vocab,
+    store: PostingStore,
 }
 
 impl ColumnPostings {
     fn new() -> Self {
-        Self::InRam {
-            terms: FxHashMap::default(),
-            pos_runs: FxHashMap::default(),
-            bytes: 0,
+        Self {
+            vocab: Vocab::new(),
+            store: PostingStore::Ram(RamStore::new()),
         }
     }
     fn is_spilled(&self) -> bool {
-        matches!(self, Self::Spilled { .. })
+        matches!(self.store, PostingStore::Spilled(_))
     }
     fn is_empty(&self) -> bool {
-        match self {
-            Self::InRam { terms, .. } => terms.is_empty(),
-            Self::Spilled { .. } => false,
-        }
+        self.vocab.id_to_term.is_empty()
     }
 }
 
@@ -691,9 +714,8 @@ fn triple_tf<const N: usize>(t: &[u32; N]) -> u32 {
 /// `write_posting_record` — function-call overhead is ~4× lower
 /// on `BufWriter` and the syscall amortisation through the 64-KiB
 /// buffer is unchanged. Reserved for callers without a per-
-/// partition batch buffer (the `flush_in_ram_to_partitions`
-/// streaming path uses the buffered `push_triple_batched` path
-/// instead — see below).
+/// partition batch buffer (the spill transition streams through the
+/// buffered `push_record_batched` path instead — see below).
 /// On big-endian hosts, the bulk `bytemuck::cast_slice` write
 /// path in `write_triples_sorted` is replaced with a per-triple
 /// scalar write to preserve the little-endian on-disk format.
@@ -1356,9 +1378,9 @@ pub struct FtsBuilder {
     /// Grown in lockstep with `columns`.
     column_tokenizers: Vec<Arc<dyn Tokenizer>>,
     columns: Vec<ColumnState>,
-    /// Per-column posting accumulator. Each entry starts in
-    /// `ColumnPostings::InRam` and transitions to `Spilled` exactly
-    /// once when its accumulated bytes cross `spill_threshold_bytes`.
+    /// Per-column posting accumulator. Each entry's store starts in
+    /// RAM and transitions to spill files exactly once, when its
+    /// accumulated bytes cross `spill_threshold_bytes`.
     /// Mirror of `VectorBuilder`'s `pre_spill_buffer` + `spill`.
     postings: Vec<ColumnPostings>,
     /// Scratch directory that owns all posting + term dictionary spill files.
@@ -1381,21 +1403,6 @@ pub struct FtsBuilder {
     /// Tracks the number of distinct local_doc_ids ever seen by add_doc.
     /// Used as `n_docs` for the FTS blob header.
     n_docs: u32,
-    /// Per-document term-frequency table for the in-RAM path. Draining
-    /// keeps its bucket allocation, avoiding a fresh allocation and
-    /// repeated growth for every document.
-    ///
-    /// Declared before `bump` so it drops first. Its transient `&str`
-    /// keys borrow from that arena under the lifetime invariant described
-    /// on [`DocTfMap`].
-    doc_tf: DocTfMap,
-    /// Per-doc chain heads for the positional capture path: term →
-    /// index of its LAST occurrence in `doc_pos_chain`. Shares its
-    /// `&'static str` keys with `doc_tf` (same bump arena, same
-    /// lifetime invariant), so it is likewise declared before `bump`
-    /// and cleared before the arena resets. Untouched for
-    /// positionless columns.
-    doc_pos_head: DocPosHeadMap,
     /// Per-doc occurrence chain: `(position, prev_index)` per token,
     /// `CHAIN_END` terminating each term's chain. Cleared per doc;
     /// capacity persists.
@@ -1407,18 +1414,6 @@ pub struct FtsBuilder {
     /// spilled positional drain path (the in-RAM path encodes
     /// straight into the accumulator's per-term buffer instead).
     run_scratch: Vec<u8>,
-    /// Per-shard bump arena reused across every `add_doc` call.
-    /// Holds the transient `&str` keys of the per-doc tf hashmap.
-    /// Reset at the top of each `add_doc` so the leftover bytes are
-    /// invalidated before the next allocation; `Bump::reset` keeps
-    /// the largest chunk so subsequent docs allocate in-place
-    /// without going back to the system allocator.
-    ///
-    /// Only the in-RAM arm of `add_doc` consumes this — the spill
-    /// arm interns tokens straight into the column's `term_to_id`
-    /// and dedupes via a dense `Vec<u32>` (kept inside `ColumnPostings
-    /// ::Spilled`) keyed by `term_id` instead.
-    bump: Bump,
     /// The Parquet row each doc id stands for, when the caller fed
     /// documents in an order of its own rather than in row order.
     ///
@@ -1591,12 +1586,9 @@ impl FtsBuilder {
             spill_partitions: DEFAULT_SPILL_PARTITIONS,
             max_partition_bytes: DEFAULT_MAX_PARTITION_BYTES,
             n_docs: 0,
-            doc_tf: DocTfMap::with_hasher(FxBuildHasher),
-            doc_pos_head: DocPosHeadMap::with_hasher(FxBuildHasher),
             doc_pos_chain: Vec::new(),
             pos_scratch: Vec::new(),
             run_scratch: Vec::new(),
-            bump: Bump::new(),
             doc_map: None,
             sorted_inputs: Vec::new(),
             head_sink: None,
@@ -1769,92 +1761,62 @@ impl FtsBuilder {
         Ok(blobs)
     }
 
-    /// Positional twin of
-    /// [`flush_in_ram_to_partitions`](Self::flush_in_ram_to_partitions):
-    /// drains the term → postings map *and* the parallel term →
-    /// position-runs map. Each `(doc, tf)` pair's run — delimited by
-    /// its `tf` varints within the term's concatenated buffer — is
-    /// appended to the partition's positions blob, and the record
-    /// carries the run's byte offset in its trailing lanes.
-    #[allow(clippy::too_many_arguments)]
-    fn flush_in_ram_to_positional_partitions(
-        terms: FxHashMap<Box<str>, Vec<(u32, u32)>>,
-        mut pos_runs: FxHashMap<Box<str>, Vec<u8>>,
-        partitions: &mut [SpillPartition<POSITIONAL_RECORD_LANES>],
-        blobs: &mut [PartitionPositions],
-        term_to_id: &mut TermIdMap,
-        id_to_term: &mut Vec<&'static str>,
-        arena: &Bump,
-    ) -> Result<(), BuildError> {
-        let n_part = partitions.len();
-        debug_assert_eq!(n_part, blobs.len(), "one blob per partition");
+    /// Move an in-RAM column's postings into fresh spill partitions,
+    /// keyed by the ids the vocabulary already assigned, so the column
+    /// can run the rest of the build in spill mode. Called once per
+    /// column, at the moment its estimated bytes cross the threshold.
+    /// A positional column's runs go to the partition's positions blob
+    /// and each record carries its run's byte offset in the trailing
+    /// lanes, exactly as the spilled `add_doc` writes them.
+    fn spill_ram_store(
+        scratch_dir: &Path,
+        column_id: u32,
+        n_partitions: usize,
+        positional: bool,
+        ram: RamStore,
+    ) -> Result<SpillStore, BuildError> {
         debug_assert!(
-            n_part.is_power_of_two(),
-            "spill_partitions must be a power of 2; got {n_part}"
+            n_partitions.is_power_of_two(),
+            "spill_partitions must be a power of 2; got {n_partitions}"
         );
-        let mask = n_part - 1;
-        for (term, postings) in terms {
-            let (term_id, _is_new) = intern_term_id(term_to_id, id_to_term, arena, &term);
-            let p = (term_id as usize) & mask;
-            let runs = pos_runs
-                .remove(&term)
-                .expect("positional term accumulated a position run");
+        let mask = n_partitions - 1;
+        let RamStore {
+            postings, pos_runs, ..
+        } = ram;
+        if !positional {
+            let mut partitions =
+                Self::open_partitions_for_column(scratch_dir, column_id, n_partitions)?;
+            for (term_id, list) in postings.into_iter().enumerate() {
+                let p = term_id & mask;
+                for (doc_id, tf) in list {
+                    push_record_batched(&mut partitions[p], [term_id as u32, doc_id, tf])?;
+                }
+            }
+            return Ok(SpillStore::Plain(partitions));
+        }
+        let mut partitions =
+            Self::open_partitions_for_column(scratch_dir, column_id, n_partitions)?;
+        let mut blobs = Self::open_position_blobs_for_column(scratch_dir, column_id, n_partitions)?;
+        for (term_id, (list, runs)) in postings.into_iter().zip(pos_runs).enumerate() {
+            let p = term_id & mask;
             let blob = &mut blobs[p];
             let writer = blob
                 .writer
                 .as_mut()
                 .expect("positions blob writer is open before finish");
             let mut at: usize = 0;
-            for (doc_id, tf) in postings {
+            for (doc_id, tf) in list {
                 let run_start = at;
                 skip_run(&runs, &mut at, tf).expect("builder-encoded runs are well-formed");
                 writer.write_all(&runs[run_start..at])?;
                 let pos_off = blob.len;
                 blob.len += (at - run_start) as u64;
                 let (lo, hi) = pos_off_lanes(pos_off);
-                push_record_batched(&mut partitions[p], [term_id, doc_id, tf, lo, hi])?;
+                push_record_batched(&mut partitions[p], [term_id as u32, doc_id, tf, lo, hi])?;
             }
             debug_assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
         }
-        Ok(())
-    }
-
-    /// Drain an in-RAM term → postings map into spill partitions,
-    /// assigning a fresh `term_id` per term as it's first seen.
-    /// Used once per column at the moment that column crosses the
-    /// spill threshold. After this returns, the map is empty
-    /// (already dropped by the caller) and all records live in the
-    /// partition files as fixed-size 12-byte triples.
-    ///
-    /// `term_to_id` + `id_to_term` are populated with this
-    /// column's vocabulary; subsequent `add_doc` calls reuse them
-    /// to intern any new terms they see.
-    fn flush_in_ram_to_partitions(
-        terms: FxHashMap<Box<str>, Vec<(u32, u32)>>,
-        partitions: &mut [SpillPartition<PLAIN_RECORD_LANES>],
-        term_to_id: &mut TermIdMap,
-        id_to_term: &mut Vec<&'static str>,
-        arena: &Bump,
-    ) -> Result<(), BuildError> {
-        let n_part = partitions.len();
-        debug_assert!(
-            n_part.is_power_of_two(),
-            "spill_partitions must be a power of 2; got {n_part}"
-        );
-        let mask = n_part - 1;
-        for (term, postings) in terms {
-            // Drain-time intern: every drained term is by construction
-            // a fresh id (term_to_id was empty when the transition
-            // started). The `is_new` flag is unused here; the dense-
-            // array sizing is handled by the caller pre-growing
-            // `dense_doc_tf` to `id_to_term.len()` after this returns.
-            let (term_id, _is_new) = intern_term_id(term_to_id, id_to_term, arena, &term);
-            let p = (term_id as usize) & mask;
-            for (doc_id, tf) in postings {
-                push_record_batched(&mut partitions[p], [term_id, doc_id, tf])?;
-            }
-        }
-        Ok(())
+        Ok(SpillStore::Positional { partitions, blobs })
     }
 
     /// Index `text` for `(column_id, local_doc_id)`.
@@ -1900,292 +1862,11 @@ impl FtsBuilder {
             self.columns[col_idx].doc_lengths.len(),
         );
 
-        // Dispatch by variant. Re-destructured inside each helper
-        // so the helper can field-split-borrow `self.postings`,
-        // `self.columns`, and (for in-RAM) `self.bump` without
-        // routing through an enum field reference held across the
-        // call.
-        if self.postings[col_idx].is_spilled() {
-            self.add_doc_spilled(col_idx, local_doc_id, text)
-        } else {
-            self.add_doc_inram(col_idx, local_doc_id, text)
-        }
-    }
-
-    /// Push one prebuilt posting `(term, doc_id, tf, positions)` into the
-    /// column's accumulator without tokenizing — the FTS-compaction-merge
-    /// counterpart of [`add_doc`]. `positions` is empty for a non-positional
-    /// column; otherwise it holds the `tf` token offsets for this `(term,
-    /// doc)`. The concatenating merges feed each term's docs in ascending
-    /// doc-id order (sequential inputs, dense remap), matching what
-    /// `add_doc` produces. The multi-cell merge does not — it remaps
-    /// postings through the packed stable-id row order — so it forces the
-    /// column into spill mode first, where the finish restores per-term
-    /// doc order (see `radix_sort_records_by_lex_rank`); the in-RAM
-    /// accumulator preserves insertion order and must only be fed
-    /// ascending. Mirrors the in-RAM drain in [`add_doc_inram`], minus the
-    /// tokenize + per-doc position-chain walk.
-    ///
-    /// Doc lengths are fed separately via [`append_prebuilt_doc_lengths`] — the
-    /// merge carries the inputs' stored lengths rather than recomputing them.
-    ///
-    /// Memory-bounded: while in-RAM, a push that crosses `spill_threshold_bytes`
-    /// transitions the column to the spilled accumulator (the same
-    /// [`add_doc`]-time transition), after which each posting is written
-    /// straight to the partition/position spill files.
-    pub(crate) fn add_prebuilt_term_posting(
-        &mut self,
-        column_id: u32,
-        term: &str,
-        doc_id: FtsDocId,
-        tf: u32,
-        positions: &[u32],
-    ) -> Result<(), BuildError> {
-        // The accumulators below are the blob's own id space from end to
-        // end, so the id comes off here, once, at the entry point that
-        // decides what space the caller had to be in.
-        let doc_id = doc_id.get();
-        let col_idx = column_id as usize;
-        if self.postings[col_idx].is_spilled() {
-            return self.push_prebuilt_spilled(col_idx, term, doc_id, tf, positions);
-        }
-
-        // In-RAM push, mirroring the `add_doc_inram` drain minus the tokenize +
-        // per-doc chain walk (positions arrive already decoded).
-        let positional = self.columns[col_idx].positions;
-        let threshold = self.spill_threshold_bytes;
-        let crossed = match &mut self.postings[col_idx] {
-            ColumnPostings::InRam {
-                terms,
-                pos_runs,
-                bytes,
-            } => {
-                let term_len = term.len();
-                let mut new_bytes: usize = 0;
-                match terms.get_mut(term) {
-                    Some(acc) => {
-                        acc.push((doc_id, tf));
-                        new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
-                    }
-                    None => {
-                        terms.insert(Box::<str>::from(term), vec![(doc_id, tf)]);
-                        new_bytes = new_bytes.saturating_add(
-                            ACCUM_NEW_TERM_FIXED_BYTES + term_len + ACCUM_POSTING_BYTES,
-                        );
-                    }
-                }
-                if positional {
-                    match pos_runs.get_mut(term) {
-                        Some(run) => {
-                            let before = run.len();
-                            encode_run(run, positions);
-                            new_bytes = new_bytes.saturating_add(run.len() - before);
-                        }
-                        None => {
-                            let mut run = Vec::new();
-                            encode_run(&mut run, positions);
-                            new_bytes = new_bytes
-                                .saturating_add(ACCUM_NEW_TERM_FIXED_BYTES + term_len + run.len());
-                            pos_runs.insert(Box::<str>::from(term), run);
-                        }
-                    }
-                }
-                *bytes = bytes.saturating_add(new_bytes);
-                *bytes > threshold
-            }
-            ColumnPostings::Spilled { .. } => unreachable!("spilled handled above"),
-        };
-
-        if crossed {
-            let (drained, drained_pos_runs) = match &mut self.postings[col_idx] {
-                ColumnPostings::InRam {
-                    terms, pos_runs, ..
-                } => (mem::take(terms), mem::take(pos_runs)),
-                ColumnPostings::Spilled { .. } => unreachable!("just pushed in-RAM"),
-            };
-            self.spill_inram_column(col_idx, drained, drained_pos_runs)?;
-        }
-        Ok(())
-    }
-
-    /// Transition an in-RAM column to the spilled accumulator, draining the
-    /// given in-RAM maps into fresh spill partitions and building the term
-    /// interner. Same construction as the `add_doc_inram` threshold transition,
-    /// factored so the prebuilt-posting path reuses it. `drained_pos_runs` is
-    /// empty (and unused) for a non-positional column.
-    fn spill_inram_column(
-        &mut self,
-        col_idx: usize,
-        drained: FxHashMap<Box<str>, Vec<(u32, u32)>>,
-        drained_pos_runs: FxHashMap<Box<str>, Vec<u8>>,
-    ) -> Result<(), BuildError> {
-        let positional = self.columns[col_idx].positions;
-        let column_id = col_idx as u32;
-        let term_arena = Bump::new();
-        let mut term_to_id: TermIdMap = TermIdMap::default();
-        let mut id_to_term: Vec<&'static str> = Vec::with_capacity(drained.len());
-        let store = match positional {
-            false => {
-                let mut partitions = Self::open_partitions_for_column(
-                    self.scratch_dir.path(),
-                    column_id,
-                    self.spill_partitions,
-                )?;
-                Self::flush_in_ram_to_partitions(
-                    drained,
-                    &mut partitions,
-                    &mut term_to_id,
-                    &mut id_to_term,
-                    &term_arena,
-                )?;
-                SpillStore::Plain(partitions)
-            }
-            true => {
-                let mut partitions = Self::open_partitions_for_column(
-                    self.scratch_dir.path(),
-                    column_id,
-                    self.spill_partitions,
-                )?;
-                let mut blobs = Self::open_position_blobs_for_column(
-                    self.scratch_dir.path(),
-                    column_id,
-                    self.spill_partitions,
-                )?;
-                Self::flush_in_ram_to_positional_partitions(
-                    drained,
-                    drained_pos_runs,
-                    &mut partitions,
-                    &mut blobs,
-                    &mut term_to_id,
-                    &mut id_to_term,
-                    &term_arena,
-                )?;
-                SpillStore::Positional { partitions, blobs }
-            }
-        };
-        let dense_doc_tf = vec![0u32; id_to_term.len()];
-        let dense_doc_poshead = match positional {
-            true => vec![CHAIN_END; id_to_term.len()],
-            false => Vec::new(),
-        };
-        self.postings[col_idx] = ColumnPostings::Spilled {
-            partitions: store,
-            term_to_id,
-            id_to_term,
-            dense_doc_tf,
-            dense_doc_poshead,
-            updated_terms: Vec::new(),
-            term_arena,
-        };
-        Ok(())
-    }
-
-    /// Write one prebuilt posting straight to a spilled column's partition
-    /// (and position blob, for a positional column) as the fixed-size record
-    /// `add_doc_spilled` emits: interns the term, hash-selects the partition,
-    /// and appends the `(term_id, doc_id, tf[, pos_lo, pos_hi])` record. The
-    /// finish path k-way merges the partitions exactly as for a fresh build.
-    fn push_prebuilt_spilled(
-        &mut self,
-        col_idx: usize,
-        term: &str,
-        doc_id: u32,
-        tf: u32,
-        positions: &[u32],
-    ) -> Result<(), BuildError> {
-        let positional = self.columns[col_idx].positions;
-        let ColumnPostings::Spilled {
-            partitions,
-            term_to_id,
-            id_to_term,
-            dense_doc_tf,
-            dense_doc_poshead,
-            term_arena,
-            ..
-        } = &mut self.postings[col_idx]
-        else {
-            unreachable!("push_prebuilt_spilled on a non-spilled column");
-        };
-
-        let (term_id, is_new) = intern_term_id(term_to_id, id_to_term, term_arena, term);
-        if is_new {
-            // Keep the per-id parallel arrays in lockstep with the vocab.
-            dense_doc_tf.push(0);
-            if positional {
-                dense_doc_poshead.push(CHAIN_END);
-            }
-        }
-
-        match partitions {
-            SpillStore::Plain(parts) => {
-                let p = (term_id as usize) & (parts.len() - 1);
-                push_record_batched(&mut parts[p], [term_id, doc_id, tf])?;
-            }
-            SpillStore::Positional {
-                partitions: parts,
-                blobs,
-            } => {
-                let p = (term_id as usize) & (parts.len() - 1);
-                let blob = &mut blobs[p];
-                let writer = blob
-                    .writer
-                    .as_mut()
-                    .expect("positions blob writer open before finish");
-                let mut run = Vec::new();
-                encode_run(&mut run, positions);
-                writer.write_all(&run)?;
-                let pos_off = blob.len;
-                blob.len += run.len() as u64;
-                let (lo, hi) = pos_off_lanes(pos_off);
-                push_record_batched(&mut parts[p], [term_id, doc_id, tf, lo, hi])?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Append a run of per-doc lengths to a column (the compaction merge feeds
-    /// the inputs' already-clamped stored lengths rather than recomputing them
-    /// from text) and advance the builder's doc count so `finish` sizes the
-    /// doc-lengths table and `n_docs` correctly. Append (not replace) so the
-    /// prebuilt feed composes: with lengths a prior input already carried
-    /// across, and with lengths `add_doc` accumulated for docs tokenized into
-    /// the same builder — the merged lengths axis stays aligned with the
-    /// column's ascending local-doc-id axis either way.
-    ///
-    /// Also accumulates `total_tokens` as the sum of the lengths. `finish`
-    /// derives the stored average from it, and a doc length *is*
-    /// its token count (`add_doc` clamps only at `u32::MAX`, never reached in
-    /// practice), so this sum equals what re-indexing the same corpus would
-    /// accumulate — keeping merged BM25 scores identical to a fresh build.
-    pub(crate) fn append_prebuilt_doc_lengths(&mut self, column_id: u32, doc_lengths: &[u32]) {
-        let total_tokens: u64 = doc_lengths.iter().map(|&dl| u64::from(dl)).sum();
-        let col = &mut self.columns[column_id as usize];
-        col.total_tokens += total_tokens;
-        col.doc_lengths
-            .extend(doc_lengths.iter().map(|&dl| stored_doc_length(dl)));
-        self.n_docs = self.n_docs.max(col.doc_lengths.len() as u32);
-    }
-
-    /// Spilled-mode hot path. Per-token cost: intern lookup + dense-
-    /// array tf bump; per-doc cost: drain `updated_terms` into the
-    /// partition writers as 12-byte triples. Invariant maintained:
-    /// `dense_doc_tf.len() == id_to_term.len()` and
-    /// `dense_doc_tf[tid] != 0 iff tid in updated_terms`. See the
-    /// inline `SAFETY` comments for the bounds-check elisions.
-    #[inline(always)]
-    fn add_doc_spilled(
-        &mut self,
-        col_idx: usize,
-        local_doc_id: u32,
-        text: &str,
-    ) -> Result<(), BuildError> {
         // Downcast once per call so the tokenize_each_inline fast
-        // path is reachable. See the original `add_doc` for the
-        // ~150M dyn-dispatch savings this buys on the 1M-doc bench.
+        // path is reachable: through the trait object every token
+        // costs an indirect call and the interning closure cannot
+        // inline into the scan loop.
         let tokenizer = &self.column_tokenizers[col_idx];
-        // `standard` needs a monomorphized scan — through the trait
-        // object every token costs an indirect call and the interning
-        // closure cannot inline into the scan loop.
         let standard_tok = tokenizer
             .as_ref()
             .as_any()
@@ -2196,50 +1877,25 @@ impl FtsBuilder {
         // through the *chain's* scan — the base's would index the
         // unfiltered tokens.
         let chain_tok = tokenizer.as_ref().as_any().downcast_ref::<ChainTokenizer>();
+        let positional = self.columns[col_idx].positions;
         let mut tokens_in_doc: u64 = 0;
 
-        let positional = self.columns[col_idx].positions;
-        let col_post = &mut self.postings[col_idx];
-        let (
-            store,
+        let ColumnPostings { vocab, store } = &mut self.postings[col_idx];
+        let Vocab {
             term_to_id,
             id_to_term,
             dense_doc_tf,
             dense_doc_poshead,
             updated_terms,
             term_arena,
-        ) = match col_post {
-            ColumnPostings::Spilled {
-                partitions,
-                term_to_id,
-                id_to_term,
-                dense_doc_tf,
-                dense_doc_poshead,
-                updated_terms,
-                term_arena,
-            } => (
-                partitions,
-                term_to_id,
-                id_to_term,
-                dense_doc_tf,
-                dense_doc_poshead,
-                updated_terms,
-                term_arena,
-            ),
-            ColumnPostings::InRam { .. } => {
-                unreachable!("add_doc_spilled called on InRam column")
-            }
-        };
-
-        let n_part = store.n_partitions();
-        debug_assert!(
-            n_part.is_power_of_two(),
-            "spill_partitions must be a power of 2"
-        );
-        let mask = n_part - 1;
-
+        } = vocab;
         updated_terms.clear();
         let mut pos_overflow = false;
+
+        // Per-token cost: intern lookup + dense-array tf bump; the
+        // positional scan also links each occurrence into the per-doc
+        // chain. Both stores share this scan and differ only in where
+        // the per-doc drain below puts the postings.
         if !positional {
             let mut on_token = |tok: &str| {
                 tokens_in_doc += 1;
@@ -2250,10 +1906,10 @@ impl FtsBuilder {
                     dense_doc_tf.push(0);
                 }
                 // SAFETY: lockstep invariant between `dense_doc_tf`
-                // and `id_to_term` (see type-level docs above) holds
-                // here: `intern_term_id` returns `term_id <
-                // id_to_term.len()` and we just `push(0)` on `is_new`
-                // so `idx < dense_doc_tf.len()`.
+                // and `id_to_term` (see [`Vocab`]) holds here:
+                // `intern_term_id` returns `term_id < id_to_term.len()`
+                // and we just `push(0)` on `is_new`, so `idx <
+                // dense_doc_tf.len()`.
                 let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
                 if *slot == 0 {
                     updated_terms.push(term_id);
@@ -2268,10 +1924,6 @@ impl FtsBuilder {
                 tokenizer.tokenize_each(text, &mut on_token);
             }
         } else {
-            // Positional twin of the scan: same interning + dense-tf
-            // bump, plus each occurrence links its position into the
-            // per-doc chain (the same chain the in-RAM path uses),
-            // headed per term in `dense_doc_poshead`.
             self.doc_pos_chain.clear();
             let doc_pos_chain = &mut self.doc_pos_chain;
             // `record` interns the token, bumps its tf, and links its
@@ -2356,18 +2008,76 @@ impl FtsBuilder {
             self.n_docs = docs_now;
         }
 
-        // Per-doc drain: emit one fixed-size record per touched term,
-        // then zero the dense slot to restore the `dense_doc_tf[tid]
-        // != 0 iff in updated_terms` invariant. The positional store
-        // additionally walks the term's chain, appends its run to the
-        // partition's positions blob, and rides the run's byte offset
-        // in the record's trailing lanes.
+        // Per-doc drain: one posting per touched term, then zero the
+        // dense slot to restore the `dense_doc_tf[tid] != 0 iff in
+        // updated_terms` invariant. A positional column additionally
+        // walks the term's chain (positions come out descending — the
+        // chain heads at the LAST occurrence), reverses it, and
+        // delta-varint encodes the run.
         //
-        // SAFETY: `p = term_id & mask` where `mask = n_partitions - 1`
-        // (power-of-two enforced), so `p` indexes the partition vec;
-        // the dense-slot index `idx` was already validated above.
+        // SAFETY (every `get_unchecked` below): `idx` was validated in
+        // the scan above; `p = term_id & mask` where `mask =
+        // n_partitions - 1` (power-of-two enforced), so `p` indexes the
+        // partition vec.
+        let doc_pos_chain = &self.doc_pos_chain;
+        let pos_scratch = &mut self.pos_scratch;
+        let run_buf = &mut self.run_scratch;
         match store {
-            SpillStore::Plain(partitions) => {
+            PostingStore::Ram(ram) => {
+                ram.grow_to(id_to_term.len(), positional);
+                let mut new_bytes: usize = 0;
+                for &term_id in updated_terms.iter() {
+                    let idx = term_id as usize;
+                    let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
+                    let tf = *slot;
+                    *slot = 0;
+                    let list = &mut ram.postings[idx];
+                    if list.is_empty() {
+                        new_bytes = new_bytes
+                            .saturating_add(ACCUM_NEW_TERM_FIXED_BYTES + id_to_term[idx].len());
+                    }
+                    list.push((local_doc_id, tf));
+                    new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
+                    if positional {
+                        let head_slot = unsafe { dense_doc_poshead.get_unchecked_mut(idx) };
+                        let head = *head_slot;
+                        *head_slot = CHAIN_END;
+                        pos_scratch.clear();
+                        let mut at = head;
+                        while at != CHAIN_END {
+                            let (pos, prev) = doc_pos_chain[at as usize];
+                            pos_scratch.push(pos);
+                            at = prev;
+                        }
+                        pos_scratch.reverse();
+                        debug_assert_eq!(
+                            pos_scratch.len() as u32,
+                            tf,
+                            "chain length must equal tf"
+                        );
+                        let run = &mut ram.pos_runs[idx];
+                        let before = run.len();
+                        encode_run(run, pos_scratch);
+                        new_bytes = new_bytes.saturating_add(run.len() - before);
+                    }
+                }
+                ram.bytes = ram.bytes.saturating_add(new_bytes);
+                if ram.bytes > self.spill_threshold_bytes {
+                    // Crossed the threshold: move the postings to spill
+                    // files, keyed by the ids already assigned, and run
+                    // the rest of the build in spill mode.
+                    let spilled = Self::spill_ram_store(
+                        self.scratch_dir.path(),
+                        column_id,
+                        self.spill_partitions,
+                        positional,
+                        mem::replace(ram, RamStore::new()),
+                    )?;
+                    *store = PostingStore::Spilled(spilled);
+                }
+            }
+            PostingStore::Spilled(SpillStore::Plain(partitions)) => {
+                let mask = partitions.len() - 1;
                 for &term_id in updated_terms.iter() {
                     let idx = term_id as usize;
                     let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
@@ -2378,10 +2088,8 @@ impl FtsBuilder {
                     push_record_batched(partition, [term_id, local_doc_id, tf])?;
                 }
             }
-            SpillStore::Positional { partitions, blobs } => {
-                let doc_pos_chain = &self.doc_pos_chain;
-                let pos_scratch = &mut self.pos_scratch;
-                let run_buf = &mut self.run_scratch;
+            PostingStore::Spilled(SpillStore::Positional { partitions, blobs }) => {
+                let mask = partitions.len() - 1;
                 for &term_id in updated_terms.iter() {
                     let idx = term_id as usize;
                     let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
@@ -2419,324 +2127,122 @@ impl FtsBuilder {
         Ok(())
     }
 
-    /// In-RAM hot path. Stages tokens into a per-doc `tf_per_term`
-    /// hashbrown map (`&str` keys backed by `self.bump`), then
-    /// drains into the column's `terms: HashMap<Box<str>, …>`
-    /// posting accumulator. On a Zipfian corpus ~80-95% of tokens
-    /// are repeats within the same doc, so the bump-arena-keyed
-    /// raw-entry probe pays off vs a `Box<str>`-keyed map.
+    /// Push one prebuilt posting `(term, doc_id, tf, positions)` into the
+    /// column's accumulator without tokenizing — the FTS-compaction-merge
+    /// counterpart of [`add_doc`]. `positions` is empty for a non-positional
+    /// column; otherwise it holds the `tf` token offsets for this `(term,
+    /// doc)`. The concatenating merges feed each term's docs in ascending
+    /// doc-id order (sequential inputs, dense remap), matching what
+    /// `add_doc` produces. The multi-cell merge does not — it remaps
+    /// postings through the packed stable-id row order — so it forces the
+    /// column into spill mode first, where the finish restores per-term
+    /// doc order (see `radix_sort_records_by_lex_rank`); the in-RAM
+    /// accumulator preserves insertion order and must only be fed
+    /// ascending.
     ///
-    /// After the drain, if the column's accumulated bytes cross
-    /// `self.spill_threshold_bytes`, transitions it to
-    /// `ColumnPostings::Spilled` (one-shot — every subsequent
-    /// `add_doc` for this column routes through
-    /// [`Self::add_doc_spilled`]).
-    #[inline(always)]
-    fn add_doc_inram(
+    /// Doc lengths are fed separately via [`append_prebuilt_doc_lengths`] — the
+    /// merge carries the inputs' stored lengths rather than recomputing them.
+    ///
+    /// Memory-bounded: while in-RAM, a push that crosses `spill_threshold_bytes`
+    /// transitions the column to the spilled accumulator (the same
+    /// [`add_doc`]-time transition), after which each posting is written
+    /// straight to the partition/position spill files.
+    ///
+    /// [`add_doc`]: Self::add_doc
+    /// [`append_prebuilt_doc_lengths`]: Self::append_prebuilt_doc_lengths
+    pub(crate) fn add_prebuilt_term_posting(
         &mut self,
-        col_idx: usize,
-        local_doc_id: u32,
-        text: &str,
+        column_id: u32,
+        term: &str,
+        doc_id: FtsDocId,
+        tf: u32,
+        positions: &[u32],
     ) -> Result<(), BuildError> {
-        let tokenizer = &self.column_tokenizers[col_idx];
-        // `standard` needs a monomorphized scan — through the trait
-        // object every token costs an indirect call and the interning
-        // closure cannot inline into the scan loop.
-        let standard_tok = tokenizer
-            .as_ref()
-            .as_any()
-            .downcast_ref::<StandardTokenizer>();
-        // A column with a stopword set or a stemmer tokenizes through
-        // the chain, which wraps `standard`. It gets its own
-        // monomorphized arm for the same reason, and it must be reached
-        // through the *chain's* scan — the base's would index the
-        // unfiltered tokens.
-        let chain_tok = tokenizer.as_ref().as_any().downcast_ref::<ChainTokenizer>();
-        let mut tokens_in_doc: u64 = 0;
+        // The accumulators below are the blob's own id space from end to
+        // end, so the id comes off here, once, at the entry point that
+        // decides what space the caller had to be in.
+        let doc_id = doc_id.get();
+        let col_idx = column_id as usize;
         let positional = self.columns[col_idx].positions;
-
-        // Clear borrowed keys before resetting their backing arena.
-        // Both containers retain their allocations for the next doc.
-        self.doc_tf.clear();
-        self.bump.reset();
-        let bump = &self.bump;
-
-        // Per-doc dedup map. `hashbrown::raw_entry_mut` probes
-        // with the *borrowed* `&str` token from the tokenizer's
-        // input slice and only pays the `bump.alloc_str` copy on
-        // the miss path. Hit-path cost: hash + load + increment.
-        let tf_per_term = &mut self.doc_tf;
-        if !positional {
-            let mut on_token = |tok: &str| {
-                tokens_in_doc += 1;
-                let hash = compute_hash(tf_per_term.hasher(), tok);
-                match tf_per_term
-                    .raw_entry_mut()
-                    .from_hash(hash, |existing| *existing == tok)
-                {
-                    RawEntryMut::Occupied(mut e) => {
-                        *e.get_mut() += 1;
-                    }
-                    RawEntryMut::Vacant(e) => {
-                        // Miss path: copy borrowed token bytes into
-                        // the bump arena so the key outlives the
-                        // tokenizer's input lifetime, then widen the
-                        // bump ref to `'static` tied to the scratch
-                        // table's lifetime.
-                        let bumped: &str = bump.alloc_str(tok);
-                        // SAFETY: the `'static` tag is a lie — the real
-                        // lifetime is `self.bump`. The table is drained below,
-                        // cleared before the arena is reset on the next call,
-                        // and declared before `bump` so it also drops first if
-                        // unwinding leaves entries behind.
-                        let extended: &'static str = unsafe { std::mem::transmute(bumped) };
-                        e.insert_hashed_nocheck(hash, extended, 1);
-                    }
+        let ColumnPostings { vocab, store } = &mut self.postings[col_idx];
+        let term_id = vocab.intern(term, positional);
+        let idx = term_id as usize;
+        match store {
+            PostingStore::Ram(ram) => {
+                ram.grow_to(vocab.len(), positional);
+                let mut new_bytes: usize = 0;
+                let list = &mut ram.postings[idx];
+                if list.is_empty() {
+                    new_bytes = new_bytes.saturating_add(ACCUM_NEW_TERM_FIXED_BYTES + term.len());
                 }
-            };
-            if let Some(standard) = standard_tok {
-                standard.tokenize_each_inline(text, &mut on_token);
-            } else if let Some(chain) = chain_tok {
-                chain.tokenize_each_inline(text, &mut on_token);
-            } else {
-                tokenizer.tokenize_each(text, &mut on_token);
-            }
-        } else {
-            // Positional variant of the scan: same tf accumulation,
-            // plus each occurrence links its token position into a
-            // per-doc chained list headed per term. Chained (not
-            // sorted): O(1) per token, and the drain below walks each
-            // term's chain once. A separate closure so the
-            // positionless hot path above stays byte-identical.
-            self.doc_pos_head.clear();
-            self.doc_pos_chain.clear();
-            let doc_pos_head = &mut self.doc_pos_head;
-            let doc_pos_chain = &mut self.doc_pos_chain;
-            let mut pos_overflow = false;
-            // `record` accumulates tf and links each occurrence's
-            // `position` into the per-doc chain. `position` is the
-            // gap-inclusive ordinal (a dropped token still advances it,
-            // so phrase adjacency isn't faked across a dropped word);
-            // the doc length (`tokens_in_doc`) counts only emitted
-            // tokens, bumped by the caller below — identical to the
-            // positionless build.
-            let mut record = |tok: &str, position: u64| {
-                let hash = compute_hash(tf_per_term.hasher(), tok);
-                let key: &'static str = match tf_per_term
-                    .raw_entry_mut()
-                    .from_hash(hash, |existing| *existing == tok)
-                {
-                    RawEntryMut::Occupied(mut e) => {
-                        *e.get_mut() += 1;
-                        e.key()
-                    }
-                    RawEntryMut::Vacant(e) => {
-                        let bumped: &str = bump.alloc_str(tok);
-                        // SAFETY: same lifetime argument as the
-                        // positionless closure above — the map (and
-                        // the chain-head map, which shares its keys)
-                        // is drained/cleared before the arena resets.
-                        let extended: &'static str = unsafe { std::mem::transmute(bumped) };
-                        e.insert_hashed_nocheck(hash, extended, 1);
-                        extended
-                    }
-                };
-                if position > u32::MAX as u64 {
-                    // Positions are u32 ordinals; a doc this long is
-                    // a hard build error (checked after the scan).
-                    pos_overflow = true;
-                    return;
+                list.push((doc_id, tf));
+                new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
+                if positional {
+                    let run = &mut ram.pos_runs[idx];
+                    let before = run.len();
+                    encode_run(run, positions);
+                    new_bytes = new_bytes.saturating_add(run.len() - before);
                 }
-                let idx = doc_pos_chain.len() as u32;
-                let prev = doc_pos_head.insert(key, idx).unwrap_or(CHAIN_END);
-                doc_pos_chain.push((position as u32, prev));
-            };
-            if let Some(standard) = standard_tok {
-                // `standard` drops nothing — every segment carrying an
-                // alphanumeric is emitted — so an emission ordinal *is*
-                // the gap-inclusive position and no gap bookkeeping is
-                // needed. Monomorphized for the same reason as above.
-                standard.tokenize_each_inline(text, |tok| {
-                    record(tok, tokens_in_doc);
-                    tokens_in_doc += 1;
-                });
-            } else if let Some(chain) = chain_tok {
-                // Gap-aware: a token the chain's stopword filter removes
-                // advances the position ordinal but emits nothing, and
-                // the doc length counts only what is emitted — the token
-                // count Lucene's norms are built from too.
-                chain.tokenize_each_inline_positioned(text, |tok, position| {
-                    record(tok, position);
-                    tokens_in_doc += 1;
-                });
-            } else {
-                // A custom tokenizer reports its own gap-inclusive
-                // positions through the trait (see the `Tokenizer`
-                // trait docs).
-                tokenizer.tokenize_each_positioned(text, &mut |tok, position| {
-                    record(tok, position);
-                    tokens_in_doc += 1;
-                });
-            }
-            if pos_overflow {
-                return Err(BuildError::PositionOverflow {
-                    column: self.columns[col_idx].name.clone(),
-                });
-            }
-        }
-
-        let col = &mut self.columns[col_idx];
-        let dl_clamped: u32 = stored_doc_length(tokens_in_doc.min(u32::MAX as u64) as u32);
-        col.doc_lengths.push(dl_clamped);
-        col.total_tokens = col.total_tokens.saturating_add(tokens_in_doc);
-        let docs_now = local_doc_id.saturating_add(1);
-        if docs_now > self.n_docs {
-            self.n_docs = docs_now;
-        }
-
-        let column_id = col_idx as u32;
-        let col_post = &mut self.postings[col_idx];
-        let (terms, pos_runs, bytes) = match col_post {
-            ColumnPostings::InRam {
-                terms,
-                pos_runs,
-                bytes,
-            } => (terms, pos_runs, bytes),
-            ColumnPostings::Spilled { .. } => {
-                unreachable!("add_doc_inram called on Spilled column")
-            }
-        };
-        // Lookup with `get_mut(&str)` first — borrowed probe
-        // against a `Box<str>` key, no allocation on hits. Only
-        // the miss path constructs a `Box::<str>::from(term)` for
-        // insertion. Bytes accounting folds into the same loop.
-        let doc_pos_head = &self.doc_pos_head;
-        let doc_pos_chain = &self.doc_pos_chain;
-        let pos_scratch = &mut self.pos_scratch;
-        let mut new_bytes: usize = 0;
-        for (term, tf) in tf_per_term.drain() {
-            let term_len = term.len();
-            match terms.get_mut(term) {
-                Some(acc) => {
-                    acc.push((local_doc_id, tf));
-                    new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
-                }
-                None => {
-                    terms.insert(Box::<str>::from(term), vec![(local_doc_id, tf)]);
-                    new_bytes = new_bytes.saturating_add(
-                        ACCUM_NEW_TERM_FIXED_BYTES + term_len + ACCUM_POSTING_BYTES,
-                    );
-                }
-            }
-            if positional {
-                // Walk this term's per-doc chain (positions come out
-                // descending — the chain heads at the LAST occurrence),
-                // reverse to ascending, and append the delta-varint run
-                // to the term's run buffer. Pair order and run order
-                // stay aligned because both append once per (term, doc)
-                // in this same loop.
-                let head = doc_pos_head.get(term).copied().unwrap_or(CHAIN_END);
-                debug_assert_ne!(head, CHAIN_END, "tf term missing from position chain");
-                pos_scratch.clear();
-                let mut at = head;
-                while at != CHAIN_END {
-                    let (p, prev) = doc_pos_chain[at as usize];
-                    pos_scratch.push(p);
-                    at = prev;
-                }
-                pos_scratch.reverse();
-                debug_assert_eq!(pos_scratch.len() as u32, tf, "chain length must equal tf");
-                match pos_runs.get_mut(term) {
-                    Some(run) => {
-                        let before = run.len();
-                        encode_run(run, pos_scratch);
-                        new_bytes = new_bytes.saturating_add(run.len() - before);
-                    }
-                    None => {
-                        let mut run = Vec::new();
-                        encode_run(&mut run, pos_scratch);
-                        new_bytes = new_bytes
-                            .saturating_add(ACCUM_NEW_TERM_FIXED_BYTES + term_len + run.len());
-                        pos_runs.insert(Box::<str>::from(term), run);
-                    }
-                }
-            }
-        }
-        let new_total = bytes.saturating_add(new_bytes);
-
-        if new_total > self.spill_threshold_bytes {
-            // Crossed the threshold. Drain the in-RAM map into a
-            // fresh set of spill files for this column, build the
-            // interner from the drained vocab, transition to
-            // `Spilled` so subsequent `add_doc` calls route to
-            // `add_doc_spilled`.
-            let drained = mem::take(terms);
-            let drained_pos_runs = mem::take(pos_runs);
-            let term_arena = Bump::new();
-            let mut term_to_id: TermIdMap = TermIdMap::default();
-            // Pre-size to the exact post-flush vocab.
-            let mut id_to_term: Vec<&'static str> = Vec::with_capacity(drained.len());
-            let store = match positional {
-                false => {
-                    let mut partitions = Self::open_partitions_for_column(
+                ram.bytes = ram.bytes.saturating_add(new_bytes);
+                if ram.bytes > self.spill_threshold_bytes {
+                    let spilled = Self::spill_ram_store(
                         self.scratch_dir.path(),
                         column_id,
                         self.spill_partitions,
+                        positional,
+                        mem::replace(ram, RamStore::new()),
                     )?;
-                    Self::flush_in_ram_to_partitions(
-                        drained,
-                        &mut partitions,
-                        &mut term_to_id,
-                        &mut id_to_term,
-                        &term_arena,
-                    )?;
-                    SpillStore::Plain(partitions)
+                    *store = PostingStore::Spilled(spilled);
                 }
-                true => {
-                    let mut partitions = Self::open_partitions_for_column(
-                        self.scratch_dir.path(),
-                        column_id,
-                        self.spill_partitions,
-                    )?;
-                    let mut blobs = Self::open_position_blobs_for_column(
-                        self.scratch_dir.path(),
-                        column_id,
-                        self.spill_partitions,
-                    )?;
-                    Self::flush_in_ram_to_positional_partitions(
-                        drained,
-                        drained_pos_runs,
-                        &mut partitions,
-                        &mut blobs,
-                        &mut term_to_id,
-                        &mut id_to_term,
-                        &term_arena,
-                    )?;
-                    SpillStore::Positional { partitions, blobs }
-                }
-            };
-            let dense_doc_tf = vec![0u32; id_to_term.len()];
-            let dense_doc_poshead = match positional {
-                true => vec![CHAIN_END; id_to_term.len()],
-                false => Vec::new(),
-            };
-            let updated_terms: Vec<u32> = Vec::new();
-            *col_post = ColumnPostings::Spilled {
-                partitions: store,
-                term_to_id,
-                id_to_term,
-                dense_doc_tf,
-                dense_doc_poshead,
-                updated_terms,
-                // Declared last in the variant so it drops last;
-                // see `TermIdMap` doc for the lifetime invariant.
-                term_arena,
-            };
-        } else {
-            *bytes = new_total;
+            }
+            PostingStore::Spilled(SpillStore::Plain(parts)) => {
+                let p = idx & (parts.len() - 1);
+                push_record_batched(&mut parts[p], [term_id, doc_id, tf])?;
+            }
+            PostingStore::Spilled(SpillStore::Positional {
+                partitions: parts,
+                blobs,
+            }) => {
+                let p = idx & (parts.len() - 1);
+                let blob = &mut blobs[p];
+                let writer = blob
+                    .writer
+                    .as_mut()
+                    .expect("positions blob writer open before finish");
+                let run = &mut self.run_scratch;
+                run.clear();
+                encode_run(run, positions);
+                writer.write_all(run)?;
+                let pos_off = blob.len;
+                blob.len += run.len() as u64;
+                let (lo, hi) = pos_off_lanes(pos_off);
+                push_record_batched(&mut parts[p], [term_id, doc_id, tf, lo, hi])?;
+            }
         }
-
         Ok(())
+    }
+
+    /// Append a run of per-doc lengths to a column (the compaction merge feeds
+    /// the inputs' already-clamped stored lengths rather than recomputing them
+    /// from text) and advance the builder's doc count so `finish` sizes the
+    /// doc-lengths table and `n_docs` correctly. Append (not replace) so the
+    /// prebuilt feed composes: with lengths a prior input already carried
+    /// across, and with lengths `add_doc` accumulated for docs tokenized into
+    /// the same builder — the merged lengths axis stays aligned with the
+    /// column's ascending local-doc-id axis either way.
+    ///
+    /// Also accumulates `total_tokens` as the sum of the lengths. `finish`
+    /// derives the stored average from it, and a doc length *is*
+    /// its token count (`add_doc` clamps only at `u32::MAX`, never reached in
+    /// practice), so this sum equals what re-indexing the same corpus would
+    /// accumulate — keeping merged BM25 scores identical to a fresh build.
+    pub(crate) fn append_prebuilt_doc_lengths(&mut self, column_id: u32, doc_lengths: &[u32]) {
+        let total_tokens: u64 = doc_lengths.iter().map(|&dl| u64::from(dl)).sum();
+        let col = &mut self.columns[column_id as usize];
+        col.total_tokens += total_tokens;
+        col.doc_lengths
+            .extend(doc_lengths.iter().map(|&dl| stored_doc_length(dl)));
+        self.n_docs = self.n_docs.max(col.doc_lengths.len() as u32);
     }
 
     /// Finalise and emit the FTS blob bytes. Consumes the builder.
@@ -2815,20 +2321,14 @@ impl FtsBuilder {
             spill_partitions: _,
             max_partition_bytes: _,
             n_docs,
-            doc_tf,
-            doc_pos_head,
             doc_pos_chain: _,
             pos_scratch: _,
             run_scratch: _,
-            bump,
             doc_map,
             sorted_inputs: _,
             mut head_sink,
             head_depth,
         } = self;
-        drop(doc_tf);
-        drop(doc_pos_head);
-        drop(bump);
 
         let n_columns = columns.len() as u32;
         let mut n_terms_total_usize: usize = 0;
@@ -2900,61 +2400,33 @@ impl FtsBuilder {
                 rows: doc_map.as_deref(),
             };
 
-            // In-RAM path invariant: dispatcher checked
-            // `!any_spilled`, so every column is `InRam`.
-            let (terms, mut pos_runs) = match posting_state {
-                ColumnPostings::InRam {
-                    terms,
-                    pos_runs,
-                    bytes: _,
-                } => (terms, pos_runs),
-                ColumnPostings::Spilled { .. } => unreachable!(
+            // In-RAM path invariant: the dispatcher checked that no column
+            // spilled, so every store is the in-RAM one.
+            let ColumnPostings { vocab, store } = posting_state;
+            let ram = match store {
+                PostingStore::Ram(ram) => ram,
+                PostingStore::Spilled(_) => unreachable!(
                     "finish_to_inram dispatched on !any_spilled; \
-                     Spilled column cannot appear here"
+                     a spilled column cannot appear here"
                 ),
             };
-
-            // Sort term keys; per-term doc lists are already in
-            // insertion order (monotonically increasing local_doc_id
-            // per the `add_doc` contract), so no per-list sort
-            // needed. pdqsort: dictionary entries for one in-RAM
-            // column can run into millions; stability is unnecessary
-            // because keys are unique.
-            type InRamEntries = Vec<(Box<str>, Vec<(u32, u32)>)>;
-            let mut entries: InRamEntries = terms.into_iter().collect();
-            entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-            for (term, postings) in entries {
-                // A positional column hands the term's runs (removed
-                // by value so the map shrinks as it drains) plus the
-                // shared region sink to the encoder.
-                let term_runs: Vec<u8> = match col_positions {
-                    true => pos_runs
-                        .remove(&term)
-                        .expect("positional term accumulated a position run"),
-                    false => Vec::new(),
-                };
-                let term_positions = match col_positions {
-                    true => Some((&mut positions_sink, TermRuns::Encoded(&term_runs))),
-                    false => None,
-                };
-                encode_and_emit_term(
-                    &term,
-                    &postings,
-                    col_name_bytes,
-                    &enc,
-                    &mut key_buf,
-                    &mut postings_writer,
-                    &mut postings_crc_acc,
-                    &mut postings_len,
-                    Some(&mut dict_inram),
-                    None,
-                    term_positions,
-                    &mut finish_profile,
-                    &mut term_scratch,
-                    &mut head_sink,
-                )?;
-                n_terms_total_usize += 1;
-            }
+            n_terms_total_usize += emit_ram_column(
+                vocab,
+                ram,
+                col_positions,
+                col_name_bytes,
+                &enc,
+                &mut key_buf,
+                &mut postings_writer,
+                &mut postings_crc_acc,
+                &mut postings_len,
+                Some(&mut dict_inram),
+                None,
+                &mut positions_sink,
+                &mut finish_profile,
+                &mut term_scratch,
+                &mut head_sink,
+            )?;
 
             doc_lengths_by_orig_col[orig_col_idx] = Some(col_doc_lengths_owned);
         }
@@ -3002,20 +2474,14 @@ impl FtsBuilder {
             spill_partitions: _,
             max_partition_bytes,
             n_docs,
-            doc_tf,
-            doc_pos_head,
             doc_pos_chain: _,
             pos_scratch: _,
             run_scratch: _,
-            bump,
             doc_map,
             sorted_inputs,
             mut head_sink,
             head_depth,
         } = self;
-        drop(doc_tf);
-        drop(doc_pos_head);
-        drop(bump);
 
         let n_columns = columns.len() as u32;
         let mut n_terms_total_usize: usize = 0;
@@ -3065,7 +2531,7 @@ impl FtsBuilder {
         // in this work list are no-ops.
         let partition_flush_start = finish_profile.enabled.then(Instant::now);
         for (_, _, cp) in &mut work {
-            if let ColumnPostings::Spilled { partitions, .. } = cp {
+            if let PostingStore::Spilled(partitions) = &mut cp.store {
                 match partitions {
                     SpillStore::Plain(parts) => {
                         for partition in parts {
@@ -3205,66 +2671,37 @@ impl FtsBuilder {
                 record("terms", n_emitted as u64);
                 drop(merge_span);
             } else {
-                match posting_state {
-                    ColumnPostings::InRam {
-                        terms,
-                        pos_runs: mut col_pos_runs,
-                        bytes: _,
-                    } => {
-                        // Sort term keys; per-term doc lists are already
-                        // in insertion order which is monotonically
-                        // increasing local_doc_id per the add_doc
-                        // contract — no per-list sort needed.
-                        type InRamEntries = Vec<(Box<str>, Vec<(u32, u32)>)>;
-                        let mut entries: InRamEntries = terms.into_iter().collect();
-                        // pdqsort: posting-table dictionary entries for
-                        // one in-RAM column can run into millions of
-                        // terms; stability is unnecessary because keys
-                        // are unique.
-                        entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-                        for (term, postings) in entries {
-                            // Positional columns never spill (their
-                            // accumulator is pinned in RAM), so a spilled
-                            // build's positional terms all pass through
-                            // this arm with their runs.
-                            let term_runs: Vec<u8> = match col_positions {
-                                true => col_pos_runs
-                                    .remove(&term)
-                                    .expect("positional term accumulated a position run"),
-                                false => Vec::new(),
-                            };
-                            let term_positions = match col_positions {
-                                true => Some((&mut positions_sink, TermRuns::Encoded(&term_runs))),
-                                false => None,
-                            };
-                            encode_and_emit_term(
-                                &term,
-                                &postings,
-                                col_name_bytes,
-                                &enc,
-                                &mut key_buf,
-                                &mut postings_writer,
-                                &mut postings_crc_acc,
-                                &mut postings_len,
-                                None,
-                                Some(&mut dict_streaming),
-                                term_positions,
-                                &mut finish_profile,
-                                &mut term_scratch,
-                                &mut head_sink,
-                            )?;
-                            n_terms_total_usize += 1;
-                        }
+                let ColumnPostings { vocab, store } = posting_state;
+                match store {
+                    // A column that stayed under the threshold in a build
+                    // where another spilled: emitted straight from RAM,
+                    // into the streaming dictionary like its neighbours.
+                    PostingStore::Ram(ram) => {
+                        n_terms_total_usize += emit_ram_column(
+                            vocab,
+                            ram,
+                            col_positions,
+                            col_name_bytes,
+                            &enc,
+                            &mut key_buf,
+                            &mut postings_writer,
+                            &mut postings_crc_acc,
+                            &mut postings_len,
+                            None,
+                            Some(&mut dict_streaming),
+                            &mut positions_sink,
+                            &mut finish_profile,
+                            &mut term_scratch,
+                            &mut head_sink,
+                        )?;
                     }
-                    ColumnPostings::Spilled {
-                        partitions,
-                        term_to_id,
-                        id_to_term,
-                        dense_doc_tf: _,
-                        dense_doc_poshead: _,
-                        updated_terms: _,
-                        term_arena,
-                    } => {
+                    PostingStore::Spilled(partitions) => {
+                        let Vocab {
+                            term_to_id,
+                            id_to_term,
+                            term_arena,
+                            ..
+                        } = vocab;
                         // Term interner is finished being written to; drop the
                         // forward map (`term_to_id`) immediately — the rest of
                         // the spilled finish only needs the reverse map
@@ -4169,6 +3606,87 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     Ok(n_emitted)
 }
 
+/// Emit one in-RAM column's terms in dictionary order: the ids are
+/// sorted by their term bytes once, then each id's postings and runs
+/// are encoded straight out of the store — the lists are already in
+/// ascending doc order, so no per-list or partition sort runs. Each
+/// list is taken out of the store as it is emitted, so the column's
+/// resident bytes shrink as the emit proceeds. Returns the number of
+/// terms written.
+#[allow(clippy::too_many_arguments)]
+fn emit_ram_column<W: Write>(
+    vocab: Vocab,
+    ram: RamStore,
+    col_positions: bool,
+    col_name_bytes: &[u8],
+    enc: &TermEncoding<'_>,
+    key_buf: &mut Vec<u8>,
+    postings_writer: &mut W,
+    postings_crc_acc: &mut u32,
+    postings_len: &mut u64,
+    mut dict_entries_inram: Option<&mut TermDictBuilder>,
+    mut dict_streaming: Option<&mut TermBlockWriter<BufWriter<File>>>,
+    positions_sink: &mut PositionsSink,
+    finish_profile: &mut FinishProfile,
+    term_scratch: &mut TermScratch,
+    head_sink: &mut Option<Box<dyn TermHeadSink>>,
+) -> Result<usize, BuildError> {
+    let Vocab {
+        term_to_id,
+        id_to_term,
+        term_arena,
+        ..
+    } = vocab;
+    // The forward map is finished with; only the reverse map is read
+    // below. Its keys borrow from `term_arena`, which outlives every
+    // read of `id_to_term` here (dropped explicitly at the end).
+    drop(term_to_id);
+    let RamStore {
+        mut postings,
+        mut pos_runs,
+        ..
+    } = ram;
+    let (_, term_id_in_lex_order) = build_lex_rank(&id_to_term);
+    let mut n_emitted = 0usize;
+    for &term_id in &term_id_in_lex_order {
+        let idx = term_id as usize;
+        let pairs = mem::take(&mut postings[idx]);
+        if pairs.is_empty() {
+            // Interned but never given a posting — only a prebuilt feed
+            // that failed mid-push could leave this; nothing to write.
+            continue;
+        }
+        let runs: Vec<u8> = match col_positions {
+            true => mem::take(&mut pos_runs[idx]),
+            false => Vec::new(),
+        };
+        let term_positions = match col_positions {
+            true => Some((&mut *positions_sink, TermRuns::Encoded(runs.as_slice()))),
+            false => None,
+        };
+        encode_and_emit_term(
+            id_to_term[idx],
+            &pairs,
+            col_name_bytes,
+            enc,
+            key_buf,
+            postings_writer,
+            postings_crc_acc,
+            postings_len,
+            dict_entries_inram.as_deref_mut(),
+            dict_streaming.as_deref_mut(),
+            term_positions,
+            finish_profile,
+            term_scratch,
+            head_sink,
+        )?;
+        n_emitted += 1;
+    }
+    drop(id_to_term);
+    drop(term_arena);
+    Ok(n_emitted)
+}
+
 /// Encode one term's posting list and emit the resulting dictionary entry
 /// into whichever sink the finish path uses. Exactly one of
 /// `dict_entries_inram` / `dict_streaming` is `Some`; the function
@@ -4900,137 +4418,6 @@ mod tests {
             .expect("register column");
         let err = b.add_doc(99, 0, "text").expect_err("expected error");
         assert!(matches!(err, BuildError::FtsColumnTypeInvalid { .. }));
-    }
-
-    #[test]
-    fn add_doc_reuses_term_frequency_table_capacity() {
-        let mut b = FtsBuilder::new();
-        b.register_column("title".into(), false)
-            .expect("register column");
-        b.add_doc(0, 0, "alpha beta gamma delta epsilon zeta eta theta")
-            .expect("add first doc");
-
-        assert!(b.doc_tf.is_empty(), "per-document table must be drained");
-        let capacity = b.doc_tf.capacity();
-        assert!(capacity > 0, "first document must allocate table buckets");
-
-        b.add_doc(0, 1, "alpha beta alpha").expect("add second doc");
-        assert!(b.doc_tf.is_empty(), "per-document table must be drained");
-        assert_eq!(
-            b.doc_tf.capacity(),
-            capacity,
-            "subsequent documents must reuse the existing buckets"
-        );
-    }
-
-    #[tokio::test]
-    async fn add_doc_accumulates_tf_within_doc() {
-        use bytes::Bytes;
-
-        use crate::superfile::fts::reader::{BoolMode, FtsReader};
-
-        let mut b = FtsBuilder::new();
-        b.register_column("title".into(), false)
-            .expect("register column");
-        b.add_doc(0, 0, "rust rust rust async").expect("add doc");
-
-        let blob = Bytes::from(b.finish().expect("finish"));
-        let r = FtsReader::open(
-            blob,
-            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75}]"#,
-        )
-        .expect("open");
-        let rust_hits = r
-            .search("title", &["rust"], 10, BoolMode::Or)
-            .await
-            .expect("rust search");
-        let async_hits = r
-            .search("title", &["async"], 10, BoolMode::Or)
-            .await
-            .expect("async search");
-        assert_eq!(rust_hits.len(), 1);
-        assert_eq!(rust_hits[0].0, 0);
-        assert_eq!(async_hits.len(), 1);
-        assert_eq!(async_hits[0].0, 0);
-    }
-
-    #[tokio::test]
-    async fn cross_column_same_term_stays_isolated_through_round_trip() {
-        // A term that appears in two different columns must keep
-        // its posting lists scoped per column in the emitted term dictionary +
-        // posting region. This also exercises the spill-backed
-        // accumulator: column id is implicit in the selected partition
-        // set, while the final dictionary key remains `<col>\x1F<term>`.
-        use bytes::Bytes;
-
-        use crate::superfile::fts::reader::{BoolMode, FtsReader};
-
-        let mut b = FtsBuilder::new();
-        let title_id = b
-            .register_column("title".into(), false)
-            .expect("register title");
-        let body_id = b
-            .register_column("body".into(), false)
-            .expect("register body");
-
-        // Doc 0: "rust" + "tokio" in title, "rust" + "async" in body.
-        // Doc 1: only in body — "rust".
-        // Doc 2: only in title — "rust".
-        b.add_doc(title_id, 0, "rust tokio")
-            .expect("add title doc 0");
-        b.add_doc(body_id, 0, "rust async").expect("add body doc 0");
-        b.add_doc(body_id, 1, "rust").expect("add body doc 1");
-        b.add_doc(title_id, 1, "rust").expect("add title doc 1");
-
-        // Round-trip through finish() + FtsReader::search. The
-        // reader looks up via `dict::make_key(column, term)`, so this
-        // is the strict on-disk equivalent of "two columns share a
-        // term — does each see its own postings?"
-        let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75},{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
-        let r = FtsReader::open(blob, json).expect("open");
-
-        // "rust" in title returns title's docs (0, 1) and no others.
-        let hits_t = r
-            .search("title", &["rust"], 10, BoolMode::Or)
-            .await
-            .expect("title search");
-        let ids_t: Vec<u32> = hits_t.iter().map(|(d, _)| d.get()).collect();
-        assert_eq!(ids_t.len(), 2, "title 'rust' hit count");
-        assert!(ids_t.contains(&0));
-        assert!(ids_t.contains(&1));
-
-        // "rust" in body also returns its own docs (0, 1). Same ids
-        // by coincidence; what matters is the search is scoped to
-        // body's posting list, not title's.
-        let hits_b = r
-            .search("body", &["rust"], 10, BoolMode::Or)
-            .await
-            .expect("body search");
-        let ids_b: Vec<u32> = hits_b.iter().map(|(d, _)| d.get()).collect();
-        assert_eq!(ids_b.len(), 2, "body 'rust' hit count");
-        assert!(ids_b.contains(&0));
-        assert!(ids_b.contains(&1));
-
-        // Cross-leak negative: a term that lives only in body
-        // (`async`) must NOT be findable in title, and vice versa
-        // (`tokio` in body).
-        let hits_async_in_title = r
-            .search("title", &["async"], 10, BoolMode::Or)
-            .await
-            .expect("title async search");
-        assert!(
-            hits_async_in_title.is_empty(),
-            "title must not return 'async' (lives only in body)"
-        );
-        let hits_tokio_in_body = r
-            .search("body", &["tokio"], 10, BoolMode::Or)
-            .await
-            .expect("body tokio search");
-        assert!(
-            hits_tokio_in_body.is_empty(),
-            "body must not return 'tokio' (lives only in title)"
-        );
     }
 
     #[test]

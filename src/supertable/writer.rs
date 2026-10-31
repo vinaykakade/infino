@@ -128,7 +128,10 @@ use crate::{
                 sub_hdr,
             },
         },
-        fts::{bm25::Bm25Params, builder::doc_lengths_entry_size},
+        fts::{
+            bm25::Bm25Params,
+            builder::{DEFAULT_SPILL_THRESHOLD_BYTES, doc_lengths_entry_size},
+        },
         reader::vector_layout_from_kv,
         vector::{
             builder::{
@@ -3106,6 +3109,22 @@ fn build_one_shard_with_layout(
     if let Some((sink, depth)) = &head_sink {
         builder.set_term_head_sink(Box::new(sink.clone()), *depth);
     }
+    // The text accumulator may hold what the commit reserved for it: the
+    // FTS share of the build-scratch reserve (`BUILD_FTS_NUM /
+    // BUILD_SCRATCH_DENOM` of this shard's text), never less than the
+    // builder's own default. A shard of hundreds of MB of text otherwise
+    // spills every posting to scratch files and reads them back sorted,
+    // which on a commit-sized shard writes several times the text to disk
+    // and makes the build disk-bound. A column whose postings outgrow the
+    // reserve still spills.
+    let fts_text_bytes: usize = slice
+        .iter()
+        .map(|b| ingested_byte_legs(&b.scalar, 0, options).2 as usize)
+        .sum();
+    builder.set_fts_spill_threshold_bytes(
+        (fts_text_bytes.saturating_mul(BUILD_FTS_NUM) / BUILD_SCRATCH_DENOM)
+            .max(DEFAULT_SPILL_THRESHOLD_BYTES),
+    );
 
     let scalar_schema = manifest.scalar_schema();
     // The supertable always prepends the id column at index 0 of the
