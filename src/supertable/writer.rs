@@ -50,7 +50,6 @@
 
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
-use std::sync::mpsc::{Receiver as StdReceiver, sync_channel as std_sync_channel};
 use std::{
     borrow::Cow,
     cmp,
@@ -63,7 +62,11 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     str::from_utf8,
-    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, atomic::Ordering},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
+        atomic::Ordering,
+        mpsc::{Receiver as StdReceiver, sync_channel as std_sync_channel},
+    },
     thread::available_parallelism,
     time,
 };
