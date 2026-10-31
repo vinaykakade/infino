@@ -4,10 +4,16 @@
 //! mmap primitives: map a finished cache file read-only and hand it out as
 //! shared [`Bytes`] that both the reader and the cache entry hold.
 
-use std::{fs, io, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs, io,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use bytes::Bytes;
 use memmap2::Mmap;
+use tempfile::NamedTempFile;
 
 /// Newtype around `Arc<Mmap>` that delegates `AsRef<[u8]>`
 /// to the underlying `Mmap`. Lets the cache's `mmap: Arc<Mmap>`
@@ -53,4 +59,63 @@ pub(crate) fn mmap_readonly_with_handle(path: &Path) -> io::Result<(Arc<Mmap>, B
     let mmap = Arc::new(open_readonly_mmap(path)?);
     let bytes = Bytes::from_owner(ArcMmapOwner(Arc::clone(&mmap)));
     Ok((mmap, bytes))
+}
+
+/// The sealed files behind live temp-backed [`Bytes`], keyed by the
+/// mapping's address: where a publish to local-filesystem storage finds the
+/// file to link into place instead of copying the bytes out again. An
+/// entry lives exactly as long as the bytes do.
+static TEMP_BACKED: OnceLock<Mutex<HashMap<usize, PathBuf>>> = OnceLock::new();
+
+fn temp_backed() -> &'static Mutex<HashMap<usize, PathBuf>> {
+    TEMP_BACKED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Owner of temp-backed bytes: the mapping and the file it maps, which is
+/// unlinked only when the last clone of the bytes drops.
+struct TempBackedOwner {
+    mmap: Arc<Mmap>,
+    file: NamedTempFile,
+}
+
+impl AsRef<[u8]> for TempBackedOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.mmap.as_ref()
+    }
+}
+
+impl Drop for TempBackedOwner {
+    fn drop(&mut self) {
+        if let Ok(mut map) = temp_backed().lock() {
+            map.remove(&(self.mmap.as_ptr() as usize));
+        }
+        // `file` unlinks itself after this.
+    }
+}
+
+/// Map a finished temp file read-only as zero-copy [`Bytes`] that keep the
+/// file alive, so a publish to local-filesystem storage can link that file
+/// into place ([`temp_file_behind`]) rather than write its bytes a second
+/// time. The ordinary [`mmap_readonly_bytes`] drops the file at once.
+pub(crate) fn mmap_temp_file_bytes(file: NamedTempFile) -> io::Result<Bytes> {
+    let mmap = Arc::new(open_readonly_mmap(file.path())?);
+    let owner = TempBackedOwner { mmap, file };
+    if let Ok(mut map) = temp_backed().lock() {
+        map.insert(
+            owner.mmap.as_ptr() as usize,
+            owner.file.path().to_path_buf(),
+        );
+    }
+    Ok(Bytes::from_owner(owner))
+}
+
+/// The still-present temp file `bytes` were mapped from by
+/// [`mmap_temp_file_bytes`], for the whole (unsliced) bytes; `None` for any
+/// other bytes.
+pub(crate) fn temp_file_behind(bytes: &Bytes) -> Option<PathBuf> {
+    temp_backed()
+        .lock()
+        .ok()?
+        .get(&(bytes.as_ptr() as usize))
+        .cloned()
 }

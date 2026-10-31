@@ -195,7 +195,10 @@ use crate::{
             dispatch::{open_reader, open_whole_superfile},
             vector::{IndexOutcome, serves_via_graph, stable_ids_by_local_for_routing},
         },
-        reader_cache::{DiskCacheStore, ReadIntent, disk::mmap_readonly_bytes},
+        reader_cache::{
+            DiskCacheStore, ReadIntent,
+            disk::{mmap_readonly_bytes, mmap_temp_file_bytes, temp_file_behind},
+        },
         schema::{
             DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId, LegacyNames, PhysicalSchema,
             TableSchema,
@@ -3591,7 +3594,9 @@ fn seal_shard(
             .flush()
             .map_err(|error| BuildError::Store(format!("shard temp flush: {error}")))?;
     }
-    let bytes = mmap_readonly_bytes(output.path())
+    // The file stays behind the bytes: a publish to local-filesystem
+    // storage links it into place instead of writing the superfile again.
+    let bytes = mmap_temp_file_bytes(output)
         .map_err(|error| BuildError::Store(format!("shard mmap: {error}")))?;
     let term_contribution = head_sink
         .map(|(sink, _)| sink.into_contribution(superfile_id, id_min))
@@ -12737,12 +12742,45 @@ async fn put_new_superfile_bytes(
     bytes: Bytes,
 ) -> Result<(), SupertableCommitError> {
     let path = storage_key;
+    // A superfile sealed to a file on this host, going to a directory on
+    // this host, is linked into place: the bytes were written once already.
+    // Anything that stops the link (another filesystem, a provider that is
+    // not a directory) takes the ordinary put.
+    if let (Some(dest), Some(sealed)) = (storage.local_path(&path), temp_file_behind(&bytes)) {
+        match link_sealed_file_into_place(&sealed, &dest) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                debug!(%error, "sealed file not linked into storage; writing it instead");
+            }
+        }
+    }
     let result = if (bytes.len() as u64) >= multipart_threshold {
         put_superfile_multipart(storage.as_ref(), &path, bytes).await
     } else {
         storage.put_overwrite(&path, bytes).await
     };
     result.map_err(SupertableCommitError::from)
+}
+
+/// Put `sealed` at `dest` without copying: a hard link next to `dest`, then
+/// a rename over it, so `dest` appears whole or not at all and an earlier
+/// attempt at the same key is replaced the way a put replaces it.
+fn link_sealed_file_into_place(sealed: &Path, dest: &Path) -> io::Result<()> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| io::Error::other("superfile path has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    let name = dest
+        .file_name()
+        .ok_or_else(|| io::Error::other("superfile path has no file name"))?;
+    let staging = parent.join(format!(".{}.link", name.to_string_lossy()));
+    let _ = fs::remove_file(&staging);
+    fs::hard_link(sealed, &staging)?;
+    if let Err(error) = fs::rename(&staging, dest) {
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn write_superfile_list_with_threshold(
