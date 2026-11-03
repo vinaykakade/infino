@@ -64,7 +64,7 @@ const SIGN_BIT: u32 = 0x8000_0000;
 /// Four posting blocks of documents. A group that fits a block is already
 /// as close as the postings can place it; at the 5M-document optimize the
 /// splits from four blocks down to one moved no document past 256 and
-/// left the output 0.06% larger past 512, for 2.5% of the optimize's CPU.
+/// stopping at 512 left the output 0.06% smaller and saved 2.5% of its CPU.
 const MIN_PARTITION: usize = 4 * BLOCK_LEN;
 
 /// Reorder convergence ratio.
