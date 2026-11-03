@@ -28,6 +28,7 @@ use futures::{
     stream::{self, StreamExt},
 };
 use rand::random_range;
+use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tokio::{
@@ -1374,16 +1375,36 @@ impl Supertable {
                     // cache, same as a normal writer commit does. Without
                     // this every query against it misses and re-fetches +
                     // re-opens from storage every single time.
-                    for prepared in &batch {
-                        if let Some((uri, bytes)) = prepared.bytes_for_store.clone()
-                            && let Err(e) = opts.store.insert(uri, bytes)
-                        {
-                            warn!(
-                                superfile_id = %prepared.merged_superfile_id,
-                                error = %e,
-                                "compact: failed to warm reader cache for merged superfile"
-                            );
-                        }
+                    //
+                    // Each insert opens its output's reader, and a pass's
+                    // outputs are opened side by side on the reader pool: one
+                    // after another, twenty-one gigabyte outputs held the
+                    // loop for three seconds after the commit had landed.
+                    let warms: Vec<_> = batch
+                        .iter()
+                        .filter_map(|p| {
+                            p.bytes_for_store
+                                .clone()
+                                .map(|(uri, bytes)| (p.merged_superfile_id, uri, bytes))
+                        })
+                        .collect();
+                    let store = Arc::clone(&opts.store);
+                    let warmed =
+                        run_on_pool(Some(&opts.reader_pool), "reader cache warm", move || {
+                            warms
+                                .into_par_iter()
+                                .filter_map(|(id, uri, bytes)| {
+                                    store.insert(uri, bytes).err().map(|e| (id, e))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .await;
+                    for (superfile_id, e) in warmed.unwrap_or_default() {
+                        warn!(
+                            superfile_id = %superfile_id,
+                            error = %e,
+                            "compact: failed to warm reader cache for merged superfile"
+                        );
                     }
 
                     // Drop the merged-away inputs so the in-memory cache
