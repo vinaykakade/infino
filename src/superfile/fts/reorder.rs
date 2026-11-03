@@ -37,7 +37,7 @@
 use std::{
     fmt, mem,
     sync::{
-        Mutex, PoisonError,
+        Mutex, OnceLock, PoisonError,
         atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed},
     },
     time::Instant,
@@ -45,6 +45,9 @@ use std::{
 
 #[cfg(feature = "detailed-tracing")]
 use rayon::current_thread_index;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+
 use rayon::{current_num_threads, join, prelude::*};
 use tracing::Span;
 
@@ -1394,8 +1397,21 @@ fn rank_by_gain(
     out: &mut Vec<u64>,
 ) {
     // Keys for the documents of one stretch of `half` starting at `first`.
+    let ahead = prefetch_groups();
     let keys_of = |first: usize, docs: &[u32], keys: &mut Vec<u64>| {
+        // The gains of a group `ahead` groups on are requested while this
+        // one is summed, so their misses overlap its adds.
+        let mut upcoming = docs.chunks(GAIN_LANES).skip(ahead);
         for (j, group) in docs.chunks(GAIN_LANES).enumerate() {
+            if ahead > 0
+                && let Some(next) = upcoming.next()
+            {
+                for &d in next {
+                    for &t in fwd.doc(d) {
+                        prefetch(&move_gain[t as usize]);
+                    }
+                }
+            }
             let gains = lane_gains(fwd, group, move_gain);
             let at = first + j * GAIN_LANES;
             keys.extend(
@@ -1428,6 +1444,28 @@ fn rank_by_gain(
         }
         false => keys_of(0, half, out),
     }
+}
+
+/// Ask for the cache line holding `slot`; changes nothing it reads.
+#[cfg(target_arch = "x86_64")]
+fn prefetch(slot: &f32) {
+    _mm_prefetch::<_MM_HINT_T0>((slot as *const f32).cast());
+}
+
+/// No prefetch where the target has no stable intrinsic for it.
+#[cfg(not(target_arch = "x86_64"))]
+fn prefetch(_slot: &f32) {}
+
+/// Experiment: groups ahead [`rank_by_gain`] prefetches, from
+/// `INFINO_EXP_PREFETCH_GROUPS` (unset: none).
+fn prefetch_groups() -> usize {
+    static AHEAD: OnceLock<usize> = OnceLock::new();
+    *AHEAD.get_or_init(|| {
+        std::env::var("INFINO_EXP_PREFETCH_GROUPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
 }
 
 /// The gain of each document in `group` (at most [`GAIN_LANES`] of them):
