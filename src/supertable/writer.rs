@@ -73,7 +73,7 @@ use std::{
     str::from_utf8,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{Receiver as StdReceiver, sync_channel as std_sync_channel},
     },
     thread::available_parallelism,
@@ -2628,12 +2628,20 @@ impl SupertableWriter {
                 // buffered so far: those are one superfile's worth, and a
                 // large append fed through the few lanes they would ask for
                 // would tokenise on a few threads.
-                let n_lanes = options
-                    .writer_pool
-                    .current_num_threads()
-                    .clamp(1, MAX_LANES)
-                    .min(lane_cap());
-                let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout);
+                let open_append = OpenAppend::enter();
+                let pool_threads = options.writer_pool.current_num_threads();
+                let n_lanes = match exp_knob("INFINO_EXP_LANE_SHARE") {
+                    Some(share) => (pool_threads * share / open_append.count)
+                        .max(exp_knob("INFINO_EXP_LANE_FLOOR").unwrap_or(1))
+                        .min(pool_threads),
+                    None => pool_threads.min(lane_cap()),
+                }
+                .clamp(1, MAX_LANES);
+                let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout)
+                    .map(|mut live| {
+                        live.open_append = Some(open_append);
+                        live
+                    });
                 let live = match opened {
                     Ok(live) => live,
                     Err(error) => {
@@ -3643,6 +3651,36 @@ struct LiveLanes {
     /// The least a lane's threshold is set to: the builder's own default,
     /// as a commit-time piece gets; lowered by tests to reach the bound.
     threshold_floor: usize,
+    /// Experiment: this append's place in the count of appends with lanes open.
+    open_append: Option<OpenAppend>,
+}
+
+/// Experiment: appends with live lanes open in this process.
+static OPEN_APPENDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Experiment: one append counted in [`OPEN_APPENDS`] until dropped.
+struct OpenAppend {
+    /// Appends open when this one entered, itself included.
+    count: usize,
+}
+
+impl OpenAppend {
+    fn enter() -> Self {
+        Self {
+            count: OPEN_APPENDS.fetch_add(1, Ordering::Relaxed) + 1,
+        }
+    }
+}
+
+impl Drop for OpenAppend {
+    fn drop(&mut self) {
+        OPEN_APPENDS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Experiment knob read from the environment.
+fn exp_knob(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
 /// One lane: its accumulator, and the commit rows its documents are, as
@@ -3682,6 +3720,7 @@ impl LiveLanes {
             reservations: Vec::new(),
             fts_bytes: 0,
             threshold_floor: DEFAULT_SPILL_THRESHOLD_BYTES,
+            open_append: None,
         })
     }
 
