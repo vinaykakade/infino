@@ -109,6 +109,8 @@ use bumpalo::Bump;
 use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
 use rayon::ThreadPool;
+#[cfg(test)]
+use rayon::ThreadPoolBuilder;
 use rustc_hash::FxBuildHasher;
 use tempfile::{Builder, TempDir};
 use tracing::debug;
@@ -1858,6 +1860,93 @@ impl LaneView {
     fn rows(&self) -> &Range<u32> {
         &self.lanes.pieces[self.piece]
     }
+
+    /// How many rows this view's superfile holds.
+    pub(crate) fn n_rows(&self) -> u32 {
+        let rows = self.rows();
+        rows.end - rows.start
+    }
+
+    /// Every term of `column` that this view's rows carry, in dictionary
+    /// order, with each of its rows (from the view's first, in no
+    /// particular order across lanes). `on_term` sees a term once and
+    /// returns what its rows are handed, or `None` to skip them.
+    pub(crate) fn for_each_term_row<K>(
+        &self,
+        column: usize,
+        mut on_term: impl FnMut(&str) -> Option<K>,
+        mut on_row: impl FnMut(&K, u32),
+    ) {
+        let rows = self.rows();
+        let first_row = rows.start;
+        let lanes = &self.lanes.lanes;
+        let docs = lane_doc_ranges(lanes, rows);
+        let order = &self.lanes.order[column];
+        let mut at = 0usize;
+        while at < order.len() {
+            let group_end = term_group_end(order, at);
+            let mut carry: Option<Option<K>> = None;
+            for entry in &order[at..group_end] {
+                let lane = entry.lane as usize;
+                let col = &lanes[lane].columns[column];
+                let Some((lo, hi)) = piece_span(self.piece, &docs[lane], col, entry) else {
+                    continue;
+                };
+                let Some(key) = carry.get_or_insert_with(|| on_term(col.term(entry.id))) else {
+                    break;
+                };
+                let stretches = &lanes[lane].stretches;
+                let mut cursor = 0usize;
+                for &(doc, _) in &col.postings[entry.id as usize][lo..hi] {
+                    on_row(key, row_of(stretches, &mut cursor, doc) - first_row);
+                }
+            }
+            at = group_end;
+        }
+    }
+}
+
+/// Each lane's documents in the commit rows `rows`, as document indexes.
+fn lane_doc_ranges(lanes: &[FrozenLane], rows: &Range<u32>) -> Vec<Range<usize>> {
+    lanes
+        .iter()
+        .map(|lane| {
+            let (lo, hi) = lane_doc_range(lane, rows);
+            lo..hi
+        })
+        .collect()
+}
+
+/// Where the entries of the term starting at `at` in a merged order end:
+/// from a first-flagged entry to the next.
+fn term_group_end(order: &[OrderedTerm], at: usize) -> usize {
+    order[at + 1..]
+        .iter()
+        .position(|entry| entry.first)
+        .map_or(order.len(), |n| at + 1 + n)
+}
+
+/// The postings of `entry`'s list that fall in piece `piece`, whose
+/// documents in the entry's lane are `docs`; `None` when it holds none. A
+/// list within the piece is taken whole; one that spans pieces has its
+/// cuts recorded.
+fn piece_span(
+    piece: usize,
+    docs: &Range<usize>,
+    col: &FrozenColumn,
+    entry: &OrderedTerm,
+) -> Option<(usize, usize)> {
+    let (first, last) = (entry.first_doc as usize, entry.last_doc as usize);
+    if first >= docs.end || last < docs.start {
+        return None;
+    }
+    let (lo, hi) = if first >= docs.start && last < docs.end {
+        (0, col.postings[entry.id as usize].len())
+    } else {
+        let at = col.cut_at[entry.id as usize] as usize + piece;
+        (col.cuts[at] as usize, col.cuts[at + 1] as usize)
+    };
+    (lo < hi).then_some((lo, hi))
 }
 
 /// Receives each term's facts as the blob is written: what a table-level
@@ -4356,14 +4445,7 @@ fn emit_lanes_column<W: Write>(
     let rows = view.rows();
     let first_row = rows.start;
     let lanes = &view.lanes.lanes;
-    // Each lane's documents in the view, as document indexes.
-    let docs: Vec<Range<usize>> = lanes
-        .iter()
-        .map(|lane| {
-            let (lo, hi) = lane_doc_range(lane, rows);
-            lo..hi
-        })
-        .collect();
+    let docs = lane_doc_ranges(lanes, rows);
     let order = &view.lanes.order[column];
 
     let mut pairs: Vec<(u32, u32)> = Vec::new();
@@ -4377,31 +4459,14 @@ fn emit_lanes_column<W: Write>(
     let mut n_emitted = 0usize;
     let mut at = 0usize;
     while at < order.len() {
-        // The entries of one term: from a first-flagged entry to the next.
-        let group_end = order[at + 1..]
-            .iter()
-            .position(|entry| entry.first)
-            .map_or(order.len(), |n| at + 1 + n);
+        let group_end = term_group_end(order, at);
         holders.clear();
         for entry in &order[at..group_end] {
             let lane = entry.lane as usize;
-            let range = &docs[lane];
-            let (first, last) = (entry.first_doc as usize, entry.last_doc as usize);
-            if first >= range.end || last < range.start {
-                continue;
-            }
             let col = &lanes[lane].columns[column];
-            // A list within the piece is taken whole; one that spans pieces
-            // has its cuts recorded.
-            let (lo, hi) = if first >= range.start && last < range.end {
-                (0, col.postings[entry.id as usize].len())
-            } else {
-                let at = col.cut_at[entry.id as usize] as usize + view.piece;
-                (col.cuts[at] as usize, col.cuts[at + 1] as usize)
-            };
-            if lo == hi {
+            let Some((lo, hi)) = piece_span(view.piece, &docs[lane], col, entry) else {
                 continue;
-            }
+            };
             holders.push(Holder {
                 lane,
                 col,
@@ -5143,6 +5208,84 @@ fn sort_partition_to_file<const N: usize>(
     Ok(())
 }
 
+/// A builder with a positional column `pos` and a plain one `flat`, as the
+/// lane tests feed them.
+#[cfg(test)]
+pub(crate) fn test_two_column_builder() -> FtsBuilder {
+    let mut b = FtsBuilder::new();
+    b.register_column("pos".into(), true).expect("register");
+    b.register_column("flat".into(), false).expect("register");
+    b
+}
+
+/// The blob one builder writes for rows `first..past` of `text_of`, both
+/// columns of [`test_two_column_builder`].
+#[cfg(test)]
+pub(crate) fn test_single_blob(first: u32, past: u32, text_of: &dyn Fn(u32) -> String) -> Vec<u8> {
+    let mut b = test_two_column_builder();
+    for i in first..past {
+        b.add_doc(0, i - first, &text_of(i)).expect("add pos");
+        b.add_doc(1, i - first, &text_of(i)).expect("add flat");
+    }
+    b.finish().expect("finish single")
+}
+
+/// The view of piece `piece` of `pieces` over `lanes` lanes fed rows
+/// `0..n_docs` of `text_of`: row `i` goes to lane `(i / slice) % lanes`, so
+/// each lane holds runs of `slice` rows interleaved with the other lanes',
+/// in row order, and consecutive rows of a lane fold into one stretch.
+#[cfg(test)]
+pub(crate) fn test_lanes_view(
+    n_docs: u32,
+    lanes: u32,
+    slice: u32,
+    text_of: &dyn Fn(u32) -> String,
+    pieces: Vec<Range<u32>>,
+    piece: usize,
+) -> LaneView {
+    let stretches_of = |rows: &[u32]| -> Vec<Stretch> {
+        let mut out: Vec<Stretch> = Vec::new();
+        for (doc, &row) in rows.iter().enumerate() {
+            match out.last_mut() {
+                Some(s) if s.row + s.len == row => s.len += 1,
+                _ => out.push(Stretch {
+                    doc: doc as u32,
+                    row,
+                    len: 1,
+                }),
+            }
+        }
+        out
+    };
+    let mut fed: Vec<(FtsBuilder, Vec<u32>)> = (0..lanes)
+        .map(|_| {
+            let mut b = test_two_column_builder();
+            b.set_lane_mode();
+            (b, Vec::new())
+        })
+        .collect();
+    for i in 0..n_docs {
+        let (lane, rows) = &mut fed[((i / slice) % lanes) as usize];
+        let doc = rows.len() as u32;
+        lane.add_doc(0, doc, &text_of(i)).expect("add pos");
+        lane.add_doc(1, doc, &text_of(i)).expect("add flat");
+        rows.push(i);
+    }
+    let frozen: Vec<FrozenLane> = fed
+        .into_iter()
+        .map(|(lane, rows)| lane.freeze(stretches_of(&rows)).expect("freeze"))
+        .collect();
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .expect("pool");
+    let frozen = Arc::new(freeze_lanes(&pool, frozen, pieces).expect("merge the lanes"));
+    LaneView {
+        lanes: frozen,
+        piece,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::any::Any;
@@ -5253,21 +5396,13 @@ mod tests {
     /// of rows, with terms the lanes share, terms only one holds, a term
     /// of one document each, and a term that straddles the cut.
     fn two_column_builder() -> FtsBuilder {
-        let mut b = FtsBuilder::new();
-        b.register_column("pos".into(), true).expect("register");
-        b.register_column("flat".into(), false).expect("register");
-        b
+        test_two_column_builder()
     }
 
     /// The blob one builder writes for rows `first..past` of `text_of`,
     /// both columns.
     fn single_blob(first: u32, past: u32, text_of: &dyn Fn(u32) -> String) -> Vec<u8> {
-        let mut b = two_column_builder();
-        for i in first..past {
-            b.add_doc(0, i - first, &text_of(i)).expect("add pos");
-            b.add_doc(1, i - first, &text_of(i)).expect("add flat");
-        }
-        b.finish().expect("finish single")
+        test_single_blob(first, past, text_of)
     }
 
     /// The blob piece `piece` of `pieces` gets from `lanes` lanes fed rows
@@ -5283,48 +5418,10 @@ mod tests {
         pieces: Vec<Range<u32>>,
         piece: usize,
     ) -> Vec<u8> {
-        let stretches_of = |rows: &[u32]| -> Vec<Stretch> {
-            let mut out: Vec<Stretch> = Vec::new();
-            for (doc, &row) in rows.iter().enumerate() {
-                match out.last_mut() {
-                    Some(s) if s.row + s.len == row => s.len += 1,
-                    _ => out.push(Stretch {
-                        doc: doc as u32,
-                        row,
-                        len: 1,
-                    }),
-                }
-            }
-            out
-        };
-        let mut fed: Vec<(FtsBuilder, Vec<u32>)> = (0..lanes)
-            .map(|_| {
-                let mut b = two_column_builder();
-                b.set_lane_mode();
-                (b, Vec::new())
-            })
-            .collect();
-        for i in 0..n_docs {
-            let (lane, rows) = &mut fed[((i / slice) % lanes) as usize];
-            let doc = rows.len() as u32;
-            lane.add_doc(0, doc, &text_of(i)).expect("add pos");
-            lane.add_doc(1, doc, &text_of(i)).expect("add flat");
-            rows.push(i);
-        }
-        let frozen: Vec<FrozenLane> = fed
-            .into_iter()
-            .map(|(lane, rows)| lane.freeze(stretches_of(&rows)).expect("freeze"))
-            .collect();
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .expect("pool");
-        let frozen = Arc::new(freeze_lanes(&pool, frozen, pieces).expect("merge the lanes"));
         let mut b = two_column_builder();
-        b.set_lane_view(LaneView {
-            lanes: frozen,
-            piece,
-        });
+        b.set_lane_view(test_lanes_view(
+            n_docs, lanes, slice, text_of, pieces, piece,
+        ));
         b.finish().expect("finish view")
     }
 

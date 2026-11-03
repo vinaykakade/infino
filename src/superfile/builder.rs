@@ -276,16 +276,87 @@ struct RowPick {
 }
 
 /// Keeps each document's most selective terms for the bisection: what the
-/// second pass of `merge_doc_order` does for one input over one stretch of
-/// output rows.
-struct TermPicker<'a, E: Fn(u32) -> bool> {
+/// second pass of [`doc_order_from`] does for one source over one stretch
+/// of output rows.
+struct TermPicker<'a> {
     n_fts_columns: u32,
     terms_per_doc: usize,
     df: &'a [u32],
-    eligible: &'a E,
+    eligible: &'a (dyn Fn(u32) -> bool + Sync),
 }
 
-impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
+impl TermPicker<'_> {
+    /// Offer term bucket `t`, carried by `term_df` documents, to the row
+    /// whose slots are `slots` and pick `pick`. A slot list holds the terms
+    /// carried by the fewest documents; the pick points at its most common
+    /// one and remembers that count, so a term that cannot displace it costs
+    /// one comparison. A row's picks depend only on the order its terms are
+    /// offered in.
+    fn offer(&self, slots: &mut [u32], pick: &mut RowPick, t: u32, term_df: u32) {
+        let (terms_per_doc, df) = (self.terms_per_doc, self.df);
+        let used = pick.filled as usize;
+        if used < terms_per_doc {
+            slots[used] = t;
+            if used == 0 || term_df > pick.worst_df {
+                pick.worst = used as u8;
+                pick.worst_df = term_df;
+            }
+            pick.filled = (used + 1) as u8;
+            return;
+        }
+        if term_df >= pick.worst_df {
+            return;
+        }
+        slots[pick.worst as usize] = t;
+
+        // The worst moved; find it again over the fixed, small slot count.
+        let (mut w, mut w_df) = (0usize, df[slots[0] as usize]);
+        for (i, &slot) in slots.iter().enumerate().take(terms_per_doc).skip(1) {
+            let d = df[slot as usize];
+            if d > w_df {
+                (w, w_df) = (i, d);
+            }
+        }
+        (pick.worst, pick.worst_df) = (w as u8, w_df);
+    }
+
+    /// Fill the slots of rows `first_row..past_row` of `view`'s piece from
+    /// its lanes' terms, offered in dictionary order as a reader offers a
+    /// blob's, so a piece's picks are the ones a merge of its rows makes.
+    fn pick_lanes(
+        &self,
+        view: &LaneView,
+        first_row: usize,
+        past_row: usize,
+        slots: &mut [u32],
+        picks: &mut [RowPick],
+    ) {
+        let terms_per_doc = self.terms_per_doc;
+        for column in 0..self.n_fts_columns as usize {
+            view.for_each_term_row(
+                column,
+                |term| {
+                    let t = term_bucket(term.as_bytes());
+                    (self.eligible)(t).then(|| (t, self.df[t as usize]))
+                },
+                |&(t, term_df), row| {
+                    let row = row as usize;
+                    if row < first_row || row >= past_row {
+                        return;
+                    }
+                    let row = row - first_row;
+                    let base = row * terms_per_doc;
+                    self.offer(
+                        &mut slots[base..base + terms_per_doc],
+                        &mut picks[row],
+                        t,
+                        term_df,
+                    );
+                },
+            );
+        }
+    }
+
     /// Fill the slots of output rows `first_row..past_row` from `reader`'s
     /// terms. `slots` and `picks` cover exactly those rows. A slot list
     /// holds the terms carried by the fewest documents; the row's pick
@@ -294,7 +365,7 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
     /// The count table is read once per term, not once per posting.
     fn pick(
         &self,
-        reader: &SuperfileReader,
+        fts: &FtsReader,
         rows: &[Option<RowId>],
         first_row: usize,
         past_row: usize,
@@ -302,7 +373,6 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
         picks: &mut [RowPick],
     ) -> Result<(), BuildError> {
         let (terms_per_doc, df) = (self.terms_per_doc, self.df);
-        let fts = reader.fts().expect("checked by the caller");
         for column_id in 0..self.n_fts_columns {
             // An ineligible term is skipped before its postings are read.
             let on_term = |term: &[u8]| {
@@ -318,33 +388,13 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
                     return;
                 }
                 let row = row - first_row;
-                let slot_base = row * terms_per_doc;
-                let pick = &mut picks[row];
-                let used = pick.filled as usize;
-                if used < terms_per_doc {
-                    slots[slot_base + used] = t;
-                    if used == 0 || term_df > pick.worst_df {
-                        pick.worst = used as u8;
-                        pick.worst_df = term_df;
-                    }
-                    pick.filled = (used + 1) as u8;
-                    return;
-                }
-                if term_df >= pick.worst_df {
-                    return;
-                }
-                slots[slot_base + pick.worst as usize] = t;
-
-                // The worst moved; find it again over the fixed, small slot
-                // count.
-                let (mut w, mut w_df) = (0usize, df[slots[slot_base] as usize]);
-                for i in 1..terms_per_doc {
-                    let d = df[slots[slot_base + i] as usize];
-                    if d > w_df {
-                        (w, w_df) = (i, d);
-                    }
-                }
-                (pick.worst, pick.worst_df) = (w as u8, w_df);
+                let base = row * terms_per_doc;
+                self.offer(
+                    &mut slots[base..base + terms_per_doc],
+                    &mut picks[row],
+                    t,
+                    term_df,
+                );
             })
             .map_err(|e| {
                 BuildError::Io(Error::other(format!(
@@ -354,6 +404,195 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
         }
         Ok(())
     }
+}
+
+/// Choose the order a blob stores `n_out_docs` documents in: the bisection
+/// over each document's most selective terms, in runs the forward-index
+/// budget holds. `df` counts each term bucket's documents; `pick_run` fills
+/// the slots of rows `first_row..past_row` from the source's terms. `None`
+/// when no term groups anything.
+fn doc_order_from(
+    n_out_docs: u32,
+    df: &[u32],
+    n_fts_columns: u32,
+    merge_input_mb: Option<u64>,
+    pick_run: impl Fn(
+        &TermPicker<'_>,
+        usize,
+        usize,
+        &mut [u32],
+        &mut [RowPick],
+    ) -> Result<(), BuildError>,
+) -> Result<Option<Vec<u32>>, BuildError> {
+    let too_common = (n_out_docs / 2).max(2);
+    let eligible = |t: u32| -> bool {
+        let d = df[t as usize];
+        d >= 2 && d <= too_common
+    };
+
+    // How many terms the corpus offers per document, summed over the
+    // buckets rather than the postings, so this costs a walk of the degree
+    // table and not a third pass over the index.
+    let eligible_postings: u64 = df
+        .iter()
+        .enumerate()
+        .filter(|&(t, _)| eligible(t as u32))
+        .map(|(_, &d)| u64::from(d))
+        .sum();
+    let Some(plan) = reorder_plan(n_out_docs as usize, eligible_postings, merge_input_mb) else {
+        // No term groups anything; arrival order it is.
+        return Ok(None);
+    };
+    let terms_per_doc = plan.terms_per_doc;
+
+    // Pass two: keep each document's most selective terms, in a
+    // fixed number of slots per document. Each row's pick tracks the
+    // slot holding the least selective term kept so far and its count,
+    // so a posting that cannot displace it costs one comparison.
+    // An ineligible term is skipped before its postings are read.
+    let pick_span = detail_span!(
+        "merge_order_pick_terms",
+        terms = df.iter().filter(|&&d| d > 0).count(),
+        eligible_terms = (0..df.len() as u32).filter(|&t| eligible(t)).count(),
+        eligible_postings = eligible_postings,
+        terms_per_doc = terms_per_doc,
+        chunk_docs = plan.chunk_docs,
+        runs = (n_out_docs as usize).div_ceil(plan.chunk_docs.max(1)),
+    )
+    .entered();
+    let n = n_out_docs as usize;
+    let mut order: Vec<u32> = Vec::with_capacity(n);
+    let mut grouped_any = false;
+    let mut first_row = 0usize;
+    while first_row < n {
+        let past_row = first_row.saturating_add(plan.chunk_docs).min(n);
+        let run = past_row - first_row;
+        let mut slots: Vec<u32> = vec![0; run * terms_per_doc];
+        let mut picks: Vec<RowPick> = vec![RowPick::default(); run];
+        let collect_span = detail_span!("merge_order_collect", docs = run).entered();
+        let picker = TermPicker {
+            n_fts_columns,
+            terms_per_doc,
+            df: &df,
+            eligible: &eligible,
+        };
+        pick_run(&picker, first_row, past_row, &mut slots, &mut picks)?;
+        drop(collect_span);
+
+        let docs: Vec<&[u32]> = (0..run)
+            .map(|row| {
+                let lo = row * terms_per_doc;
+                &slots[lo..lo + picks[row].filled as usize]
+            })
+            .collect();
+        match docs.iter().all(|d| d.is_empty()) {
+            // No term in this run groups anything; it keeps arrival order
+            // while the rest of the merge is still reordered.
+            true => order.extend(first_row as u32..past_row as u32),
+            false => {
+                grouped_any = true;
+                let bisect_span = detail_span!(
+                    "merge_order_bisect",
+                    docs = run,
+                    postings = docs.iter().map(|d| d.len()).sum::<usize>(),
+                    empty_docs = docs.iter().filter(|d| d.is_empty()).count(),
+                    distinct_docs = count_distinct_term_sets(&docs),
+                    reference = tracing::field::Empty,
+                    pool_threads = tracing::field::Empty,
+                    others_at_start = tracing::field::Empty,
+                    others_at_end = tracing::field::Empty,
+                    held_ms = tracing::field::Empty,
+                    splits = tracing::field::Empty,
+                    rounds = tracing::field::Empty,
+                    swaps = tracing::field::Empty,
+                    settled = tracing::field::Empty,
+                    converged = tracing::field::Empty,
+                    capped = tracing::field::Empty,
+                    predicted_gain = tracing::field::Empty,
+                    actual_gain = tracing::field::Empty,
+                    wasted_rounds = tracing::field::Empty,
+                    by_depth = tracing::field::Empty,
+                )
+                .entered();
+                let fwd = ForwardIndex::from_docs(&docs);
+                drop(docs);
+                let (run_order, report) = bisect_order_reported(&fwd, BisectParams::default());
+                let total = report.total();
+                bisect_span.record("reference", report.reference);
+                bisect_span.record("pool_threads", report.pool_threads);
+                bisect_span.record("others_at_start", report.others_at_start);
+                bisect_span.record("others_at_end", report.others_at_end);
+                bisect_span.record("held_ms", total.held_ns / 1_000_000);
+                bisect_span.record("splits", total.splits);
+                bisect_span.record("rounds", total.rounds);
+                bisect_span.record("swaps", total.swaps);
+                bisect_span.record("settled", total.settled);
+                bisect_span.record("converged", total.converged);
+                bisect_span.record("capped", total.capped);
+                bisect_span.record("predicted_gain", total.predicted_gain);
+                bisect_span.record("actual_gain", total.actual_gain);
+                bisect_span.record("wasted_rounds", total.wasted_rounds);
+                bisect_span.record("by_depth", tracing::field::display(&report));
+                order.extend(run_order.into_iter().map(|d| d + first_row as u32));
+            }
+        }
+        first_row = past_row;
+    }
+    drop(pick_span);
+
+    // Each run contributes its own rows and nothing else, so the runs
+    // together are still a permutation of the merge. Cheap to state and
+    // the one thing a chunking mistake would break.
+    debug_assert_eq!(order.len(), n, "the reordering lost or gained rows");
+    debug_assert!(
+        {
+            let mut seen = order.clone();
+            seen.sort_unstable();
+            seen.dedup();
+            seen.len() == n
+        },
+        "the reordering named a row twice"
+    );
+
+    match grouped_any {
+        true => Ok(Some(order)),
+        false => Ok(None),
+    }
+}
+
+/// [`doc_order_from`] over the rows of `view`'s piece, from its lanes: the
+/// order a merge of the same rows would choose, without writing the piece
+/// first. `None` when the piece is too small to reorder or no term groups
+/// anything.
+pub(crate) fn lane_doc_order(
+    view: &LaneView,
+    n_fts_columns: u32,
+    merge_input_mb: Option<u64>,
+) -> Result<Option<Vec<u32>>, BuildError> {
+    let n_out_docs = view.n_rows();
+    if (n_out_docs as usize) <= REORDER_MIN_DOCS {
+        return Ok(None);
+    }
+    let count_span = detail_span!("lane_order_count_terms").entered();
+    let mut df = vec![0u32; 1usize << REORDER_TERM_BUCKET_BITS];
+    for column in 0..n_fts_columns as usize {
+        view.for_each_term_row(
+            column,
+            |term| Some(term_bucket(term.as_bytes())),
+            |&t, _row| df[t as usize] += 1,
+        );
+    }
+    drop(count_span);
+    doc_order_from(
+        n_out_docs,
+        &df,
+        n_fts_columns,
+        merge_input_mb,
+        |picker, first_row, past_row, slots, picks| {
+            picker.pick_lanes(view, first_row, past_row, slots, picks);
+            Ok(())
+        },
+    )
 }
 
 /// Bits of bucket space the bisection groups terms in. Terms are hashed
@@ -2886,27 +3125,6 @@ impl SuperfileBuilder {
             .collect::<Result<_, _>>()?;
         let df = term_document_counts(readers, &rows_by_blob, n_fts_columns, n_buckets)?;
         drop(count_span);
-        let too_common = (n_out_docs / 2).max(2);
-        let eligible = |t: u32| -> bool {
-            let d = df[t as usize];
-            d >= 2 && d <= too_common
-        };
-
-        // How many terms the corpus offers per document, summed over the
-        // buckets rather than the postings, so this costs a walk of the degree
-        // table and not a third pass over the index.
-        let eligible_postings: u64 = df
-            .iter()
-            .enumerate()
-            .filter(|&(t, _)| eligible(t as u32))
-            .map(|(_, &d)| u64::from(d))
-            .sum();
-        let Some(plan) = reorder_plan(n_out_docs as usize, eligible_postings, merge_input_mb)
-        else {
-            // No term groups anything; arrival order it is.
-            return Ok(None);
-        };
-        let terms_per_doc = plan.terms_per_doc;
 
         // The stretch of output rows each input covers, so a run of documents
         // reads only the inputs it actually holds and the postings are read
@@ -2925,169 +3143,72 @@ impl SuperfileBuilder {
             })
             .collect();
 
-        // Pass two: keep each document's most selective terms, in a
-        // fixed number of slots per document. Each row's pick tracks the
-        // slot holding the least selective term kept so far and its count,
-        // so a posting that cannot displace it costs one comparison.
-        // An ineligible term is skipped before its postings are read.
-        let pick_span = detail_span!(
-            "merge_order_pick_terms",
-            terms = df.iter().filter(|&&d| d > 0).count(),
-            eligible_terms = (0..n_buckets as u32).filter(|&t| eligible(t)).count(),
-            eligible_postings = eligible_postings,
-            terms_per_doc = terms_per_doc,
-            chunk_docs = plan.chunk_docs,
-            runs = (n_out_docs as usize).div_ceil(plan.chunk_docs.max(1)),
-        )
-        .entered();
-        let n = n_out_docs as usize;
-        let mut order: Vec<u32> = Vec::with_capacity(n);
-        let mut grouped_any = false;
-        let mut first_row = 0usize;
-        while first_row < n {
-            let past_row = first_row.saturating_add(plan.chunk_docs).min(n);
-            let run = past_row - first_row;
-            let mut slots: Vec<u32> = vec![0; run * terms_per_doc];
-            let mut picks: Vec<RowPick> = vec![RowPick::default(); run];
-            let collect_span = detail_span!("merge_order_collect", docs = run).entered();
-            let picker = TermPicker {
-                n_fts_columns,
-                terms_per_doc,
-                df: &df,
-                eligible: &eligible,
-            };
-            // The inputs this run holds, with the rows of it each covers.
-            let mut covering: Vec<(usize, usize, usize)> = span_of
-                .iter()
-                .enumerate()
-                .filter_map(|(i, span)| match *span {
-                    Some((lo, hi)) if lo < past_row && hi >= first_row => {
-                        Some((i, lo.max(first_row), (hi + 1).min(past_row)))
+        doc_order_from(
+            n_out_docs,
+            &df,
+            n_fts_columns,
+            merge_input_mb,
+            |picker, first_row, past_row, slots, picks| {
+                let terms_per_doc = picker.terms_per_doc;
+                // The inputs this run holds, with the rows of it each covers.
+                let mut covering: Vec<(usize, usize, usize)> = span_of
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, span)| match *span {
+                        Some((lo, hi)) if lo < past_row && hi >= first_row => {
+                            Some((i, lo.max(first_row), (hi + 1).min(past_row)))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                covering.sort_unstable_by_key(|&(_, start, _)| start);
+                let apart = covering.windows(2).all(|pair| pair[0].2 <= pair[1].1);
+                if apart {
+                    // Every row belongs to one input, so inputs whose rows do not
+                    // interleave fill disjoint stretches of the slots, side by side;
+                    // each still reads its own terms in the order it always did.
+                    let (mut slots_rest, mut picks_rest) = (&mut slots[..], &mut picks[..]);
+                    let mut at = first_row;
+                    let mut windows = Vec::with_capacity(covering.len());
+                    for &(i, start, end) in &covering {
+                        let skip = start - at;
+                        let take = end - start;
+                        let (_, rest) = slots_rest.split_at_mut(skip * terms_per_doc);
+                        let (s, rest) = rest.split_at_mut(take * terms_per_doc);
+                        slots_rest = rest;
+                        let (_, rest) = picks_rest.split_at_mut(skip);
+                        let (p, rest) = rest.split_at_mut(take);
+                        picks_rest = rest;
+                        windows.push((i, start, end, s, p));
+                        at = end;
                     }
-                    _ => None,
-                })
-                .collect();
-            covering.sort_unstable_by_key(|&(_, start, _)| start);
-            let apart = covering.windows(2).all(|pair| pair[0].2 <= pair[1].1);
-            if apart {
-                // Every row belongs to one input, so inputs whose rows do not
-                // interleave fill disjoint stretches of the slots, side by side;
-                // each still reads its own terms in the order it always did.
-                let (mut slots_rest, mut picks_rest) = (&mut slots[..], &mut picks[..]);
-                let mut at = first_row;
-                let mut windows = Vec::with_capacity(covering.len());
-                for &(i, start, end) in &covering {
-                    let skip = start - at;
-                    let take = end - start;
-                    let (_, rest) = slots_rest.split_at_mut(skip * terms_per_doc);
-                    let (s, rest) = rest.split_at_mut(take * terms_per_doc);
-                    slots_rest = rest;
-                    let (_, rest) = picks_rest.split_at_mut(skip);
-                    let (p, rest) = rest.split_at_mut(take);
-                    picks_rest = rest;
-                    windows.push((i, start, end, s, p));
-                    at = end;
+                    windows
+                        .into_par_iter()
+                        .try_for_each(|(i, start, end, s, p)| {
+                            picker.pick(
+                                readers[i].0.fts().expect("checked above"),
+                                &rows_by_blob[i],
+                                start,
+                                end,
+                                s,
+                                p,
+                            )
+                        })?;
+                } else {
+                    for &(i, _, _) in &covering {
+                        picker.pick(
+                            readers[i].0.fts().expect("checked above"),
+                            &rows_by_blob[i],
+                            first_row,
+                            past_row,
+                            &mut *slots,
+                            &mut *picks,
+                        )?;
+                    }
                 }
-                windows
-                    .into_par_iter()
-                    .try_for_each(|(i, start, end, s, p)| {
-                        picker.pick(&readers[i].0, &rows_by_blob[i], start, end, s, p)
-                    })?;
-            } else {
-                for &(i, _, _) in &covering {
-                    picker.pick(
-                        &readers[i].0,
-                        &rows_by_blob[i],
-                        first_row,
-                        past_row,
-                        &mut slots,
-                        &mut picks,
-                    )?;
-                }
-            }
-
-            drop(collect_span);
-
-            let docs: Vec<&[u32]> = (0..run)
-                .map(|row| {
-                    let lo = row * terms_per_doc;
-                    &slots[lo..lo + picks[row].filled as usize]
-                })
-                .collect();
-            match docs.iter().all(|d| d.is_empty()) {
-                // No term in this run groups anything; it keeps arrival order
-                // while the rest of the merge is still reordered.
-                true => order.extend(first_row as u32..past_row as u32),
-                false => {
-                    grouped_any = true;
-                    let bisect_span = detail_span!(
-                        "merge_order_bisect",
-                        docs = run,
-                        postings = docs.iter().map(|d| d.len()).sum::<usize>(),
-                        empty_docs = docs.iter().filter(|d| d.is_empty()).count(),
-                        distinct_docs = count_distinct_term_sets(&docs),
-                        reference = tracing::field::Empty,
-                        pool_threads = tracing::field::Empty,
-                        others_at_start = tracing::field::Empty,
-                        others_at_end = tracing::field::Empty,
-                        held_ms = tracing::field::Empty,
-                        splits = tracing::field::Empty,
-                        rounds = tracing::field::Empty,
-                        swaps = tracing::field::Empty,
-                        settled = tracing::field::Empty,
-                        converged = tracing::field::Empty,
-                        capped = tracing::field::Empty,
-                        predicted_gain = tracing::field::Empty,
-                        actual_gain = tracing::field::Empty,
-                        wasted_rounds = tracing::field::Empty,
-                        by_depth = tracing::field::Empty,
-                    )
-                    .entered();
-                    let fwd = ForwardIndex::from_docs(&docs);
-                    drop(docs);
-                    let (run_order, report) = bisect_order_reported(&fwd, BisectParams::default());
-                    let total = report.total();
-                    bisect_span.record("reference", report.reference);
-                    bisect_span.record("pool_threads", report.pool_threads);
-                    bisect_span.record("others_at_start", report.others_at_start);
-                    bisect_span.record("others_at_end", report.others_at_end);
-                    bisect_span.record("held_ms", total.held_ns / 1_000_000);
-                    bisect_span.record("splits", total.splits);
-                    bisect_span.record("rounds", total.rounds);
-                    bisect_span.record("swaps", total.swaps);
-                    bisect_span.record("settled", total.settled);
-                    bisect_span.record("converged", total.converged);
-                    bisect_span.record("capped", total.capped);
-                    bisect_span.record("predicted_gain", total.predicted_gain);
-                    bisect_span.record("actual_gain", total.actual_gain);
-                    bisect_span.record("wasted_rounds", total.wasted_rounds);
-                    bisect_span.record("by_depth", tracing::field::display(&report));
-                    order.extend(run_order.into_iter().map(|d| d + first_row as u32));
-                }
-            }
-            first_row = past_row;
-        }
-        drop(df);
-        drop(pick_span);
-
-        // Each run contributes its own rows and nothing else, so the runs
-        // together are still a permutation of the merge. Cheap to state and
-        // the one thing a chunking mistake would break.
-        debug_assert_eq!(order.len(), n, "the reordering lost or gained rows");
-        debug_assert!(
-            {
-                let mut seen = order.clone();
-                seen.sort_unstable();
-                seen.dedup();
-                seen.len() == n
+                Ok(())
             },
-            "the reordering named a row twice"
-        );
-
-        match grouped_any {
-            true => Ok(Some(order)),
-            false => Ok(None),
-        }
+        )
     }
 
     test_visible! {
@@ -4725,7 +4846,9 @@ mod tests {
         superfile::{
             format::footer::read_kv_metadata,
             fts::{
-                builder::RADIX_SORT_MIN_TRIPLES, reader::BoolMode, short::SHORT_MAX_DF,
+                builder::{RADIX_SORT_MIN_TRIPLES, test_lanes_view, test_single_blob},
+                reader::BoolMode,
+                short::SHORT_MAX_DF,
                 sorted_merge::TERMS_PER_CHUNK,
             },
             vector::{
@@ -4737,6 +4860,55 @@ mod tests {
         test_helpers::{decimal128_ids, default_vector_config},
         utils::terms::DictEntry,
     };
+
+    /// A piece's lanes choose the order a merge of the same rows chooses:
+    /// a row's picks depend only on the order its terms are offered, and a
+    /// lane walk offers them in dictionary order as a blob's walk does.
+    /// Lanes hold interleaved runs of rows; the rows are skewed so terms
+    /// group, and the corpus is past the size a merge reorders.
+    #[test]
+    fn a_lane_piece_orders_its_rows_as_a_merge_of_them_does() {
+        const N_DOCS: u32 = 6_000;
+        const LANES: u32 = 3;
+        const SLICE: u32 = 7;
+        const N_COLUMNS: u32 = 2;
+        const COLUMNS_JSON: &str = r#"[{"name":"pos","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true},{"name":"flat","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let text_of = |i: u32| format!("topic{} sub{} word{} filler", i % 23, i % 89, (i * 7) % 61);
+
+        let view = test_lanes_view(N_DOCS, LANES, SLICE, &text_of, vec![0..N_DOCS], 0);
+        let from_lanes = lane_doc_order(&view, N_COLUMNS, None)
+            .expect("lane order")
+            .expect("terms group the rows");
+
+        let fts = FtsReader::open(
+            Bytes::from(test_single_blob(0, N_DOCS, &text_of)),
+            COLUMNS_JSON,
+        )
+        .expect("open the blob");
+        let rows: Vec<Option<RowId>> = (0..N_DOCS).map(|r| Some(RowId::new(r))).collect();
+        let mut df = vec![0u32; 1 << REORDER_TERM_BUCKET_BITS];
+        for column in 0..N_COLUMNS {
+            fts.for_each_term_df(
+                column,
+                |term| Some(term_bucket(term)),
+                |&t, term_df| df[t as usize] += term_df,
+            )
+            .expect("count");
+        }
+        let from_blob = doc_order_from(
+            N_DOCS,
+            &df,
+            N_COLUMNS,
+            None,
+            |picker, first_row, past_row, slots, picks| {
+                picker.pick(&fts, &rows, first_row, past_row, slots, picks)
+            },
+        )
+        .expect("blob order")
+        .expect("terms group the rows");
+
+        assert_eq!(from_lanes, from_blob);
+    }
 
     fn schema_with_fts() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
