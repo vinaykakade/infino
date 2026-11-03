@@ -579,6 +579,9 @@ pub(crate) fn bisect_order_reported(
         };
         split_levels(fwd, &mut order, &pool, run);
     }
+    if inherit_below() {
+        inherit_leaf_order(&mut order, min_partition());
+    }
     let reference = f64::from_bits(reference.load(Relaxed));
     let mut report = report.finish(reference);
     report.others_at_start = others_at_start;
@@ -1428,6 +1431,26 @@ fn rank_by_gain(
         }
         false => keys_of(0, half, out),
     }
+}
+
+/// Experiment: put each leaf the bisection stopped at back in input order,
+/// from `INFINO_EXP_INHERIT=1`: with reordered inputs, a leaf keeps the
+/// order its documents' superfiles already gave them.
+fn inherit_below() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INFINO_EXP_INHERIT").is_ok_and(|v| v == "1"))
+}
+
+/// Sort every leaf of `order`'s halving down to `leaf` documents by document
+/// id: the partitions the bisection stopped at, in its own halving.
+fn inherit_leaf_order(order: &mut [u32], leaf: usize) {
+    if order.len() <= leaf {
+        order.sort_unstable();
+        return;
+    }
+    let (left, right) = order.split_at_mut(order.len() / 2);
+    inherit_leaf_order(left, leaf);
+    inherit_leaf_order(right, leaf);
 }
 
 /// Experiment: the partition size the bisection stops at, from
