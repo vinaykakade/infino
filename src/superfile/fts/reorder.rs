@@ -37,7 +37,7 @@
 use std::{
     fmt, mem,
     sync::{
-        Mutex, PoisonError,
+        Mutex, OnceLock, PoisonError,
         atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed},
     },
     time::Instant,
@@ -1465,7 +1465,7 @@ fn order_leading_gains(gains: &mut [u64], want: usize, parallel: bool) {
     if want >= gains.len() {
         match parallel {
             true => gains.par_sort_unstable(),
-            false => gains.sort_unstable(),
+            false => sort_keys(gains),
         }
         return;
     }
@@ -1478,8 +1478,71 @@ fn order_leading_gains(gains: &mut [u64], want: usize, parallel: bool) {
     let head = &mut gains[..want];
     match parallel {
         true => head.par_sort_unstable(),
-        false => head.sort_unstable(),
+        false => sort_keys(head),
     }
+}
+
+/// Bits a radix pass sorts on.
+const RADIX_BITS: u32 = 8;
+
+/// Sort rank keys ascending. Keys are distinct (each carries its
+/// position), so any correct sort leaves them in the one order; from
+/// `radix_min_keys()` keys on, a least-significant-digit radix sort does
+/// it in passes over the keys instead of comparisons.
+fn sort_keys(keys: &mut [u64]) {
+    if keys.len() < radix_min_keys() {
+        keys.sort_unstable();
+        return;
+    }
+    radix_sort_keys(keys);
+}
+
+/// [`sort_keys`]' radix sort, least significant digit first.
+fn radix_sort_keys(keys: &mut [u64]) {
+    let buckets = 1usize << RADIX_BITS;
+    let mask = (buckets - 1) as u64;
+    let mut scratch = vec![0u64; keys.len()];
+    let (mut from, mut to): (&mut [u64], &mut [u64]) = (keys, &mut scratch);
+    let mut in_scratch = false;
+    let mut counts = vec![0usize; buckets];
+    for shift in (0..u64::BITS).step_by(RADIX_BITS as usize) {
+        counts.iter_mut().for_each(|c| *c = 0);
+        for &k in from.iter() {
+            counts[((k >> shift) & mask) as usize] += 1;
+        }
+        // A digit every key shares moves nothing.
+        if counts.iter().any(|&c| c == from.len()) {
+            continue;
+        }
+        let mut sum = 0usize;
+        for c in counts.iter_mut() {
+            let n = *c;
+            *c = sum;
+            sum += n;
+        }
+        for &k in from.iter() {
+            let d = ((k >> shift) & mask) as usize;
+            to[counts[d]] = k;
+            counts[d] += 1;
+        }
+        mem::swap(&mut from, &mut to);
+        in_scratch = !in_scratch;
+    }
+    if in_scratch {
+        to.copy_from_slice(from);
+    }
+}
+
+/// Experiment: keys from which [`sort_keys`] sorts by radix, from
+/// `INFINO_EXP_RADIX_MIN` (unset: never).
+fn radix_min_keys() -> usize {
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("INFINO_EXP_RADIX_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX)
+    })
 }
 
 /// Sort key for a ranked document: gain descending, then position ascending,
@@ -1612,6 +1675,29 @@ mod tests {
     /// document-at-a-time loop adds up, bit for bit, whatever the lengths
     /// of the documents grouped with it — none, one term, or longer than
     /// any other in its group.
+    /// The radix sort leaves rank keys in the order a comparison sort does,
+    /// shared digits and all.
+    #[test]
+    fn radix_sort_orders_keys_as_sort_unstable_does() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for len in [0usize, 1, 2, 255, 256, 257, 5000] {
+            let keys: Vec<u64> = (0..len as u32)
+                .map(|pos| rank_key(f32::from_bits((next() as u32) & 0x7F7F_FFFF) - 1.0, pos))
+                .collect();
+            let mut expected = keys.clone();
+            expected.sort_unstable();
+            let mut got = keys;
+            radix_sort_keys(&mut got);
+            assert_eq!(got, expected, "{len} keys");
+        }
+    }
+
     #[test]
     fn lane_gains_add_each_document_as_one_at_a_time_does() {
         let mut rng = StdRng::seed_from_u64(7);
