@@ -25,7 +25,7 @@ use std::{
     str::from_utf8,
     sync::{
         Arc, Mutex, PoisonError,
-        mpsc::{channel, sync_channel},
+        mpsc::{Receiver, SyncSender, TrySendError, channel, sync_channel},
     },
     thread,
     time::{Duration, Instant},
@@ -33,7 +33,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use rayon::{current_num_threads, prelude::*};
+use rayon::{Yield, current_num_threads, prelude::*};
 
 use crate::{
     superfile::{
@@ -156,7 +156,12 @@ pub(crate) fn merge_column<S: Send, T: Send>(
     // time goes: waiting on the walk, dispatching, and at the end waiting
     // for the writer.
     let (mut waited, mut encoded, mut written) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
-    let (encoded_tx, encoded_rx) = sync_channel::<(Batch, Vec<Option<T>>)>(ENCODED_BATCHES_AHEAD);
+    // A batch's encodes end when its longest term does, and a batch ran
+    // alone, so the rest of the pool idled behind that one term. Batches now
+    // encode side by side, each as a task of its own, the writer taking them
+    // in order: `ahead` bounds how many wait encoded or encoding.
+    let ahead = encode_batches_ahead();
+    let (encoded_tx, encoded_rx) = sync_channel::<(Arc<Batch>, EncodedBatch<T>)>(ahead);
     thread::scope(|scope| -> Result<(), BuildError> {
         let (readers, dicts) = (&readers, &dicts);
         for ((start, end), sender) in ranges.into_iter().zip(senders) {
@@ -173,28 +178,37 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         let writer = scope.spawn(move || -> Result<Duration, BuildError> {
             let mut written = Duration::ZERO;
             for (batch, merged) in encoded_rx {
+                let merged = merged.recv().map_err(|_| encode_task_lost())??;
                 let started = Instant::now();
                 write_batch(&batch, merged, &mut write)?;
                 written += started.elapsed();
             }
             Ok(written)
         });
-        loop {
-            let started = Instant::now();
-            let Some(batch) = walked.next() else {
-                break;
-            };
-            waited += started.elapsed();
-            let batch = batch?;
-            let started = Instant::now();
-            let merged = work.encode(&batch)?;
-            encoded += started.elapsed();
-            // The writer is gone only after an error of its own, which the
-            // join below reports.
-            if encoded_tx.send((batch, merged)).is_err() {
-                break;
+        let work = &work;
+        rayon::in_place_scope(|tasks| -> Result<(), BuildError> {
+            loop {
+                let started = Instant::now();
+                let Some(batch) = walked.next() else {
+                    break;
+                };
+                waited += started.elapsed();
+                let batch = Arc::new(batch?);
+                let started = Instant::now();
+                let (done, merged) = sync_channel(1);
+                let encoding = Arc::clone(&batch);
+                tasks.spawn(move |_| {
+                    let _ = done.send(work.encode(&encoding));
+                });
+                // The writer is gone only after an error of its own, which
+                // the join below reports.
+                if !send_helping(&encoded_tx, (batch, merged)) {
+                    break;
+                }
+                encoded += started.elapsed();
             }
-        }
+            Ok(())
+        })?;
         drop(encoded_tx);
         written = writer.join().map_err(|_| {
             BuildError::Io(Error::other(
@@ -214,6 +228,47 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         .into_iter()
         .map(|(_, s)| s)
         .collect())
+}
+
+/// A batch's encoded terms, sent by its encode task once they are all done.
+type EncodedBatch<T> = Receiver<Result<Vec<Option<T>>, BuildError>>;
+
+fn encode_task_lost() -> BuildError {
+    BuildError::Io(Error::other(
+        "fts sorted merge: an encode task ended without a result",
+    ))
+}
+
+/// Send `item`, running the pool's queued work while the channel is full
+/// when this thread is one of the pool's: blocked outright, it could hold
+/// the only thread the encodes it waits for would run on. False when the
+/// receiver is gone.
+fn send_helping<I>(tx: &SyncSender<I>, mut item: I) -> bool {
+    loop {
+        match tx.try_send(item) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(back)) => {
+                item = back;
+                match rayon::yield_now() {
+                    // Not a pool thread: nothing it holds is needed.
+                    None => return tx.send(item).is_ok(),
+                    Some(Yield::Executed) => {}
+                    Some(Yield::Idle) => thread::yield_now(),
+                }
+            }
+        }
+    }
+}
+
+/// Experiment: batches that may wait encoded or encoding, from
+/// `INFINO_EXP_ENCODE_AHEAD` (unset: [`ENCODED_BATCHES_AHEAD`]).
+fn encode_batches_ahead() -> usize {
+    std::env::var("INFINO_EXP_ENCODE_AHEAD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(ENCODED_BATCHES_AHEAD)
+        .max(1)
 }
 
 /// A key range of a column's walk: from `start` (none: the first term)
