@@ -35,6 +35,7 @@
 //! an order, so it can be tested against the cost it claims to lower.
 
 use std::{
+    cmp::Reverse,
     fmt, mem,
     sync::{
         Mutex, PoisonError,
@@ -538,6 +539,38 @@ impl ForwardIndex {
         let hi = self.starts[d as usize + 1] as usize;
         &self.terms[lo..hi]
     }
+
+    /// This index with its terms renumbered by how many documents hold
+    /// them, the most held first (ties by id): a renaming of terms, so
+    /// every degree, gain and comparison the bisection makes is the one it
+    /// made before. Ids are hash buckets spread over the whole table, so a
+    /// document's terms land at random across tables of millions of
+    /// entries; renumbered, the few terms most documents hold sit together
+    /// at the front, where the gain gather and the degree counts find them.
+    fn by_frequency(&self) -> Self {
+        let mut df = vec![0u32; self.n_terms];
+        for &t in &self.terms {
+            df[t as usize] += 1;
+        }
+        let mut ids: Vec<u32> = (0..self.n_terms as u32).collect();
+        ids.par_sort_unstable_by_key(|&t| (Reverse(df[t as usize]), t));
+        let mut new_of = vec![0u32; self.n_terms];
+        for (new, &old) in ids.iter().enumerate() {
+            new_of[old as usize] = new as u32;
+        }
+        let held = ids.iter().take_while(|&&t| df[t as usize] > 0).count();
+        let terms = self
+            .terms
+            .par_iter()
+            .with_min_len(PAR_MIN_ITEMS)
+            .map(|&t| new_of[t as usize])
+            .collect();
+        Self {
+            terms,
+            starts: self.starts.clone(),
+            n_terms: held,
+        }
+    }
 }
 
 /// The order to store documents in: `order[new_id]` is the index of the
@@ -557,6 +590,8 @@ pub(crate) fn bisect_order_reported(
     params: BisectParams,
 ) -> (Vec<u32>, BisectReport) {
     let others_at_start = RUNNING.fetch_add(1, Relaxed);
+    let renumbered = fwd.by_frequency();
+    let fwd = &renumbered;
     let n = fwd.len();
     let mut order: Vec<u32> = (0..n as u32).collect();
     let report = RunReport::new();
