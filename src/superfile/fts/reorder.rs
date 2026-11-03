@@ -106,7 +106,7 @@ const MIN_PARTITION: usize = BLOCK_LEN;
 ///
 /// Index size stands in for layout quality throughout. The reordering exists
 /// for query performance, which is not resolved at this scale.
-const REORDER_CONVERGENCE: f32 = 0.20;
+const REORDER_CONVERGENCE: f32 = 0.05;
 
 /// Ceiling on a split's move rounds. Equal to the fixed count the bisection
 /// used before the convergence test existed, so setting [`REORDER_CONVERGENCE`]
