@@ -4071,7 +4071,14 @@ fn build_piece(
             for batch in batches {
                 builder.add_rows_unindexed(batch)?;
             }
-            builder.set_fts_lane_view(lanes, piece)?;
+            builder.set_fts_lane_view(
+                lanes,
+                piece,
+                lanes_for(
+                    options.writer_pool.current_num_threads(),
+                    OPEN_APPENDS.load(Ordering::Relaxed),
+                ),
+            )?;
         }
     }
     let bounds = id_bounds(scalars.iter().copied(), options)?;

@@ -82,7 +82,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use parquet::basic::{Compression, ZstdLevel};
-use rayon::{join, prelude::*};
+use rayon::{ThreadPoolBuilder, join, prelude::*};
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tracing::{info, warn};
@@ -1922,6 +1922,7 @@ impl SuperfileBuilder {
         &mut self,
         lanes: Arc<FrozenLanes>,
         piece: usize,
+        order_threads: usize,
     ) -> Result<(), BuildError> {
         let merge_input_mb = self.opts.merge_input_mb;
         if let Some(fb) = self.fts_builder.as_mut() {
@@ -1930,10 +1931,21 @@ impl SuperfileBuilder {
                 piece,
                 order: None,
             };
-            if exp_ingest_order()
-                && let Some(order) = lane_doc_order(&view, fb.n_columns() as u32, merge_input_mb)?
-            {
-                view.set_order(order);
+            if exp_ingest_order() {
+                // On a pool of the piece's own, as a merge orders on its own:
+                // pieces ordering side by side on one shared pool stole each
+                // other's nested work and left the host idle.
+                let pool = ThreadPoolBuilder::new()
+                    .num_threads(order_threads.max(1))
+                    .thread_name(|i| format!("piece-order-{i}"))
+                    .build()
+                    .map_err(|e| BuildError::Io(Error::other(format!("piece order pool: {e}"))))?;
+                let n_columns = fb.n_columns() as u32;
+                if let Some(order) =
+                    pool.install(|| lane_doc_order(&view, n_columns, merge_input_mb))?
+                {
+                    view.set_order(order);
+                }
             }
             fb.set_lane_view(view);
         }
