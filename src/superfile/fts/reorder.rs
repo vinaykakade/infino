@@ -129,6 +129,13 @@ const PAR_MIN_ITEMS: usize = 4096;
 /// busy while each waits on its own previous add.
 const GAIN_LANES: usize = 8;
 
+/// A round counts its degree tables again, rather than moving each swapped
+/// document's postings across, once its swaps exceed this share of the
+/// partition's documents: each swap moves two documents at two updates a
+/// posting, so past a quarter of the documents in swaps the moves outnumber
+/// the postings a count reads.
+const RECOUNT_SWAP_SHARE: usize = 4;
+
 /// How hard the bisection works a split, and when it decides a split has
 /// stopped paying.
 ///
@@ -1100,7 +1107,20 @@ impl BisectState {
                     left[li] = rd;
                     right[ri] = ld;
                 }
-                if parallel && swaps > 0 {
+                if parallel && swaps.saturating_mul(RECOUNT_SWAP_SHARE) > left.len() + right.len() {
+                    // Moving a document across is two updates per posting, a
+                    // count from scratch one per posting of the partition: past
+                    // half the documents moved, counting again is less work and
+                    // ends at the same tables.
+                    let (lefts, rights) = (&left_gains[..swaps], &right_gains[..swaps]);
+                    for (&l, &r) in lefts.iter().zip(rights) {
+                        let (li, ri) = (key_pos(l) as usize, key_pos(r) as usize);
+                        let (ld, rd) = (left[li], right[ri]);
+                        left[li] = rd;
+                        right[ri] = ld;
+                    }
+                    self.recount_degrees(fwd, left, right);
+                } else if parallel && swaps > 0 {
                     // Which pairs swap depends only on the ranked gains, and
                     // every pair names its own two positions, so the swaps can
                     // land in any order. Degrees are counts, so adding them up
@@ -1366,6 +1386,31 @@ impl BisectState {
                 *slot += 1;
             }
         }
+    }
+
+    /// Count the degree tables again for halves `left` and `right`, whose
+    /// documents are the partition's: the terms it touches are the same, so
+    /// only their entries are zeroed and counted.
+    fn recount_degrees(&mut self, fwd: &ForwardIndex, left: &[u32], right: &[u32]) {
+        let (deg_left, deg_right) = (
+            as_atomic(&mut self.deg_left),
+            as_atomic(&mut self.deg_right),
+        );
+        self.touched
+            .par_iter()
+            .with_min_len(PAR_MIN_ITEMS)
+            .for_each(|&t| {
+                deg_left[t as usize].store(0, Relaxed);
+                deg_right[t as usize].store(0, Relaxed);
+            });
+        let count = |half: &[u32], deg: &[AtomicU32]| {
+            half.par_iter().with_min_len(PAR_MIN_ITEMS).for_each(|&d| {
+                for &t in fwd.doc(d) {
+                    deg[t as usize].fetch_add(1, Relaxed);
+                }
+            })
+        };
+        join(|| count(left, deg_left), || count(right, deg_right));
     }
 
     fn clear_degrees(&mut self) {
