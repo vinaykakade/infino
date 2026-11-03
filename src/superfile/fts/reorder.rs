@@ -1449,7 +1449,10 @@ fn rank_by_gain(
 /// Ask for the cache line holding `slot`; changes nothing it reads.
 #[cfg(target_arch = "x86_64")]
 fn prefetch(slot: &f32) {
-    _mm_prefetch::<_MM_HINT_T0>((slot as *const f32).cast());
+    // SAFETY: SSE, the intrinsic's only feature, is part of every x86_64
+    // target; a prefetch is a hint that reads and writes no memory, and
+    // `slot` is a live reference besides.
+    unsafe { _mm_prefetch::<_MM_HINT_T0>((slot as *const f32).cast()) };
 }
 
 /// No prefetch where the target has no stable intrinsic for it.
