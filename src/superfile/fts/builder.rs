@@ -1853,12 +1853,27 @@ fn merge_term_range(
 pub(crate) struct LaneView {
     pub(crate) lanes: Arc<FrozenLanes>,
     pub(crate) piece: usize,
+    /// The order the piece's documents are stored in, as `(order, inverse)`:
+    /// `order[doc]` is the piece row doc id `doc` stands for and
+    /// `inverse[row]` the doc id a row is stored under. `None` stores them in
+    /// row order.
+    pub(crate) order: Option<(Vec<u32>, Vec<u32>)>,
 }
 
 impl LaneView {
     /// The commit rows this view's superfile holds.
     fn rows(&self) -> &Range<u32> {
         &self.lanes.pieces[self.piece]
+    }
+
+    /// Store the piece's documents in `order` (`order[doc]` = piece row),
+    /// a permutation of its rows.
+    pub(crate) fn set_order(&mut self, order: Vec<u32>) {
+        let mut inverse = vec![0u32; order.len()];
+        for (doc, &row) in order.iter().enumerate() {
+            inverse[row as usize] = doc as u32;
+        }
+        self.order = Some((order, inverse));
     }
 
     /// How many rows this view's superfile holds.
@@ -2941,7 +2956,15 @@ impl FtsBuilder {
     /// is the one this builder would write had it been fed those rows in
     /// order itself. The lanes must hold this builder's columns, and this
     /// builder must not have accumulated postings of its own.
+    /// How many columns the builder indexes.
+    pub(crate) fn n_columns(&self) -> usize {
+        self.columns.len()
+    }
+
     pub(crate) fn set_lane_view(&mut self, view: LaneView) {
+        // A piece stored in an order of its own maps each doc id to its row,
+        // as a reordered merge does.
+        self.doc_map = view.order.as_ref().map(|(order, _)| order.clone());
         self.lane_view = Some(view);
     }
 
@@ -2983,7 +3006,10 @@ impl FtsBuilder {
                     total_tokens += u64::from(tokens);
                 }
             }
-            col.doc_lengths = lengths;
+            col.doc_lengths = match &view.order {
+                Some((order, _)) => order.iter().map(|&row| lengths[row as usize]).collect(),
+                None => lengths,
+            };
             col.total_tokens = total_tokens;
         }
         self.n_docs = n_docs as u32;
@@ -4456,6 +4482,8 @@ fn emit_lanes_column<W: Write>(
     // the view, how far the merge has read, and the lane's row stretch its
     // next document is in.
     let mut holders: Vec<Holder> = Vec::new();
+    // A reordered piece's runs, decoded so they move with their postings.
+    let mut renumbered = Renumbered::default();
     let mut n_emitted = 0usize;
     let mut at = 0usize;
     while at < order.len() {
@@ -4562,7 +4590,15 @@ fn emit_lanes_column<W: Write>(
             }
             col_positions.then_some(TermRuns::Encoded(&merged_runs))
         };
-        encode_and_emit_term(term, &pairs, runs, enc, finish_profile, term_scratch, sink)?;
+        match &view.order {
+            None => {
+                encode_and_emit_term(term, &pairs, runs, enc, finish_profile, term_scratch, sink)?
+            }
+            Some((_, inverse)) => {
+                let runs = renumber(&mut pairs, runs, inverse, &mut renumbered);
+                encode_and_emit_term(term, &pairs, runs, enc, finish_profile, term_scratch, sink)?
+            }
+        }
         n_emitted += 1;
     }
     Ok(n_emitted)
@@ -4656,6 +4692,61 @@ enum DictSink<'a> {
     InRam(&'a mut TermDictBuilder),
     /// Streamed to a scratch file in term order.
     Streaming(&'a mut TermBlockWriter<BufWriter<File>>),
+}
+
+/// Buffers [`renumber`] reuses from term to term.
+#[derive(Default)]
+struct Renumbered {
+    /// Every posting's run of positions, decoded, in arrival order.
+    values: Vec<u32>,
+    /// Where each arriving posting's run starts in `values`.
+    starts: Vec<usize>,
+    /// The starts in the renumbered order.
+    sorted_starts: Vec<usize>,
+    /// The arriving postings' indexes in the renumbered order.
+    perm: Vec<u32>,
+}
+
+/// Renumber `pairs` — `(piece row, tf)`, ascending in row — to the doc ids
+/// `inverse` stores each row under, ascending in doc id, and hand back the
+/// term's runs in that order: decoded into `buf` with their starts permuted,
+/// since a run stays with its posting.
+fn renumber<'a>(
+    pairs: &mut [(u32, u32)],
+    runs: Option<TermRuns<'_>>,
+    inverse: &[u32],
+    buf: &'a mut Renumbered,
+) -> Option<TermRuns<'a>> {
+    let Renumbered {
+        values,
+        starts,
+        sorted_starts,
+        perm,
+    } = buf;
+    values.clear();
+    starts.clear();
+    if let Some(runs) = &runs {
+        let mut at = 0usize;
+        for (i, &(_, tf)) in pairs.iter().enumerate() {
+            starts.push(values.len());
+            runs.push_run(i, tf, &mut at, values);
+        }
+    }
+    for pair in pairs.iter_mut() {
+        pair.0 = inverse[pair.0 as usize];
+    }
+    perm.clear();
+    perm.extend(0..pairs.len() as u32);
+    perm.sort_unstable_by_key(|&i| pairs[i as usize].0);
+    let sorted: Vec<(u32, u32)> = perm.iter().map(|&i| pairs[i as usize]).collect();
+    pairs.copy_from_slice(&sorted);
+    runs.as_ref()?;
+    sorted_starts.clear();
+    sorted_starts.extend(perm.iter().map(|&i| starts[i as usize]));
+    Some(TermRuns::Values {
+        values,
+        starts: sorted_starts,
+    })
 }
 
 /// Encode one term's posting list and emit the resulting dictionary entry
@@ -5283,6 +5374,7 @@ pub(crate) fn test_lanes_view(
     LaneView {
         lanes: frozen,
         piece,
+        order: None,
     }
 }
 
@@ -5468,6 +5560,56 @@ mod tests {
             .is_err(),
             "no frozen lane"
         );
+    }
+
+    /// A piece stored in an order of its own writes the blob one builder
+    /// writes when fed the piece's rows in that order with the same doc map:
+    /// postings renumbered and sorted, each run of positions moved with its
+    /// posting, lengths and the map in the new numbering. For a whole corpus
+    /// and for both halves of a cut, on interleaved lanes.
+    #[test]
+    fn a_reordered_lane_piece_writes_the_blob_a_builder_fed_in_that_order_writes() {
+        const N_DOCS: u32 = 500;
+        const LANES: u32 = 3;
+        const SLICE: u32 = 7;
+        const CUT: u32 = 213;
+        /// Multiplier of the scrambled order: coprime with every piece size
+        /// below, so `doc * STEP % n` visits each row once.
+        const STEP: u32 = 97;
+        let text_of = |i: u32| {
+            let mut text = format!("every every u{i} shared{}", i % 7);
+            if i.is_multiple_of(3) {
+                text.push_str(" some some");
+            }
+            if i.is_multiple_of(50) {
+                text.push_str(" rare");
+            }
+            text
+        };
+        let scrambled = |n: u32| -> Vec<u32> { (0..n).map(|doc| doc * STEP % n).collect() };
+        for (pieces, piece) in [
+            (vec![0..N_DOCS], 0usize),
+            (vec![0..CUT, CUT..N_DOCS], 0),
+            (vec![0..CUT, CUT..N_DOCS], 1),
+        ] {
+            let rows = pieces[piece].clone();
+            let order = scrambled(rows.end - rows.start);
+            let mut view = test_lanes_view(N_DOCS, LANES, SLICE, &text_of, pieces, piece);
+            view.set_order(order.clone());
+            let mut from_lanes = test_two_column_builder();
+            from_lanes.set_lane_view(view);
+            let from_lanes = from_lanes.finish().expect("finish lanes");
+
+            let mut fed = test_two_column_builder();
+            for (doc, &row) in order.iter().enumerate() {
+                let text = text_of(rows.start + row);
+                fed.add_doc(0, doc as u32, &text).expect("add pos");
+                fed.add_doc(1, doc as u32, &text).expect("add flat");
+            }
+            fed.doc_map = Some(order);
+            let fed = fed.finish().expect("finish fed");
+            assert_eq!(from_lanes, fed, "piece {piece} of {rows:?}");
+        }
     }
 
     #[test]

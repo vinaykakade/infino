@@ -595,6 +595,18 @@ pub(crate) fn lane_doc_order(
     )
 }
 
+/// Experiment: order each piece's documents at ingest, from
+/// `INFINO_EXP_INGEST_ORDER=1`.
+fn exp_ingest_order() -> bool {
+    std::env::var("INFINO_EXP_INGEST_ORDER").is_ok_and(|v| v == "1")
+}
+
+/// Experiment: a merge of inputs that each store an order of their own keeps
+/// them, from `INFINO_EXP_KEEP_INPUT_ORDER=1`.
+fn exp_keep_input_order() -> bool {
+    std::env::var("INFINO_EXP_KEEP_INPUT_ORDER").is_ok_and(|v| v == "1")
+}
+
 /// Bits of bucket space the bisection groups terms in. Terms are hashed
 /// into it rather than interned, so the vocabulary costs nothing to
 /// hold. At this width a corpus with millions of distinct terms will
@@ -1906,10 +1918,26 @@ impl SuperfileBuilder {
     /// this builder's superfile is; see [`FtsBuilder::set_lane_view`]. The
     /// rows themselves go in through [`Self::add_rows_unindexed`], in row
     /// order.
-    pub(crate) fn set_fts_lane_view(&mut self, lanes: Arc<FrozenLanes>, piece: usize) {
+    pub(crate) fn set_fts_lane_view(
+        &mut self,
+        lanes: Arc<FrozenLanes>,
+        piece: usize,
+    ) -> Result<(), BuildError> {
+        let merge_input_mb = self.opts.merge_input_mb;
         if let Some(fb) = self.fts_builder.as_mut() {
-            fb.set_lane_view(LaneView { lanes, piece });
+            let mut view = LaneView {
+                lanes,
+                piece,
+                order: None,
+            };
+            if exp_ingest_order()
+                && let Some(order) = lane_doc_order(&view, fb.n_columns() as u32, merge_input_mb)?
+            {
+                view.set_order(order);
+            }
+            fb.set_lane_view(view);
         }
+        Ok(())
     }
 
     /// Override the FTS builder's in-RAM spill threshold (forwarded
@@ -3123,6 +3151,21 @@ impl SuperfileBuilder {
             .zip(rows_of.iter())
             .map(|((reader, _), rows)| remap_by_blob_id(reader.fts().expect("checked above"), rows))
             .collect::<Result<_, _>>()?;
+        // Experiment: inputs that each store their documents in an order of
+        // their own keep it, concatenated: their blob ids, in blob order,
+        // name the output rows.
+        if exp_keep_input_order()
+            && readers
+                .iter()
+                .all(|(reader, _)| reader.fts().is_some_and(FtsReader::has_doc_map))
+        {
+            let order: Vec<u32> = rows_by_blob
+                .iter()
+                .flat_map(|rows| rows.iter().flatten().map(|row| row.get()))
+                .collect();
+            debug_assert_eq!(order.len(), n_out_docs as usize);
+            return Ok(Some(order));
+        }
         let df = term_document_counts(readers, &rows_by_blob, n_fts_columns, n_buckets)?;
         drop(count_span);
 
