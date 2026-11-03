@@ -36,6 +36,7 @@
 
 use std::{
     fmt, mem,
+    ops::Range,
     sync::{
         Mutex, PoisonError,
         atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed},
@@ -538,6 +539,46 @@ impl ForwardIndex {
         let hi = self.starts[d as usize + 1] as usize;
         &self.terms[lo..hi]
     }
+
+    /// This index with its documents laid out in `order`: document `i` of
+    /// the result is document `order[i]` of this one, its terms in the same
+    /// sequence. A renaming of documents, so every count, gain and
+    /// comparison made against it is the one made against this index.
+    fn permuted(&self, order: &[u32]) -> Self {
+        let mut starts = Vec::with_capacity(order.len() + 1);
+        starts.push(0u32);
+        let mut at = 0u32;
+        for &d in order {
+            at += self.doc(d).len() as u32;
+            starts.push(at);
+        }
+        let mut terms = Vec::with_capacity(at as usize);
+        terms.par_extend(
+            order
+                .par_iter()
+                .with_min_len(PAR_MIN_ITEMS)
+                .flat_map_iter(|&d| self.doc(d).iter().copied()),
+        );
+        Self {
+            terms,
+            starts,
+            n_terms: self.n_terms,
+        }
+    }
+}
+
+/// Mutable slices of `order` for `ranges`, which are disjoint and ascending.
+fn slices_of<'a>(mut order: &'a mut [u32], ranges: &[Range<usize>]) -> Vec<&'a mut [u32]> {
+    let mut at = 0;
+    let mut out = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let (_, rest) = order.split_at_mut(range.start - at);
+        let (part, rest) = rest.split_at_mut(range.len());
+        out.push(part);
+        order = rest;
+        at = range.end;
+    }
+    out
 }
 
 /// The order to store documents in: `order[new_id]` is the index of the
@@ -595,8 +636,17 @@ pub(crate) fn bisect_order_reported(
 /// is the same.
 fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bisect<'_>) {
     let width = rayon::current_num_threads();
-    let mut level: Vec<&mut [u32]> = vec![order];
-    let mut handed_on: Vec<(&mut [u32], u32)> = Vec::new();
+    // The index laid out again in the order the last level left, with each
+    // position's document id in `fwd`; `None` while `fwd` itself is read.
+    // After a level's swaps a partition's documents sit all over `fwd`, and
+    // every round of the next level reads each one's terms: laid out in
+    // position order, those reads run front to back instead of at random
+    // across the whole index. A renaming of documents changes no count or
+    // gain, so the order found is the same.
+    let mut laid: Option<(ForwardIndex, Vec<u32>)> = None;
+    let mut level: Vec<Range<usize>> = Vec::new();
+    level.push(0..order.len());
+    let mut handed_on: Vec<(Range<usize>, u32)> = Vec::new();
     let mut depth = 0u32;
     // A level at a time while the level is narrower than the pool, and for
     // as long as no level has set the bar: each completed level offers its
@@ -604,32 +654,42 @@ fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bi
     // still takes its bar from the first level that lowered the cost, and
     // takes the same bar on every run.
     while !level.is_empty() && (level.len() < width || !run.has_reference()) {
+        if depth > 0 {
+            laid = Some(relaid(fwd, laid.take(), order));
+        }
+        let cur = laid.as_ref().map_or(fwd, |(laid, _)| laid);
         // Only a partition `split_parallel` would refine and halve itself is
         // split here; any other takes its own path there. A small partition
         // is halved here too while no bar is set — the same serial refine
         // `split_halves` would give it — so the levels keep offering until
         // one lowers the cost.
         let wide = run.has_reference();
-        let (here, rest): (Vec<_>, Vec<_>) = level.into_iter().partition(|part| {
-            part.len() > MIN_PARTITION
+        let parts = slices_of(order, &level);
+        let (mut here, mut rest) = (Vec::new(), Vec::new());
+        for (range, part) in level.iter().zip(parts) {
+            let splits_here = part.len() > MIN_PARTITION
                 && depth < MAX_DEPTH
                 && (part.len() >= PARALLEL_MIN_PARTITION || !wide)
-                && !localizing_pays(fwd, part)
-        });
-        handed_on.extend(rest.into_iter().map(|part| (part, depth)));
-        let docs: usize = here.iter().map(|part| part.len()).sum();
-        let split: Vec<(f64, [&mut [u32]; 2])> = here
+                && !localizing_pays(cur, part);
+            match splits_here {
+                true => here.push((range.clone(), part)),
+                false => rest.push(range.clone()),
+            }
+        }
+        handed_on.extend(rest.into_iter().map(|range| (range, depth)));
+        let docs: usize = here.iter().map(|(_, part)| part.len()).sum();
+        let split: Vec<(f64, [Range<usize>; 2])> = here
             .into_par_iter()
-            .map(|part| {
+            .map(|(range, part)| {
                 let mid = part.len() / 2;
                 let parallel = part.len() >= PARALLEL_MIN_PARTITION;
                 let first_round = pool.with_state(|state| {
-                    let first_round = state.refine(fwd, part, mid, depth, parallel, run);
+                    let first_round = state.refine(cur, part, mid, depth, parallel, run);
                     state.flush(run.report);
                     first_round
                 });
-                let (left, right) = part.split_at_mut(mid);
-                (first_round, [left, right])
+                let cut = range.start + mid;
+                (first_round, [range.start..cut, cut..range.end])
             })
             .collect();
         // The level's splits ran side by side, but their first rounds' gains
@@ -639,10 +699,44 @@ fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bi
         level = split.into_iter().flat_map(|(_, halves)| halves).collect();
         depth += 1;
     }
-    handed_on.extend(level.into_iter().map(|part| (part, depth)));
-    handed_on
+    handed_on.extend(level.into_iter().map(|range| (range, depth)));
+    handed_on.sort_by_key(|(range, _)| range.start);
+    let cur = laid.as_ref().map_or(fwd, |(laid, _)| laid);
+    let ranges: Vec<Range<usize>> = handed_on.iter().map(|(range, _)| range.clone()).collect();
+    slices_of(order, &ranges)
         .into_par_iter()
-        .for_each(|(part, depth)| split_parallel(fwd, part, depth, pool, run));
+        .zip(handed_on.par_iter())
+        .for_each(|(part, (_, depth))| split_parallel(cur, part, *depth, pool, run));
+    // Back from positions in the laid-out index to documents in `fwd`.
+    if let Some((_, ids)) = laid {
+        order
+            .par_iter_mut()
+            .with_min_len(PAR_MIN_ITEMS)
+            .for_each(|slot| *slot = ids[*slot as usize]);
+    }
+}
+
+/// `fwd` laid out in `order`, which names documents of `prior`'s index
+/// when there is one (else of `fwd`), with each position's document id in
+/// `fwd`; `order` is left naming positions, which are now the documents.
+fn relaid(
+    fwd: &ForwardIndex,
+    prior: Option<(ForwardIndex, Vec<u32>)>,
+    order: &mut [u32],
+) -> (ForwardIndex, Vec<u32>) {
+    let (next, ids) = match prior {
+        None => (fwd.permuted(order), order.to_vec()),
+        Some((cur, ids)) => (
+            cur.permuted(order),
+            order.iter().map(|&p| ids[p as usize]).collect(),
+        ),
+    };
+    order
+        .par_iter_mut()
+        .enumerate()
+        .with_min_len(PAR_MIN_ITEMS)
+        .for_each(|(i, slot)| *slot = i as u32);
+    (next, ids)
 }
 
 /// Split `order` as [`BisectState::split`] does, running the two halves
