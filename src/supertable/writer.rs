@@ -2631,7 +2631,8 @@ impl SupertableWriter {
                 let n_lanes = options
                     .writer_pool
                     .current_num_threads()
-                    .clamp(1, MAX_LANES);
+                    .clamp(1, MAX_LANES)
+                    .min(lane_cap());
                 let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout);
                 let live = match opened {
                     Ok(live) => live,
@@ -19801,4 +19802,13 @@ mod lost_write_span_tests {
             assert_eq!(lost.take(), [("manifest.write", "pointer".to_string())]);
         });
     }
+}
+
+/// Experiment: the most lanes one append opens, from `INFINO_EXP_LANE_CAP`
+/// (unset: no cap).
+fn lane_cap() -> usize {
+    std::env::var("INFINO_EXP_LANE_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX)
 }
