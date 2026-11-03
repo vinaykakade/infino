@@ -37,7 +37,7 @@
 use std::{
     fmt, mem,
     sync::{
-        Mutex, PoisonError,
+        Mutex, OnceLock, PoisonError,
         atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed},
     },
     time::Instant,
@@ -566,7 +566,7 @@ pub(crate) fn bisect_order_reported(
     let mut order: Vec<u32> = (0..n as u32).collect();
     let report = RunReport::new();
     let reference = AtomicU64::new(0);
-    if n > MIN_PARTITION {
+    if n > min_partition() {
         let pool = StatePool {
             n_terms: fwd.n_terms,
             free: Mutex::new(Vec::new()),
@@ -616,7 +616,7 @@ fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bi
         // one lowers the cost.
         let wide = run.has_reference();
         let (here, rest): (Vec<_>, Vec<_>) = level.into_iter().partition(|part| {
-            part.len() > MIN_PARTITION
+            part.len() > min_partition()
                 && depth < MAX_DEPTH
                 && (part.len() >= PARALLEL_MIN_PARTITION || !wide)
                 && !localizing_pays(fwd, part)
@@ -659,7 +659,7 @@ fn split_parallel(
     pool: &StatePool,
     run: Bisect<'_>,
 ) {
-    if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
+    if order.len() <= min_partition() || depth >= MAX_DEPTH {
         return;
     }
     if localizing_pays(fwd, order) {
@@ -909,7 +909,7 @@ impl BisectState {
     }
 
     fn split(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32, run: Bisect<'_>) {
-        if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
+        if order.len() <= min_partition() || depth >= MAX_DEPTH {
             return;
         }
         if localizing_pays(fwd, order) {
@@ -1430,6 +1430,18 @@ fn rank_by_gain(
     }
 }
 
+/// Experiment: the partition size the bisection stops at, from
+/// `INFINO_EXP_MIN_PARTITION` (unset: [`MIN_PARTITION`]).
+fn min_partition() -> usize {
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("INFINO_EXP_MIN_PARTITION")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MIN_PARTITION)
+    })
+}
+
 /// The gain of each document in `group` (at most [`GAIN_LANES`] of them):
 /// the sum of its terms' `move_gain`, added from zero in the order the
 /// document lists its terms, as a document-at-a-time loop adds them. The
@@ -1942,7 +1954,7 @@ mod tests {
         }
 
         fn split(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32) {
-            if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
+            if order.len() <= min_partition() || depth >= MAX_DEPTH {
                 return;
             }
             let mid = order.len() / 2;
@@ -2041,7 +2053,7 @@ mod tests {
 
     fn reference_order(fwd: &ForwardIndex) -> Vec<u32> {
         let mut order: Vec<u32> = (0..fwd.len() as u32).collect();
-        if fwd.len() <= MIN_PARTITION {
+        if fwd.len() <= min_partition() {
             return order;
         }
         RefState::new(fwd.n_terms).split(fwd, &mut order, 0);

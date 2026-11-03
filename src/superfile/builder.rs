@@ -174,6 +174,15 @@ const REORDER_FORWARD_INDEX_BUDGET_SHARE: u64 = 10;
 /// how much of each one is read.
 const REORDER_TERMS_PER_DOC: usize = 16;
 
+/// Experiment: slots per document from `INFINO_EXP_TERMS_PER_DOC` (unset:
+/// [`REORDER_TERMS_PER_DOC`]).
+fn exp_terms_per_doc() -> usize {
+    std::env::var("INFINO_EXP_TERMS_PER_DOC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(REORDER_TERMS_PER_DOC)
+}
+
 /// Bytes the bisection's forward index may take.
 ///
 /// Derived from the merge input cap: `merge_input_mb` is the cap the
@@ -246,11 +255,12 @@ fn reorder_plan(
     // what splits the merge. A narrower index reads a long document short,
     // and the mean is no guide to how long the longest are, so it is worth
     // that only when it buys something: keeping the whole merge in one run.
-    let narrow = carried.min(REORDER_TERMS_PER_DOC);
-    let terms_per_doc = match holds(REORDER_TERMS_PER_DOC) >= n_docs {
-        true => REORDER_TERMS_PER_DOC,
+    let width = exp_terms_per_doc();
+    let narrow = carried.min(width);
+    let terms_per_doc = match holds(width) >= n_docs {
+        true => width,
         false if holds(narrow) >= n_docs => narrow,
-        false => REORDER_TERMS_PER_DOC,
+        false => width,
     };
 
     // Runs of an even size rather than full ones and a remainder. A merge a
