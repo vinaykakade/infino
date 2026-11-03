@@ -131,7 +131,7 @@ use crate::{
     storage::{StorageError, StorageProvider, stuck_after},
     superfile::{
         BuildError as SuperfileBuildError, FtsError, ReadError, SuperfileReader,
-        builder::{BuilderOptions, SuperfileBuilder, VectorConfig, index_fts_rows},
+        builder::{BuilderOptions, SuperfileBuilder, VectorConfig, index_fts_rows, lane_doc_order},
         format::{
             CRC_BYTES,
             footer::read_kv_metadata,
@@ -146,8 +146,8 @@ use crate::{
         fts::{
             bm25::Bm25Params,
             builder::{
-                DEFAULT_SPILL_THRESHOLD_BYTES, FrozenLane, FrozenLanes, FtsBuilder, MAX_LANES,
-                Stretch, doc_lengths_entry_size, freeze_lanes,
+                DEFAULT_SPILL_THRESHOLD_BYTES, FrozenLane, FrozenLanes, FtsBuilder, LaneView,
+                MAX_LANES, Stretch, doc_lengths_entry_size, freeze_lanes,
             },
         },
         reader::vector_layout_from_kv,
@@ -2763,6 +2763,26 @@ impl SupertableWriter {
         let merge_span = detail_span!("seal.merge_lanes", pieces = n_pieces).entered();
         let frozen = Arc::new(freeze_lanes(pool, frozen, pieces)?);
         drop(merge_span);
+        // Experiment: each piece's order, chosen here on the commit's own
+        // thread so its parallel levels spread over the whole pool, rather
+        // than inside a piece task, where they stole nested work.
+        let orders: Vec<Option<Vec<u32>>> = match exp_ingest_order() {
+            false => vec![None; n_pieces],
+            true => {
+                let _order_span = detail_span!("seal.order_pieces", pieces = n_pieces).entered();
+                (0..n_pieces)
+                    .map(|piece| {
+                        let view = LaneView {
+                            lanes: Arc::clone(&frozen),
+                            piece,
+                            order: None,
+                        };
+                        pool.install(|| lane_doc_order(&view, frozen.n_columns() as u32, None))
+                    })
+                    .collect::<Result<_, _>>()?
+            }
+        };
+        let orders = Arc::new(orders);
         let pieces_span = detail_span!("seal.build_pieces", pieces = n_pieces).entered();
         let (batches, bounds) = (Arc::new(batches), Arc::new(bounds));
         let (piece_options, piece_manifest, piece_stats) =
@@ -2782,6 +2802,7 @@ impl SupertableWriter {
                             batches: &rows,
                             lanes: Arc::clone(&frozen),
                             piece: i,
+                            order: orders[i].clone(),
                         },
                         &piece_options,
                         &piece_manifest,
@@ -3649,6 +3670,12 @@ struct LiveLanes {
     open_append: Option<OpenAppend>,
 }
 
+/// Experiment: order each piece's documents at ingest, from
+/// `INFINO_EXP_INGEST_ORDER=1`.
+fn exp_ingest_order() -> bool {
+    std::env::var("INFINO_EXP_INGEST_ORDER").is_ok_and(|v| v == "1")
+}
+
 /// Appends in this process with live lanes open.
 static OPEN_APPENDS: AtomicUsize = AtomicUsize::new(0);
 
@@ -4012,6 +4039,9 @@ enum PieceRows<'a> {
         batches: &'a [RecordBatch],
         lanes: Arc<FrozenLanes>,
         piece: usize,
+        /// The order the piece's documents are stored in; `None` keeps row
+        /// order.
+        order: Option<Vec<u32>>,
     },
 }
 
@@ -4065,20 +4095,14 @@ fn build_piece(
             batches,
             lanes,
             piece,
+            order,
         } => {
             // The body in row order; the postings come from the lanes,
             // merged at the finish.
             for batch in batches {
                 builder.add_rows_unindexed(batch)?;
             }
-            builder.set_fts_lane_view(
-                lanes,
-                piece,
-                lanes_for(
-                    options.writer_pool.current_num_threads(),
-                    OPEN_APPENDS.load(Ordering::Relaxed),
-                ),
-            )?;
+            builder.set_fts_lane_view(lanes, piece, order);
         }
     }
     let bounds = id_bounds(scalars.iter().copied(), options)?;

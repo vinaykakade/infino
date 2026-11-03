@@ -1662,6 +1662,13 @@ pub(crate) struct FrozenLanes {
     pieces: Vec<Range<u32>>,
 }
 
+impl FrozenLanes {
+    /// How many text columns the lanes hold.
+    pub(crate) fn n_columns(&self) -> usize {
+        self.order.len()
+    }
+}
+
 /// The most lanes a commit may be fed through: a merged order names each
 /// entry's lane in a byte.
 pub(crate) const MAX_LANES: usize = u8::MAX as usize;

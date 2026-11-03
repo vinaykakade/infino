@@ -82,7 +82,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use parquet::basic::{Compression, ZstdLevel};
-use rayon::{ThreadPoolBuilder, join, prelude::*};
+use rayon::{join, prelude::*};
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tracing::{info, warn};
@@ -593,12 +593,6 @@ pub(crate) fn lane_doc_order(
             Ok(())
         },
     )
-}
-
-/// Experiment: order each piece's documents at ingest, from
-/// `INFINO_EXP_INGEST_ORDER=1`.
-fn exp_ingest_order() -> bool {
-    std::env::var("INFINO_EXP_INGEST_ORDER").is_ok_and(|v| v == "1")
 }
 
 /// Experiment: a merge of inputs that each store an order of their own keeps
@@ -1922,34 +1916,19 @@ impl SuperfileBuilder {
         &mut self,
         lanes: Arc<FrozenLanes>,
         piece: usize,
-        order_threads: usize,
-    ) -> Result<(), BuildError> {
-        let merge_input_mb = self.opts.merge_input_mb;
+        order: Option<Vec<u32>>,
+    ) {
         if let Some(fb) = self.fts_builder.as_mut() {
             let mut view = LaneView {
                 lanes,
                 piece,
                 order: None,
             };
-            if exp_ingest_order() {
-                // On a pool of the piece's own, as a merge orders on its own:
-                // pieces ordering side by side on one shared pool stole each
-                // other's nested work and left the host idle.
-                let pool = ThreadPoolBuilder::new()
-                    .num_threads(order_threads.max(1))
-                    .thread_name(|i| format!("piece-order-{i}"))
-                    .build()
-                    .map_err(|e| BuildError::Io(Error::other(format!("piece order pool: {e}"))))?;
-                let n_columns = fb.n_columns() as u32;
-                if let Some(order) =
-                    pool.install(|| lane_doc_order(&view, n_columns, merge_input_mb))?
-                {
-                    view.set_order(order);
-                }
+            if let Some(order) = order {
+                view.set_order(order);
             }
             fb.set_lane_view(view);
         }
-        Ok(())
     }
 
     /// Override the FTS builder's in-RAM spill threshold (forwarded
