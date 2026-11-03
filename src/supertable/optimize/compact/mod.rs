@@ -1365,11 +1365,18 @@ impl Supertable {
                     record("committed", batch.len());
                     // This attempt's own removals, resolved against its own base above, so a
                     // retry that found fewer inputs records only those.
+                    let __t = Instant::now();
                     inner.note_superseded(&current, &new_manifest, &entries_to_remove);
+                    info!(secs = __t.elapsed().as_secs_f64(), "[commitstep] note_superseded");
+                    let __t = Instant::now();
                     inner.manifest.store(Arc::new(new_manifest));
                     // Point the sidecar cache at the manifest just published;
                     // until then a carried sidecar has no seq and reads as absent.
+                    info!(secs = __t.elapsed().as_secs_f64(), "[commitstep] manifest_store");
+                    let __t = Instant::now();
                     inner.reconcile_tombstone_seqs();
+                    info!(secs = __t.elapsed().as_secs_f64(), "[commitstep] reconcile");
+                    let __t = Instant::now();
                     // Warm each merged superfile into the in-memory reader
                     // cache, same as a normal writer commit does. Without
                     // this every query against it misses and re-fetches +
@@ -1390,9 +1397,13 @@ impl Supertable {
                     // doesn't grow forever across repeated compactions.
                     // The disk cache is already size-bounded (LRU), so its
                     // stale entries just age out on their own.
+                    info!(secs = __t.elapsed().as_secs_f64(), "[commitstep] warm_store");
+                    let __t = Instant::now();
                     for entry in &entries_to_remove {
                         opts.store.remove(&entry.uri);
                     }
+                    info!(secs = __t.elapsed().as_secs_f64(), "[commitstep] remove_store");
+                    let __t = Instant::now();
 
                     // Disk-cache warm + background storage reclaim ride the
                     // shared post-commit finalizer (the same path writer
@@ -1409,6 +1420,14 @@ impl Supertable {
                         pending_cache_inserts,
                     )
                     .await;
+                    info!(secs = __t.elapsed().as_secs_f64(), "[commitstep] finalize");
+                    let __t = Instant::now();
+                    drop(batch);
+                    drop(term_contributions);
+                    drop(entries_to_remove);
+                    drop(new_entries);
+                    drop(current);
+                    info!(secs = __t.elapsed().as_secs_f64(), "[commitstep] drops");
 
                     return match deferred_error {
                         Some(e) => Err(e),
