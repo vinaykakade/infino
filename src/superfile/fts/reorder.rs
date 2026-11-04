@@ -1973,6 +1973,8 @@ fn order_leading_gains(gains: &mut [u64], want: usize, parallel: bool) {
     // what sits in front of it.
     if exp_sel() == 1 && !parallel && gains.len() >= 4096 {
         radix_front(gains, want);
+    } else if exp_sel() == 2 && !parallel {
+        sampled_front(gains, want);
     } else {
         gains.select_nth_unstable(want);
     }
@@ -1980,6 +1982,37 @@ fn order_leading_gains(gains: &mut [u64], want: usize, parallel: bool) {
     match parallel {
         true => head.par_sort_unstable(),
         false => head.sort_unstable(),
+    }
+}
+
+/// Leave the `want` smallest keys in front, in any order: one partition
+/// pass around a pivot sampled to sit just past the wanted rank.
+fn sampled_front(gains: &mut [u64], want: usize) {
+    let n = gains.len();
+    const SAMPLE: usize = 256;
+    if n < 8 * SAMPLE || want.saturating_mul(4) > n {
+        gains.select_nth_unstable(want);
+        return;
+    }
+    let step = n / SAMPLE;
+    let mut sample = [0u64; SAMPLE];
+    for (j, slot) in sample.iter_mut().enumerate() {
+        *slot = gains[j * step];
+    }
+    sample.sort_unstable();
+    let r = ((want as f64 / n as f64) * SAMPLE as f64 * 1.5) as usize + 4;
+    let pivot = sample[r.min(SAMPLE - 1)];
+    let mut lo = 0usize;
+    for i in 0..n {
+        let k = gains[i];
+        gains[i] = gains[lo];
+        gains[lo] = k;
+        lo += usize::from(k <= pivot);
+    }
+    if lo > want {
+        gains[..lo].select_nth_unstable(want);
+    } else if lo < want {
+        gains[lo..].select_nth_unstable(want - lo);
     }
 }
 
