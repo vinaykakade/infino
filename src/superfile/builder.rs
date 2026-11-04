@@ -314,6 +314,16 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
     ) -> Result<(), BuildError> {
         let (terms_per_doc, df) = (self.terms_per_doc, self.df);
         let keep_dfs = exp_pick_df();
+        // Without a caller's table, this call's rows are its own: keep their
+        // counts only while it runs.
+        let mut own_dfs = Vec::new();
+        let slot_dfs = match keep_dfs && slot_dfs.is_empty() {
+            true => {
+                own_dfs.resize(slots.len(), 0);
+                &mut own_dfs[..]
+            }
+            false => slot_dfs,
+        };
         // An input that keeps every document, numbered consecutively and
         // wholly inside this stretch, places local doc `d` at a fixed offset
         // plus `d`; such an input needs no row lookup or range test.
@@ -3042,10 +3052,7 @@ impl SuperfileBuilder {
             let past_row = first_row.saturating_add(plan.chunk_docs).min(n);
             let run = past_row - first_row;
             let mut slots: Vec<u32> = vec![0; run * terms_per_doc];
-            let mut slot_dfs: Vec<u32> = match exp_pick_df() {
-                true => vec![0; run * terms_per_doc],
-                false => Vec::new(),
-            };
+            let mut slot_dfs: Vec<u32> = Vec::new();
             let mut picks: Vec<RowPick> = vec![RowPick::default(); run];
             let collect_span = detail_span!("merge_order_collect", docs = run).entered();
             let picker = TermPicker {
@@ -3072,7 +3079,6 @@ impl SuperfileBuilder {
                 // interleave fill disjoint stretches of the slots, side by side;
                 // each still reads its own terms in the order it always did.
                 let (mut slots_rest, mut picks_rest) = (&mut slots[..], &mut picks[..]);
-                let mut dfs_rest = &mut slot_dfs[..];
                 let mut at = first_row;
                 let mut windows = Vec::with_capacity(covering.len());
                 for &(i, start, end) in &covering {
@@ -3081,15 +3087,7 @@ impl SuperfileBuilder {
                     let (_, rest) = slots_rest.split_at_mut(skip * terms_per_doc);
                     let (s, rest) = rest.split_at_mut(take * terms_per_doc);
                     slots_rest = rest;
-                    let sd = match dfs_rest.is_empty() {
-                        true => &mut [][..],
-                        false => {
-                            let (_, rest) = dfs_rest.split_at_mut(skip * terms_per_doc);
-                            let (sd, rest) = rest.split_at_mut(take * terms_per_doc);
-                            dfs_rest = rest;
-                            sd
-                        }
-                    };
+                    let sd: &mut [u32] = &mut [];
                     let (_, rest) = picks_rest.split_at_mut(skip);
                     let (p, rest) = rest.split_at_mut(take);
                     picks_rest = rest;
@@ -3102,6 +3100,9 @@ impl SuperfileBuilder {
                         picker.pick(&readers[i].0, &rows_by_blob[i], start, end, s, sd, p)
                     })?;
             } else {
+                if exp_pick_df() {
+                    slot_dfs.resize(run * terms_per_doc, 0);
+                }
                 for &(i, _, _) in &covering {
                     picker.pick(
                         &readers[i].0,
