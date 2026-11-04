@@ -639,6 +639,14 @@ enum Spread {
     /// that order. For a partition the serial path would split, so it splits
     /// to the same order with the whole pool behind it.
     ParallelAsSerial,
+    /// [`Spread::ParallelAsSerial`] on a partition just renumbered, whose
+    /// ids already run in first-sight order.
+    ParallelRenumbered,
+}
+
+fn exp_b() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("INFINO_EXP_B").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
 impl Spread {
@@ -662,6 +670,7 @@ struct Part<'a> {
     /// below a partition that did, and [`split_parallel`] splits those
     /// serially.
     as_serial: bool,
+    fresh: bool,
 }
 
 /// Split the top of the tree a level at a time, then hand each partition to
@@ -683,6 +692,7 @@ fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bi
         order,
         distinct: None,
         as_serial: false,
+        fresh: false,
     };
     split_level(vec![root], Vec::new(), 0, run, current_num_threads());
 }
@@ -719,6 +729,7 @@ fn split_level<'a>(
         part.order.len() > MIN_PARTITION
             && depth < MAX_DEPTH
             && (part.order.len() >= PARALLEL_MIN_PARTITION || !wide)
+            && !(exp_b() >= 2 && part.as_serial)
     });
     handed_on.extend(rest.into_iter().map(|part| (part, depth)));
     // A partition renumbers here as `split_parallel` would renumber it, and
@@ -764,6 +775,7 @@ fn split_level<'a>(
         order: inner,
         distinct: None,
         as_serial: true,
+        fresh: true,
     }));
     split_parts(here, handed_on, depth, run, width);
     orders
@@ -790,12 +802,14 @@ fn split_parts<'a>(
                 pool,
                 order,
                 as_serial,
+                fresh,
                 ..
             } = part;
             let mid = order.len() / 2;
             let spread = match (order.len() >= PARALLEL_MIN_PARTITION, as_serial) {
                 (false, _) => Spread::Serial,
                 (true, false) => Spread::Parallel,
+                (true, true) if fresh && exp_b() >= 1 => Spread::ParallelRenumbered,
                 (true, true) => Spread::ParallelAsSerial,
             };
             let refined = pool.with_state(|state| {
@@ -811,6 +825,7 @@ fn split_parts<'a>(
                 order,
                 distinct: Some(distinct),
                 as_serial,
+                fresh: false,
             };
             (
                 refined.first_round_gain,
@@ -1492,7 +1507,7 @@ impl BisectState {
                     .collect();
                 chunks.into_iter().sum()
             }
-            Spread::ParallelAsSerial => {
+            Spread::ParallelAsSerial | Spread::ParallelRenumbered => {
                 let costs: Vec<f64> = self
                     .touched
                     .par_iter()
@@ -1660,7 +1675,7 @@ impl BisectState {
             touched.par_extend(by_first.par_iter().map(|&(_, t)| t));
             return;
         }
-        if spread == Spread::Parallel {
+        if matches!(spread, Spread::Parallel | Spread::ParallelRenumbered) {
             let Self { deg, touched, .. } = self;
             let (left, right) = order.split_at(mid);
             {
