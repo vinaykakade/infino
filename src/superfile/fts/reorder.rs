@@ -54,6 +54,57 @@ use crate::{
     utils::trace::detail_span,
 };
 
+fn exp_knob(name: &str) -> u32 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+fn exp_filter() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| exp_knob("INFINO_EXP_RANK_FILTER") != 0)
+}
+fn exp_prefetch() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| exp_knob("INFINO_EXP_PREFETCH") != 0)
+}
+fn exp_localize_pct() -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| match exp_knob("INFINO_EXP_LOCALIZE_PCT") {
+        0 => 50,
+        p => p as usize,
+    })
+}
+#[inline(always)]
+fn prefetch_at<T>(base: &[T], i: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch is a hint; it never faults whatever the address.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(
+            base.as_ptr().wrapping_add(i) as *const i8,
+            core::arch::x86_64::_MM_HINT_T0,
+        )
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (base, i);
+}
+/// Drop the keys of `gains` that cannot be swapped this round: those whose
+/// gain plus the other side's best gain does not pay.
+fn exp_drop_unpairable(gains: &mut Vec<u64>, other_best: f32, parallel: bool) {
+    let keep = |k: &u64| !(key_gain(*k) + other_best <= 0.0);
+    match parallel {
+        true => {
+            let kept: Vec<u64> = gains.par_iter().copied().filter(|k| keep(k)).collect();
+            *gains = kept;
+        }
+        false => gains.retain(keep),
+    }
+}
+fn exp_best(gains: &[u64], parallel: bool) -> Option<f32> {
+    let k = match parallel {
+        true => gains.par_iter().copied().min(),
+        false => gains.iter().copied().min(),
+    }?;
+    Some(key_gain(k))
+}
+
 /// The sign bit of an `f32`.
 const SIGN_BIT: u32 = 0x8000_0000;
 
@@ -802,7 +853,9 @@ fn split_parallel(
 /// could never shrink it by half anyway.
 fn localizing_pays(fwd: &ForwardIndex, distinct: Option<usize>) -> bool {
     // An empty table cannot shrink.
-    fwd.n_terms > 0 && distinct.is_some_and(|distinct| distinct.saturating_mul(2) <= fwd.n_terms)
+    let pct = exp_localize_pct();
+    fwd.n_terms > 0
+        && distinct.is_some_and(|distinct| distinct.saturating_mul(100) <= fwd.n_terms * pct)
 }
 
 /// Apply a permutation computed over a partition's own positions back onto
@@ -941,7 +994,16 @@ impl BisectState {
         let mut starts: Vec<u32> = Vec::with_capacity(order.len() + 1);
         starts.push(0);
         let mut n_local = 0u32;
-        for &d in order.iter() {
+        let pf = exp_prefetch();
+        for (i, &d) in order.iter().enumerate() {
+            if pf {
+                if let Some(&a) = order.get(i + 16) {
+                    prefetch_at(&fwd.starts, a as usize);
+                }
+                if let Some(&b) = order.get(i + 8) {
+                    prefetch_at(&fwd.terms, fwd.starts[b as usize] as usize);
+                }
+            }
             for &t in fwd.doc(d) {
                 let slot = &mut self.deg[t as usize][0];
                 if *slot == 0 {
@@ -1110,6 +1172,15 @@ impl BisectState {
                     &mut right_gains,
                 );
 
+                if exp_filter() {
+                    if let (Some(bl), Some(br)) = (
+                        exp_best(&left_gains, parallel),
+                        exp_best(&right_gains, parallel),
+                    ) {
+                        exp_drop_unpairable(&mut left_gains, br, parallel);
+                        exp_drop_unpairable(&mut right_gains, bl, parallel);
+                    }
+                }
                 // Swap in pairs so the halves keep their sizes. Both
                 // lists are ordered by gain, so once a pair does not pay
                 // for itself no later pair can either — which is why only
@@ -1439,7 +1510,16 @@ impl BisectState {
             );
             return;
         }
+        let pf = exp_prefetch();
         for (i, &d) in order.iter().enumerate() {
+            if pf {
+                if let Some(&a) = order.get(i + 16) {
+                    prefetch_at(&fwd.starts, a as usize);
+                }
+                if let Some(&b) = order.get(i + 8) {
+                    prefetch_at(&fwd.terms, fwd.starts[b as usize] as usize);
+                }
+            }
             let side = usize::from(i >= mid);
             for &t in fwd.doc(d) {
                 let degs = &mut self.deg[t as usize];
@@ -1474,8 +1554,19 @@ fn rank_by_gain(
     out: &mut Vec<u64>,
 ) {
     // Keys for the documents of one stretch of `half` starting at `first`.
+    let pf = exp_prefetch();
     let keys_of = |first: usize, docs: &[u32], keys: &mut Vec<u64>| {
         for (j, group) in docs.chunks(GAIN_LANES).enumerate() {
+            if pf {
+                let a = (j + 2) * GAIN_LANES;
+                for &d in docs.get(a..(a + GAIN_LANES).min(docs.len())).unwrap_or(&[]) {
+                    prefetch_at(&fwd.starts, d as usize);
+                }
+                let b = (j + 1) * GAIN_LANES;
+                for &d in docs.get(b..(b + GAIN_LANES).min(docs.len())).unwrap_or(&[]) {
+                    prefetch_at(&fwd.terms, fwd.starts[d as usize] as usize);
+                }
+            }
             let gains = lane_gains(fwd, group, move_gain);
             let at = first + j * GAIN_LANES;
             keys.extend(
