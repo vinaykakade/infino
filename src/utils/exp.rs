@@ -36,3 +36,20 @@ pub(crate) fn decode_batch() -> usize {
             .unwrap_or(0)
     })
 }
+
+/// Thread-CPU nanoseconds spent in the body encoder's column tasks.
+pub(crate) static ENCODE_TASK_CPU_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The calling thread's CPU clock when timing is on.
+pub(crate) fn cpu_mark() -> Option<u128> {
+    match copy_timing() {
+        true => crate::runtime_metrics::cpu::thread_cpu_ns(),
+        false => None,
+    }
+}
+
+/// CPU nanoseconds since `mark` on this thread.
+pub(crate) fn cpu_since(mark: Option<u128>) -> u64 {
+    crate::runtime_metrics::cpu::thread_cpu_delta_ns(mark)
+}

@@ -3239,6 +3239,10 @@ impl SuperfileBuilder {
         let copy_start = std::time::Instant::now();
         let decode_busy = std::sync::atomic::AtomicU64::new(0);
         let stats_busy = std::sync::atomic::AtomicU64::new(0);
+        let stats_cpu = std::sync::atomic::AtomicU64::new(0);
+        let decode_cpu = std::sync::atomic::AtomicU64::new(0);
+        let mut ids_cpu = 0u64;
+        crate::utils::exp::ENCODE_TASK_CPU_NS.store(0, std::sync::atomic::Ordering::Relaxed);
         for input in inputs {
             let opts = self.opts.clone();
             let (sender, decoded) = sync_channel::<Result<(RecordBatch, SuperfileStats), BuildError>>(
@@ -3260,9 +3264,12 @@ impl SuperfileBuilder {
                     sync_channel::<Result<RecordBatch, BuildError>>(DECODED_BATCHES_AHEAD);
                 let decode_busy = &decode_busy;
                 let stats_busy = &stats_busy;
+                let stats_cpu = &stats_cpu;
+                let decode_cpu = &decode_cpu;
                 let stats_sender = sender.clone();
                 scope.spawn(move || {
                     let t = std::time::Instant::now();
+                    let cpu0 = crate::utils::exp::cpu_mark();
                     let batches = match input.batches(&opts) {
                         Ok(batches) => batches,
                         Err(e) => {
@@ -3279,8 +3286,13 @@ impl SuperfileBuilder {
                             return raw_sender.send(batch).is_err() || failed;
                         }
                         let decoded = batch.and_then(|batch| {
-                            let stats = SuperfileStats::try_compute_from_record_batch(&batch)?;
-                            Ok((batch, stats))
+                            let mark = crate::utils::exp::cpu_mark();
+                            let stats = SuperfileStats::try_compute_from_record_batch(&batch);
+                            stats_cpu.fetch_add(
+                                crate::utils::exp::cpu_since(mark),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            Ok((batch, stats?))
                         });
                         let failed = decoded.is_err();
                         // The receiver is gone once the merge has failed.
@@ -3309,14 +3321,23 @@ impl SuperfileBuilder {
                         t.elapsed().as_micros() as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
+                    decode_cpu.fetch_add(
+                        crate::utils::exp::cpu_since(cpu0),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 });
                 if stats_thread {
                     scope.spawn(move || {
                         let t = std::time::Instant::now();
                         for batch in raw {
                             let decoded = batch.and_then(|batch| {
-                                let stats = SuperfileStats::try_compute_from_record_batch(&batch)?;
-                                Ok((batch, stats))
+                                let mark = crate::utils::exp::cpu_mark();
+                                let stats = SuperfileStats::try_compute_from_record_batch(&batch);
+                                stats_cpu.fetch_add(
+                                    crate::utils::exp::cpu_since(mark),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                Ok((batch, stats?))
                             });
                             let failed = decoded.is_err();
                             if stats_sender.send(decoded).is_err() || failed {
@@ -3352,7 +3373,9 @@ impl SuperfileBuilder {
                     body_encoder.write_batch(&record_batch)?;
                     timings.write_parquet += start.elapsed();
 
+                    let mark = crate::utils::exp::cpu_mark();
                     push_stable_ids(id_sidecar, &record_batch, &id_column)?;
+                    ids_cpu += crate::utils::exp::cpu_since(mark);
 
                     let rows = record_batch.num_rows() as u32;
                     if reanalyze {
@@ -3365,7 +3388,12 @@ impl SuperfileBuilder {
         }
         if crate::utils::exp::copy_timing() {
             eprintln!(
-                "[copytiming] wall_ms={} decode_thread_ms={} stats_thread_ms={} wait_decoded_ms={} encode_ms={}",
+                "[copytiming] cpu_ms decode_thread={} stats={} encode_tasks={} ids={} | wall_ms={} decode_thread_ms={} stats_thread_ms={} wait_decoded_ms={} encode_ms={}",
+                decode_cpu.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+                stats_cpu.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+                crate::utils::exp::ENCODE_TASK_CPU_NS.load(std::sync::atomic::Ordering::Relaxed)
+                    / 1_000_000,
+                ids_cpu / 1_000_000,
                 copy_start.elapsed().as_millis(),
                 decode_busy.load(std::sync::atomic::Ordering::Relaxed) / 1000,
                 stats_busy.load(std::sync::atomic::Ordering::Relaxed) / 1000,

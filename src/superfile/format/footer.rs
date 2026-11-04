@@ -389,7 +389,13 @@ impl ParquetBodyEncoder {
             .collect();
         match self.together {
             true => tasks.par_iter_mut().try_for_each(|(writer, leaves)| {
-                leaves.iter().try_for_each(|leaf| writer.write(leaf))
+                let mark = crate::utils::exp::cpu_mark();
+                let r = leaves.iter().try_for_each(|leaf| writer.write(leaf));
+                crate::utils::exp::ENCODE_TASK_CPU_NS.fetch_add(
+                    crate::utils::exp::cpu_since(mark),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                r
             })?,
             false => tasks.iter_mut().try_for_each(|(writer, leaves)| {
                 leaves.iter().try_for_each(|leaf| writer.write(leaf))
