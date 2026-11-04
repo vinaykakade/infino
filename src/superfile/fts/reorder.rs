@@ -591,6 +591,12 @@ fn exp_deg_pair() -> bool {
     cfg!(test) || *ON.get_or_init(|| std::env::var("INFINO_EXP_DEG_PAIR").is_ok_and(|v| v == "1"))
 }
 
+/// Experiment knob: keep each term's cost and refresh gains and costs together.
+fn exp_cost_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test) || *ON.get_or_init(|| std::env::var("INFINO_EXP_COST").is_ok_and(|v| v == "1"))
+}
+
 /// Experiment knob: recompute move gains only for terms a swap moved.
 fn exp_dirty_gains() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -884,6 +890,10 @@ struct BisectState<const P: bool> {
     deg: Vec<u32>,
     /// Terms the degree table covers.
     n_terms: usize,
+    /// Each touched term's place in `touched`, where `term_costs` holds it.
+    pos_of: Vec<u32>,
+    /// What each touched term costs across the split, in `touched` order.
+    term_costs: Vec<f64>,
     /// Terms whose degrees a swap changed since their move gains were last
     /// computed, repeats and all; `None` once that outgrows the partition's
     /// terms, when the next round computes every term's gains.
@@ -919,6 +929,8 @@ impl<const P: bool> BisectState<P> {
         Self {
             deg: vec![0u32; 2 * n_terms],
             n_terms,
+            pos_of: Vec::new(),
+            term_costs: Vec::new(),
             dirty: None,
             move_gain_left: vec![0f32; n_terms],
             move_gain_right: vec![0f32; n_terms],
@@ -1106,7 +1118,14 @@ impl<const P: bool> BisectState<P> {
         let n_right = (order.len() - mid) as f32;
         fill_cost_table(&mut self.cost_left, n_left);
         fill_cost_table(&mut self.cost_right, n_right);
-        let mut cost_before = self.partition_cost(n_left, n_right, parallel);
+        // With every term's cost kept by its place in `touched`, the gains
+        // and the cost come from one pass, and later rounds redo only the
+        // terms their swaps moved.
+        let cached = !parallel && exp_cost_cache();
+        let mut cost_before = match cached {
+            true => self.refresh_terms(n_left, n_right, true),
+            false => self.partition_cost(n_left, n_right, parallel),
+        };
         // What the split's first round lowered the cost by: its offer
         // towards the run's bar, which measures every later round against
         // what a first round over fresh halves is worth per document.
@@ -1137,7 +1156,9 @@ impl<const P: bool> BisectState<P> {
             let moved = {
                 let step = timed.then(Instant::now);
                 let cpu = timed.then(thread_cpu_ns).flatten();
-                self.compute_move_gains(n_left, n_right, parallel);
+                if !cached {
+                    self.compute_move_gains(n_left, n_right, parallel);
+                }
                 if let Some(step) = step {
                     level.gains_ns += ns_since(step);
                     level.serial_cpu_ns += thread_cpu_delta_ns(cpu);
@@ -1259,7 +1280,10 @@ impl<const P: bool> BisectState<P> {
                 break;
             }
             level.swaps += moved as u64;
-            let cost_after = self.partition_cost(n_left, n_right, parallel);
+            let cost_after = match cached {
+                true => self.refresh_terms(n_left, n_right, false),
+                false => self.partition_cost(n_left, n_right, parallel),
+            };
             let round_gain = cost_before - cost_after;
             cost_before = cost_after;
             if round == 0 {
@@ -1442,6 +1466,72 @@ impl<const P: bool> BisectState<P> {
             done.clear();
             mem::swap(&mut done, fresh);
         }
+    }
+
+    /// Bring the move gains and per-term costs up to date with the degrees
+    /// and return the split's cost, summed over `touched` in order exactly
+    /// as [`Self::partition_cost`] sums it. `all` redoes every term and
+    /// numbers them; otherwise only the terms the last swaps listed are
+    /// redone, or every term when that list outgrew them.
+    fn refresh_terms(&mut self, n_left: f32, n_right: f32, all: bool) -> f64 {
+        let update = |state: &mut Self, t: u32| -> f64 {
+            let (dl, dr) = (state.deg[state.l(t)], state.deg[state.r(t)]);
+            let t = t as usize;
+            let left = Side {
+                deg: dl,
+                size: n_left,
+                costs: &state.cost_left,
+            };
+            let right = Side {
+                deg: dr,
+                size: n_right,
+                costs: &state.cost_right,
+            };
+            if dl > 0 {
+                state.move_gain_left[t] = move_gain(&left, &right);
+            }
+            if dr > 0 {
+                state.move_gain_right[t] = move_gain(&right, &left);
+            }
+            f64::from(left.cost(dl)) + f64::from(right.cost(dr))
+        };
+        let dirty = match all {
+            true => None,
+            false => self.dirty.take(),
+        };
+        if all {
+            if self.pos_of.len() < self.n_terms {
+                self.pos_of.resize(self.n_terms, 0);
+            }
+            self.term_costs.clear();
+        }
+        match &dirty {
+            Some(dirty) => {
+                for &t in dirty {
+                    let c = update(self, t);
+                    let at = self.pos_of[t as usize] as usize;
+                    self.term_costs[at] = c;
+                }
+            }
+            None => {
+                let touched = mem::take(&mut self.touched);
+                for (i, &t) in touched.iter().enumerate() {
+                    let c = update(self, t);
+                    match all {
+                        true => {
+                            self.pos_of[t as usize] = i as u32;
+                            self.term_costs.push(c);
+                        }
+                        false => self.term_costs[i] = c,
+                    }
+                }
+                self.touched = touched;
+            }
+        }
+        let mut list = dirty.unwrap_or_default();
+        list.clear();
+        self.dirty = Some(list);
+        self.term_costs.iter().sum()
     }
 
     /// Count each term's documents on either side of `mid` into the degree
