@@ -13760,6 +13760,8 @@ pub(crate) async fn try_commit_attempt(
     // Checked immediately before the pointer PUT; see [`CommitFence`].
     fence: Option<&mut dyn CommitFence>,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
+    let t_att = Instant::now();
+    let mut marks: Vec<(&str, f64)> = Vec::new();
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(
         &storage,
@@ -13795,6 +13797,7 @@ pub(crate) async fn try_commit_attempt(
     ))
     .await?;
 
+    marks.push(("update", t_att.elapsed().as_secs_f64()));
     // 2a. Name any already-written sidecar in this same successor; a later
     //     manifest would leave its tombstones unreadable in between.
     new_manifest.register_tombstone_sidecar(sidecar_to_register);
@@ -13888,6 +13891,7 @@ pub(crate) async fn try_commit_attempt(
     //     built no contribution) leaves it incomplete, so part selection
     //     keeps its summary-based choice instead of trusting an index that
     //     would never route to that superfile.
+    marks.push(("etag", t_att.elapsed().as_secs_f64()));
     let contributed: HashSet<Uuid> = term_contributions.iter().map(|c| c.superfile_id).collect();
     let every_new_covered = new_entries
         .iter()
@@ -13915,6 +13919,7 @@ pub(crate) async fn try_commit_attempt(
         }
         _ => None,
     };
+    marks.push(("load_root", t_att.elapsed().as_secs_f64()));
     if let Some(reference) = unreadable_prior {
         new_manifest = new_manifest.with_term_index_ref(reference, false);
     } else if !term_contributions.is_empty() {
@@ -13979,6 +13984,7 @@ pub(crate) async fn try_commit_attempt(
     //    content-hashes) are unchanged in the new list. Each touched
     //    part ships both wire forms, full and the routing sibling the
     //    list entry references, and its summaries section.
+    marks.push(("layers_root", t_att.elapsed().as_secs_f64()));
     let encoded_parts: Vec<(String, Bytes)> =
         parts_to_write.iter().flat_map(|ep| ep.objects()).collect();
     // Whatever this commit's safety rests on has to still hold here. What is left after it is the
@@ -13993,6 +13999,19 @@ pub(crate) async fn try_commit_attempt(
     new_manifest
         .write(storage.as_ref(), prev_etag.as_deref(), &encoded_parts)
         .await?;
+    marks.push(("write", t_att.elapsed().as_secs_f64()));
+    if crate::storage::io_counters::timeline_enabled() {
+        let mut last = 0.0;
+        let parts: Vec<String> = marks
+            .iter()
+            .map(|(n, t)| {
+                let d = t - last;
+                last = *t;
+                format!("{n} {:.0}ms", d * 1e3)
+            })
+            .collect();
+        info!("[turn] {} parts {}", parts.join(" "), encoded_parts.len());
+    }
     // Silence the unused-import warning when no path uses
     // `PartId` / `part_mod` directly (helpers consume them
     // from inside `build_part_and_entry`).
