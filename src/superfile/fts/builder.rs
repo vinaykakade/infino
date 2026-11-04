@@ -3067,6 +3067,16 @@ impl FtsBuilder {
             // The collection size idf is baked with: the documents that
             // carry tokens, matching what the reader divides by.
             let n_scored = n_scored_per_col[orig_col_idx];
+            let norms: Option<(Vec<u8>, [f32; 256])> = exp_norm_table().then(|| {
+                let buckets = col_doc_lengths
+                    .iter()
+                    .map(|&l| bm25::quantize_len(l))
+                    .collect();
+                let norms = std::array::from_fn(|q| {
+                    params.dl_norm_k1(bm25::dequantize_len(q as u8), avgdl)
+                });
+                (buckets, norms)
+            });
             let enc = TermEncoding {
                 doc_lengths: col_doc_lengths,
                 avgdl,
@@ -3075,6 +3085,7 @@ impl FtsBuilder {
                 heads: head_sink.is_some(),
                 head_depth,
                 rows: doc_map.as_deref(),
+                norms: norms.as_ref().map(|(b, n)| (b.as_slice(), n)),
             };
 
             // In-RAM path invariant: the dispatcher checked that no column
@@ -3274,6 +3285,7 @@ impl FtsBuilder {
                 heads: head_sink.is_some(),
                 head_depth,
                 rows: doc_map.as_deref(),
+                norms: None,
             };
 
             let mut sink = TermSink {
@@ -4621,6 +4633,12 @@ fn encode_and_emit_term<W: Write>(
     )
 }
 
+/// Experiment knob: score postings from per-document length buckets.
+fn exp_norm_table() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("INFINO_EXP_NORM_TABLE").is_some_and(|v| v == "1"))
+}
+
 /// Experiment knob: encode position groups straight from the merged runs.
 fn exp_direct_group() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4656,6 +4674,10 @@ struct TermEncoding<'a> {
     head_depth: usize,
     /// The row each blob document id stands for, when they differ.
     rows: Option<&'a [u32]>,
+    /// Each document's stored length bucket, and each bucket's length
+    /// normalizer, when built: a posting is then scored from one byte
+    /// a document rather than four.
+    norms: Option<(&'a [u8], &'a [f32; 256])>,
 }
 
 /// A term encoded on a worker thread, its bytes taken out of that
@@ -4711,6 +4733,18 @@ fn encode_term(
     let idf_t = bm25::idf(n_scored_docs as u64, df);
     let score_all = |scratch: &mut TermScratch| {
         scratch.scores.clear();
+        if let Some((buckets, norms)) = enc.norms {
+            scratch.scores.extend(pairs.iter().map(|&(doc, tf)| {
+                let tf = tf as f32;
+                let denom = tf + norms[buckets[doc as usize] as usize];
+                if denom == 0.0 {
+                    0.0
+                } else {
+                    idf_t * tf / denom
+                }
+            }));
+            return;
+        }
         scratch.scores.extend(pairs.iter().map(|&(doc, tf)| {
             bm25::score(
                 idf_t,
@@ -6609,6 +6643,7 @@ mod tests {
             heads: true,
             head_depth: DEPTH,
             rows: Some(&rows),
+            norms: None,
         };
         let idf = bm25::idf(u64::from(DOCS), pairs.len() as u64);
         let scores: Vec<f32> = pairs
