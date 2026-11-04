@@ -901,6 +901,7 @@ struct BisectState {
     packed: ForwardIndex,
     pos: Vec<u32>,
     was: Vec<u32>,
+    rerank: Rerank,
 }
 
 impl BisectState {
@@ -909,6 +910,7 @@ impl BisectState {
             packed: ForwardIndex::default(),
             pos: Vec::new(),
             was: Vec::new(),
+            rerank: Rerank::default(),
             deg: vec![[0u32; 2]; n_terms],
             moved_terms: None,
             move_gain_left: vec![0f32; n_terms],
@@ -1019,6 +1021,22 @@ impl BisectState {
             return;
         }
         let mid = order.len() / 2;
+        if exp_pack() & 4 != 0 {
+            let mut packed = ForwardIndex::default();
+            self.pack_and_count(fwd, order, mid, &mut packed);
+            let mut pos: Vec<u32> = (0..order.len() as u32).collect();
+            self.rerank.on = exp_pack() & 8 != 0;
+            let [left_distinct, right_distinct] = self
+                .refine_in(&packed, &mut pos, mid, depth, false, run, true)
+                .distinct;
+            self.rerank.on = false;
+            let (left, right) = pos.split_at_mut(mid);
+            self.split(&packed, left, depth + 1, run, Some(left_distinct));
+            self.split(&packed, right, depth + 1, run, Some(right_distinct));
+            drop(packed);
+            apply_inner_order(order, &pos);
+            return;
+        }
         // The root's first round offers the bar from inside `refine`.
         let [left_distinct, right_distinct] =
             self.refine(fwd, order, mid, depth, false, run).distinct;
@@ -1056,7 +1074,9 @@ impl BisectState {
         } else {
             let mut packed = mem::take(&mut self.packed);
             self.pack_and_count(fwd, order, mid, &mut packed);
+            self.rerank.on = knob & 8 != 0;
             let refined = self.refine_in(&packed, &mut pos, mid, depth, parallel, run, true);
+            self.rerank.on = false;
             self.packed = packed;
             refined
         };
@@ -1161,6 +1181,10 @@ impl BisectState {
         // Taken out of `self` so the ranking can borrow the move-gain
         // tables while writing them, and put back before returning so the
         // next split reuses the same allocations.
+        let mut rr = mem::take(&mut self.rerank);
+        if rr.on {
+            rr.start(order.len());
+        }
         let mut left_gains = mem::take(&mut self.left_gains);
         let mut right_gains = mem::take(&mut self.right_gains);
         let mut last_swaps = 0usize;
@@ -1181,6 +1205,17 @@ impl BisectState {
             // its terms get one rarer on this side and one commoner on
             // the other. Positive means the move is worth making.
             let moved = {
+                let incremental = rr.on
+                    && round > 0
+                    && match self.moved_terms.as_deref() {
+                        None => false,
+                        Some(moved) => {
+                            if !rr.built {
+                                rr.build(fwd, &self.touched, &self.deg);
+                            }
+                            rr.mark(moved, fwd.terms.len() / 2)
+                        }
+                    };
                 let step = timed.then(Instant::now);
                 let cpu = timed.then(thread_cpu_ns).flatten();
                 self.compute_move_gains(n_left, n_right, parallel);
@@ -1190,14 +1225,51 @@ impl BisectState {
                 }
                 let step = timed.then(Instant::now);
                 let (left, right) = order.split_at_mut(mid);
-                rank_by_gain(fwd, left, &self.move_gain_left, parallel, &mut left_gains);
-                rank_by_gain(
-                    fwd,
-                    right,
-                    &self.move_gain_right,
-                    parallel,
-                    &mut right_gains,
-                );
+                if incremental {
+                    for &d in &rr.dirty {
+                        let p = rr.at[d as usize] as usize;
+                        let table = match p >= mid {
+                            false => &self.move_gain_left,
+                            true => &self.move_gain_right,
+                        };
+                        let mut g = 0.0f32;
+                        for &t in fwd.doc(d) {
+                            g += table[t as usize];
+                        }
+                        rr.gain[p] = g;
+                    }
+                    left_gains.clear();
+                    left_gains.extend(
+                        rr.gain[..mid]
+                            .iter()
+                            .enumerate()
+                            .map(|(p, &g)| rank_key(g, p as u32)),
+                    );
+                    right_gains.clear();
+                    right_gains.extend(
+                        rr.gain[mid..]
+                            .iter()
+                            .enumerate()
+                            .map(|(p, &g)| rank_key(g, p as u32)),
+                    );
+                } else {
+                    rank_by_gain(fwd, left, &self.move_gain_left, parallel, &mut left_gains);
+                    rank_by_gain(
+                        fwd,
+                        right,
+                        &self.move_gain_right,
+                        parallel,
+                        &mut right_gains,
+                    );
+                    if rr.on {
+                        for (slot, &k) in rr.gain.iter_mut().zip(&left_gains) {
+                            *slot = key_gain(k);
+                        }
+                        for (slot, &k) in rr.gain[mid..].iter_mut().zip(&right_gains) {
+                            *slot = key_gain(k);
+                        }
+                    }
+                }
 
                 // Swap in pairs so the halves keep their sizes. Both
                 // lists are ordered by gain, so once a pair does not pay
@@ -1258,6 +1330,18 @@ impl BisectState {
                     }
                     left[li] = rd;
                     right[ri] = ld;
+                    if rr.on {
+                        rr.at[rd as usize] = li as u32;
+                        rr.at[ld as usize] = (mid + ri) as u32;
+                        // A document without terms is never marked; its gain
+                        // is zero on either side.
+                        if fwd.doc(rd).is_empty() {
+                            rr.gain[li] = 0.0;
+                        }
+                        if fwd.doc(ld).is_empty() {
+                            rr.gain[mid + ri] = 0.0;
+                        }
+                    }
                 }
                 if parallel && swaps > 0 {
                     // Which pairs swap depends only on the ranked gains, and
@@ -1331,6 +1415,7 @@ impl BisectState {
 
         self.left_gains = left_gains;
         self.right_gains = right_gains;
+        self.rerank = rr;
         let refined = Refined {
             first_round_gain,
             distinct: self.distinct_by_side(),
@@ -1589,6 +1674,101 @@ fn pack_parallel(fwd: &ForwardIndex, order: &[u32]) -> ForwardIndex {
         terms,
         starts,
         n_terms: fwd.n_terms,
+    }
+}
+
+/// Per-refine state for re-ranking only the documents whose gains moved.
+#[derive(Default)]
+struct Rerank {
+    on: bool,
+    built: bool,
+    term_slot: Vec<u32>,
+    inv_starts: Vec<u32>,
+    inv_docs: Vec<u32>,
+    term_stamp: Vec<u32>,
+    doc_stamp: Vec<u32>,
+    stamp: u32,
+    dirty: Vec<u32>,
+    at: Vec<u32>,
+    gain: Vec<f32>,
+}
+
+impl Rerank {
+    fn start(&mut self, n: usize) {
+        self.built = false;
+        self.at.clear();
+        self.at.extend(0..n as u32);
+        self.gain.clear();
+        self.gain.resize(n, 0.0);
+        self.doc_stamp.clear();
+        self.doc_stamp.resize(n, 0);
+        self.stamp = 0;
+    }
+
+    fn build(&mut self, fwd: &ForwardIndex, touched: &[u32], deg: &[[u32; 2]]) {
+        if self.term_slot.len() < fwd.n_terms {
+            self.term_slot.resize(fwd.n_terms, 0);
+        }
+        self.inv_starts.clear();
+        self.inv_starts.push(0);
+        let mut total = 0u32;
+        for (i, &t) in touched.iter().enumerate() {
+            self.term_slot[t as usize] = i as u32;
+            let [l, r] = deg[t as usize];
+            total += l + r;
+            self.inv_starts.push(total);
+        }
+        self.inv_docs.clear();
+        self.inv_docs.resize(total as usize, 0);
+        let mut cursor: Vec<u32> = self.inv_starts[..touched.len()].to_vec();
+        for d in 0..fwd.len() as u32 {
+            for &t in fwd.doc(d) {
+                let c = &mut cursor[self.term_slot[t as usize] as usize];
+                self.inv_docs[*c as usize] = d;
+                *c += 1;
+            }
+        }
+        self.term_stamp.clear();
+        self.term_stamp.resize(touched.len(), 0);
+        self.built = true;
+    }
+
+    /// Mark the documents carrying a moved term; false when that would cost
+    /// more than ranking every document.
+    fn mark(&mut self, moved: &[u32], budget: usize) -> bool {
+        self.stamp += 1;
+        let stamp = self.stamp;
+        let mut cost = 0usize;
+        for &t in moved {
+            let slot = self.term_slot[t as usize] as usize;
+            if self.term_stamp[slot] == stamp {
+                continue;
+            }
+            self.term_stamp[slot] = stamp;
+            cost += (self.inv_starts[slot + 1] - self.inv_starts[slot]) as usize;
+            if cost > budget {
+                return false;
+            }
+        }
+        self.stamp += 1;
+        let dstamp = self.stamp;
+        self.dirty.clear();
+        for &t in moved {
+            let slot = self.term_slot[t as usize] as usize;
+            if self.term_stamp[slot] != stamp {
+                continue;
+            }
+            self.term_stamp[slot] = dstamp;
+            let lo = self.inv_starts[slot] as usize;
+            let hi = self.inv_starts[slot + 1] as usize;
+            for &d in &self.inv_docs[lo..hi] {
+                if self.doc_stamp[d as usize] != dstamp {
+                    self.doc_stamp[d as usize] = dstamp;
+                    self.dirty.push(d);
+                }
+            }
+        }
+        true
     }
 }
 
