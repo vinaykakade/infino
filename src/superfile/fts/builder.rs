@@ -924,17 +924,64 @@ fn read_partition_records<const N: usize>(path: &Path) -> Result<Vec<[u32; N]>, 
 /// vocabulary; tiny even at 10M docs.
 fn build_lex_rank(id_to_term: &[&str]) -> (Vec<u32>, Vec<u32>) {
     let n = id_to_term.len();
-    let mut by_lex: Vec<u32> = (0..n as u32).collect();
-    by_lex.sort_unstable_by(|&a, &b| {
-        id_to_term[a as usize]
-            .as_bytes()
-            .cmp(id_to_term[b as usize].as_bytes())
-    });
+    let by_lex: Vec<u32> = if exp_lex_prefix() {
+        lex_order_by_prefix(id_to_term)
+    } else {
+        let mut by_lex: Vec<u32> = (0..n as u32).collect();
+        by_lex.sort_unstable_by(|&a, &b| {
+            id_to_term[a as usize]
+                .as_bytes()
+                .cmp(id_to_term[b as usize].as_bytes())
+        });
+        by_lex
+    };
     let mut rank = vec![0u32; n];
     for (r, id) in by_lex.iter().enumerate() {
         rank[*id as usize] = r as u32;
     }
     (rank, by_lex)
+}
+
+/// Experiment knob: sort the dictionary by an inline 8-byte key. Read once.
+fn exp_lex_prefix() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INFINO_EXP_LEX_PREFIX").is_ok_and(|v| v == "1"))
+}
+
+/// The first eight bytes of `term`, zero-padded, as a big-endian integer.
+///
+/// Integer order on these keys agrees with byte order on the terms
+/// wherever the keys differ: the first differing byte decides both, and a
+/// term that ends inside the eight bytes pads with zeros, which sort no
+/// later than any byte the longer term carries there. Equal keys say
+/// nothing, so ties fall back to the full comparison.
+#[inline]
+fn lex_key(term: &[u8]) -> u64 {
+    let mut key = [0u8; 8];
+    let k = term.len().min(8);
+    key[..k].copy_from_slice(&term[..k]);
+    u64::from_be_bytes(key)
+}
+
+/// Term ids in byte order of their terms. Sorts `(key, id)` pairs so most
+/// comparisons are one integer compare against data held in the pair
+/// itself, rather than a library compare through a pointer into the
+/// arena. The vocabulary holds each term once, so the order is total and
+/// identical to a sort on the full terms.
+fn lex_order_by_prefix(id_to_term: &[&str]) -> Vec<u32> {
+    let mut keyed: Vec<(u64, u32)> = id_to_term
+        .iter()
+        .enumerate()
+        .map(|(id, t)| (lex_key(t.as_bytes()), id as u32))
+        .collect();
+    keyed.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| {
+            id_to_term[a.1 as usize]
+                .as_bytes()
+                .cmp(id_to_term[b.1 as usize].as_bytes())
+        })
+    });
+    keyed.into_iter().map(|(_, id)| id).collect()
 }
 
 /// Experiment knob: compare interned terms inline. Read once.
@@ -5210,6 +5257,21 @@ mod term_eq_tests {
     }
 
     proptest! {
+        /// The keyed sort orders ids exactly as a sort on the full
+        /// terms does, including terms that share a long prefix, end
+        /// inside the key, or carry zero bytes the padding could mistake
+        /// for an end.
+        #[test]
+        fn lex_order_by_prefix_matches_a_full_term_sort(
+            terms in proptest::collection::btree_set("[ab\\x00é]{0,11}", 0..200)
+        ) {
+            let terms: Vec<String> = terms.into_iter().rev().collect();
+            let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+            let mut expected: Vec<u32> = (0..refs.len() as u32).collect();
+            expected.sort_unstable_by(|&a, &b| refs[a as usize].as_bytes().cmp(refs[b as usize].as_bytes()));
+            prop_assert_eq!(super::lex_order_by_prefix(&refs), expected);
+        }
+
         #[test]
         fn term_bytes_eq_matches_slice_equality(
             a in proptest::collection::vec(any::<u8>(), 0..40),

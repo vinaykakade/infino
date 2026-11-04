@@ -825,6 +825,13 @@ fn split_target_bytes(options: &SupertableOptions) -> usize {
     (options.superfile_buffer_split_mb as usize).saturating_mul(MIB)
 }
 
+/// Experiment knob: free the frozen lanes on the pool, off the committing
+/// thread. Read once.
+fn exp_bg_drop() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INFINO_EXP_BG_DROP").is_ok_and(|v| v == "1"))
+}
+
 /// Where a commit of `buffer` is cut into superfiles: `bounds[i]..bounds[i + 1]`
 /// are piece `i`'s rows. The count is [`superfiles_per_commit`]'s, from the
 /// buffered bytes (Arrow reports capacity, not logical bytes — fine for a
@@ -2763,6 +2770,9 @@ impl SupertableWriter {
         drop(freeze_span);
         let merge_span = detail_span!("seal.merge_lanes", pieces = n_pieces).entered();
         let frozen = Arc::new(freeze_lanes(pool, frozen, pieces)?);
+        // Experiment: hold one reference so the last one is not dropped
+        // on this thread, and release it on the pool after the build.
+        let frozen_hold = exp_bg_drop().then(|| Arc::clone(&frozen));
         drop(merge_span);
         let pieces_span = detail_span!("seal.build_pieces", pieces = n_pieces).entered();
         let (batches, bounds) = (Arc::new(batches), Arc::new(bounds));
@@ -2793,6 +2803,9 @@ impl SupertableWriter {
             },
             seal_task_lost,
         )?;
+        if let Some(frozen) = frozen_hold {
+            pool.spawn(move || drop(frozen));
+        }
         drop(pieces_span);
         let sealed = sealing.elapsed();
         let superfiles = outputs.len();
