@@ -2771,16 +2771,32 @@ impl SupertableWriter {
             false => vec![None; n_pieces],
             true => {
                 let _order_span = detail_span!("seal.order_pieces", pieces = n_pieces).entered();
-                (0..n_pieces)
-                    .map(|piece| {
-                        let view = LaneView {
-                            lanes: Arc::clone(&frozen),
-                            piece,
-                            order: None,
-                        };
-                        pool.install(|| lane_doc_order(&view, frozen.n_columns() as u32, None))
-                    })
-                    .collect::<Result<_, _>>()?
+                // On a pool of the append's own, its share of the writer
+                // pool's threads, as a merge orders on its own: appends
+                // ordering side by side on the shared pool stole each other's
+                // nested work and left the host half idle.
+                let share = lanes_for(
+                    pool.current_num_threads(),
+                    OPEN_APPENDS.load(Ordering::Relaxed),
+                );
+                let order_pool = ThreadPoolBuilder::new()
+                    .num_threads(share)
+                    .thread_name(|i| format!("append-order-{i}"))
+                    .build()
+                    .map_err(|e| BuildError::Store(format!("append order pool: {e}")))?;
+                order_pool.install(|| {
+                    (0..n_pieces)
+                        .into_par_iter()
+                        .map(|piece| {
+                            let view = LaneView {
+                                lanes: Arc::clone(&frozen),
+                                piece,
+                                order: None,
+                            };
+                            lane_doc_order(&view, frozen.n_columns() as u32, None)
+                        })
+                        .collect::<Result<_, _>>()
+                })?
             }
         };
         let ordered_at = sealing.elapsed();
