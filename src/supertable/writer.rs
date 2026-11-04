@@ -4093,6 +4093,7 @@ fn build_piece(
     vector_layout: VectorLayout,
     provided_centroids: Option<Arc<[f32]>>,
 ) -> Result<ShardOutput, BuildError> {
+    let piece_started = Instant::now();
     let scalars = rows.scalars();
     let fts_text_bytes: u64 = scalars
         .iter()
@@ -4136,7 +4137,17 @@ fn build_piece(
     // Per-scalar-column min/max from the piece's batches; `from_batches`
     // borrows them.
     let scalar_stats = ScalarStatsAgg::from_batches(&manifest.scalar_schema(), &scalars);
-    seal_shard(builder, superfile_id, head_sink, bounds, scalar_stats)
+    let sealing = Instant::now();
+    let added = sealing.duration_since(piece_started);
+    let sealed = seal_shard(builder, superfile_id, head_sink, bounds, scalar_stats);
+    if exp_ingest_order() {
+        eprintln!(
+            "[piece] add={:.1}s seal={:.1}s",
+            added.as_secs_f64(),
+            sealing.elapsed().as_secs_f64()
+        );
+    }
+    sealed
 }
 
 /// The sink a shard build hands its terms to, with the head depth, when

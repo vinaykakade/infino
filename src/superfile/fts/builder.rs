@@ -4545,10 +4545,14 @@ fn emit_ordered_lanes_column<W: Write + Send>(
         sync_channel::<Vec<Option<LaneEncoded<'_>>>>(ENCODED_BATCHES_AHEAD);
     // The writer's own borrow, given back when the scope ends.
     let write_profile = &mut *finish_profile;
+    let started = Instant::now();
+    let (mut encoding, mut handing, mut writing) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
     thread::scope(|scope| -> Result<(), BuildError> {
         let n_emitted = &mut n_emitted;
+        let writing = &mut writing;
         let writer = scope.spawn(move || -> Result<(), BuildError> {
             for batch in encoded_rx {
+                let at = Instant::now();
                 for (term, mut merged) in batch.into_iter().flatten() {
                     *n_emitted += 1;
                     write_term(
@@ -4561,6 +4565,7 @@ fn emit_ordered_lanes_column<W: Write + Send>(
                         sink,
                     )?;
                 }
+                *writing += at.elapsed();
             }
             Ok(())
         });
@@ -4586,6 +4591,7 @@ fn emit_ordered_lanes_column<W: Write + Send>(
             if batch.is_empty() || !(full || groups.peek().is_none()) {
                 continue;
             }
+            let at = Instant::now();
             let encoded: Vec<Option<LaneEncoded<'_>>> = batch
                 .par_chunks(task_terms(batch.len()))
                 .map(encode_chunk)
@@ -4595,11 +4601,14 @@ fn emit_ordered_lanes_column<W: Write + Send>(
                 .collect();
             batch.clear();
             batch_postings = 0;
+            encoding += at.elapsed();
+            let at = Instant::now();
             // The writer is gone only after an error of its own, which the
             // join below reports.
             if encoded_tx.send(encoded).is_err() {
                 break;
             }
+            handing += at.elapsed();
         }
         drop(encoded_tx);
         writer.join().map_err(|_| {
@@ -4611,6 +4620,15 @@ fn emit_ordered_lanes_column<W: Write + Send>(
     for worker in workers.into_inner().unwrap_or_else(PoisonError::into_inner) {
         finish_profile.absorb(&worker.profile);
     }
+    // Experiment: where an ordered piece's emit spends its wall.
+    eprintln!(
+        "[lane-emit] col={column} terms={n_emitted} wall={:.1}s encode={:.1}s blocked={:.1}s \
+         write={:.1}s",
+        started.elapsed().as_secs_f64(),
+        encoding.as_secs_f64(),
+        handing.as_secs_f64(),
+        writing.as_secs_f64(),
+    );
     Ok(n_emitted)
 }
 
