@@ -13674,6 +13674,8 @@ async fn put_new_superfile_bytes(
             }
         }
     }
+    let t_put = Instant::now();
+    let n_bytes = bytes.len();
     let result = if (bytes.len() as u64) >= multipart_threshold {
         put_superfile_multipart(storage.as_ref(), &path, bytes).await
     } else if exp_put_hedge() {
@@ -13681,6 +13683,9 @@ async fn put_new_superfile_bytes(
     } else {
         storage.put_overwrite(&path, bytes).await
     };
+    if crate::storage::io_counters::timeline_enabled() && t_put.elapsed().as_secs_f64() > 1.5 {
+        info!("[put] slow {n_bytes} bytes {:.0}ms", t_put.elapsed().as_secs_f64() * 1e3);
+    }
     result.map_err(SupertableCommitError::from)
 }
 
