@@ -567,23 +567,61 @@ pub(crate) fn bisect_order_reported(
     let report = RunReport::new();
     let reference = AtomicU64::new(0);
     if n > MIN_PARTITION {
-        let pool = StatePool {
-            n_terms: fwd.n_terms,
-            free: Mutex::new(Vec::new()),
-        };
         let run = Bisect {
             params,
             reference: &reference,
             report: &report,
             parent: &report.span,
         };
-        split_levels(fwd, &mut order, &pool, run);
+        match exp_deg_pair() {
+            true => split_root::<true>(fwd, &mut order, run),
+            false => split_root::<false>(fwd, &mut order, run),
+        }
     }
     let reference = f64::from_bits(reference.load(Relaxed));
     let mut report = report.finish(reference);
     report.others_at_start = others_at_start;
     report.others_at_end = RUNNING.fetch_sub(1, Relaxed) - 1;
     (order, report)
+}
+
+/// Experiment knob: keep a term's two degrees side by side.
+fn exp_deg_pair() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test) || *ON.get_or_init(|| std::env::var("INFINO_EXP_DEG_PAIR").is_ok_and(|v| v == "1"))
+}
+
+/// Experiment knob: recompute move gains only for terms a swap moved.
+fn exp_dirty_gains() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test) || *ON.get_or_init(|| std::env::var("INFINO_EXP_DIRTY").is_ok_and(|v| v == "1"))
+}
+
+/// Run the bisection with degree layout `P`.
+fn split_root<const P: bool>(fwd: &ForwardIndex, order: &mut [u32], run: Bisect<'_>) {
+    let pool = StatePool::<P> {
+        n_terms: fwd.n_terms,
+        free: Mutex::new(Vec::new()),
+    };
+    split_levels(fwd, order, &pool, run);
+}
+
+/// Where term `t`'s left degree sits in a degree table.
+#[inline(always)]
+fn at_left<const P: bool>(t: usize) -> usize {
+    match P {
+        true => 2 * t,
+        false => t,
+    }
+}
+
+/// Where term `t`'s right degree sits in a degree table over `n` terms.
+#[inline(always)]
+fn at_right<const P: bool>(t: usize, n: usize) -> usize {
+    match P {
+        true => 2 * t + 1,
+        false => n + t,
+    }
 }
 
 /// Split the top of the tree a level at a time, then hand each partition to
@@ -598,7 +636,12 @@ pub(crate) fn bisect_order_reported(
 /// partition order, the same on every run. Every partition goes through
 /// exactly the steps [`split_parallel`] would take it through, so the order
 /// is the same.
-fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bisect<'_>) {
+fn split_levels<const P: bool>(
+    fwd: &ForwardIndex,
+    order: &mut [u32],
+    pool: &StatePool<P>,
+    run: Bisect<'_>,
+) {
     let width = rayon::current_num_threads();
     // Each partition travels with its distinct terms once a refine has
     // counted them; nothing has counted the root's.
@@ -671,11 +714,11 @@ fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bi
 /// Split `order` as [`BisectState::split`] does, running the two halves
 /// of a large partition in parallel. `distinct` is the partition's distinct
 /// terms, where its parent's refine counted them.
-fn split_parallel(
+fn split_parallel<const P: bool>(
     fwd: &ForwardIndex,
     order: &mut [u32],
     depth: u32,
-    pool: &StatePool,
+    pool: &StatePool<P>,
     run: Bisect<'_>,
     distinct: Option<usize>,
 ) {
@@ -696,7 +739,7 @@ fn split_parallel(
             );
         }
         let mut inner: Vec<u32> = (0..order.len() as u32).collect();
-        let inner_pool = StatePool {
+        let inner_pool = StatePool::<P> {
             n_terms: local.n_terms,
             free: Mutex::new(Vec::new()),
         };
@@ -810,13 +853,13 @@ struct Refined {
 
 /// Scratch states shared by the parallel splits. A split takes one and
 /// puts it back clean, so only as many exist as ever ran at once.
-struct StatePool {
+struct StatePool<const P: bool> {
     n_terms: usize,
-    free: Mutex<Vec<BisectState>>,
+    free: Mutex<Vec<BisectState<P>>>,
 }
 
-impl StatePool {
-    fn with_state<R>(&self, f: impl FnOnce(&mut BisectState) -> R) -> R {
+impl<const P: bool> StatePool<P> {
+    fn with_state<R>(&self, f: impl FnOnce(&mut BisectState<P>) -> R) -> R {
         // A split never panics while holding the lock, so a poisoned
         // list is still a valid one.
         let taken = self
@@ -836,9 +879,15 @@ impl StatePool {
 
 /// Scratch reused down the whole recursion, so a split allocates
 /// nothing beyond what the first one needed.
-struct BisectState {
-    deg_left: Vec<u32>,
-    deg_right: Vec<u32>,
+struct BisectState<const P: bool> {
+    /// Both sides' degrees, placed by [`at_left`] and [`at_right`].
+    deg: Vec<u32>,
+    /// Terms the degree table covers.
+    n_terms: usize,
+    /// Terms whose degrees a swap changed since their move gains were last
+    /// computed, repeats and all; `None` once that outgrows the partition's
+    /// terms, when the next round computes every term's gains.
+    dirty: Option<Vec<u32>>,
     /// What moving any one left document lowers a term's cost by. It
     /// depends only on the term's degrees, so it is computed once per
     /// term per round rather than once per document carrying it.
@@ -865,11 +914,12 @@ struct BisectState {
     levels: Vec<LevelReport>,
 }
 
-impl BisectState {
+impl<const P: bool> BisectState<P> {
     fn new(n_terms: usize) -> Self {
         Self {
-            deg_left: vec![0u32; n_terms],
-            deg_right: vec![0u32; n_terms],
+            deg: vec![0u32; 2 * n_terms],
+            n_terms,
+            dirty: None,
             move_gain_left: vec![0f32; n_terms],
             move_gain_right: vec![0f32; n_terms],
             cost_left: Vec::new(),
@@ -879,6 +929,16 @@ impl BisectState {
             right_gains: Vec::new(),
             levels: Vec::new(),
         }
+    }
+
+    #[inline(always)]
+    fn l(&self, t: u32) -> usize {
+        at_left::<P>(t as usize)
+    }
+
+    #[inline(always)]
+    fn r(&self, t: u32) -> usize {
+        at_right::<P>(t as usize, self.n_terms)
     }
 
     fn note(&mut self, depth: u32, level: &LevelReport) {
@@ -921,7 +981,8 @@ impl BisectState {
         let mut n_local = 0u32;
         for &d in order.iter() {
             for &t in fwd.doc(d) {
-                let slot = &mut self.deg_left[t as usize];
+                let at = self.l(t);
+                let slot = &mut self.deg[at];
                 if *slot == 0 {
                     n_local += 1;
                     *slot = n_local;
@@ -931,8 +992,9 @@ impl BisectState {
             }
             starts.push(terms.len() as u32);
         }
-        for &t in &self.touched {
-            self.deg_left[t as usize] = 0;
+        for i in 0..self.touched.len() {
+            let at = self.l(self.touched[i]);
+            self.deg[at] = 0;
         }
         self.touched.clear();
         ForwardIndex {
@@ -969,7 +1031,7 @@ impl BisectState {
                 );
             }
             let mut inner: Vec<u32> = (0..order.len() as u32).collect();
-            let mut inner_state = BisectState::new(local.n_terms);
+            let mut inner_state = BisectState::<P>::new(local.n_terms);
             // Its terms fill the new table exactly, so it does not renumber
             // again before it splits.
             inner_state.split(&local, &mut inner, depth, run, None);
@@ -1033,6 +1095,9 @@ impl BisectState {
         let step = timed.then(Instant::now);
         let cpu = timed.then(thread_cpu_ns).flatten();
         self.count_degrees(fwd, order, mid, parallel);
+        // The first round computes every term's gains; the swaps of each
+        // round list the terms whose gains the next one must redo.
+        self.dirty = None;
         if let Some(step) = step {
             level.count_ns += ns_since(step);
             level.serial_cpu_ns += thread_cpu_delta_ns(cpu);
@@ -1127,12 +1192,21 @@ impl BisectState {
                     let (ld, rd) = (left[li], right[ri]);
                     // The degree tables follow the documents across.
                     for &t in fwd.doc(ld) {
-                        self.deg_left[t as usize] -= 1;
-                        self.deg_right[t as usize] += 1;
+                        let (a, b) = (self.l(t), self.r(t));
+                        self.deg[a] -= 1;
+                        self.deg[b] += 1;
                     }
                     for &t in fwd.doc(rd) {
-                        self.deg_right[t as usize] -= 1;
-                        self.deg_left[t as usize] += 1;
+                        let (a, b) = (self.l(t), self.r(t));
+                        self.deg[b] -= 1;
+                        self.deg[a] += 1;
+                    }
+                    if let Some(dirty) = &mut self.dirty {
+                        dirty.extend_from_slice(fwd.doc(ld));
+                        dirty.extend_from_slice(fwd.doc(rd));
+                        if dirty.len() > self.touched.len() {
+                            self.dirty = None;
+                        }
                     }
                     left[li] = rd;
                     right[ri] = ld;
@@ -1142,10 +1216,8 @@ impl BisectState {
                     // every pair names its own two positions, so the swaps can
                     // land in any order. Degrees are counts, so adding them up
                     // in parallel ends at the same tables.
-                    let (deg_left, deg_right) = (
-                        as_atomic(&mut self.deg_left),
-                        as_atomic(&mut self.deg_right),
-                    );
+                    let n_terms = self.n_terms;
+                    let deg = as_atomic(&mut self.deg);
                     let (lefts, rights) = (&left_gains[..swaps], &right_gains[..swaps]);
                     let (left_docs, right_docs) = (&*left, &*right);
                     lefts
@@ -1154,12 +1226,14 @@ impl BisectState {
                         .with_min_len(PAR_MIN_ITEMS)
                         .for_each(|(&l, &r)| {
                             for &t in fwd.doc(left_docs[key_pos(l) as usize]) {
-                                deg_left[t as usize].fetch_sub(1, Relaxed);
-                                deg_right[t as usize].fetch_add(1, Relaxed);
+                                let t = t as usize;
+                                deg[at_left::<P>(t)].fetch_sub(1, Relaxed);
+                                deg[at_right::<P>(t, n_terms)].fetch_add(1, Relaxed);
                             }
                             for &t in fwd.doc(right_docs[key_pos(r) as usize]) {
-                                deg_right[t as usize].fetch_sub(1, Relaxed);
-                                deg_left[t as usize].fetch_add(1, Relaxed);
+                                let t = t as usize;
+                                deg[at_right::<P>(t, n_terms)].fetch_sub(1, Relaxed);
+                                deg[at_left::<P>(t)].fetch_add(1, Relaxed);
                             }
                         });
                     for (&l, &r) in lefts.iter().zip(rights) {
@@ -1246,8 +1320,8 @@ impl BisectState {
     fn distinct_by_side(&self) -> [usize; 2] {
         self.touched.iter().fold([0, 0], |[left, right], &t| {
             [
-                left + usize::from(self.deg_left[t as usize] > 0),
-                right + usize::from(self.deg_right[t as usize] > 0),
+                left + usize::from(self.deg[self.l(t)] > 0),
+                right + usize::from(self.deg[self.r(t)] > 0),
             ]
         })
     }
@@ -1278,12 +1352,12 @@ impl BisectState {
     #[inline]
     fn term_split_cost(&self, t: usize, n_left: f32, n_right: f32) -> f64 {
         let left = Side {
-            deg: self.deg_left[t],
+            deg: self.deg[at_left::<P>(t)],
             size: n_left,
             costs: &self.cost_left,
         };
         let right = Side {
-            deg: self.deg_right[t],
+            deg: self.deg[at_right::<P>(t, self.n_terms)],
             size: n_right,
             costs: &self.cost_right,
         };
@@ -1298,8 +1372,8 @@ impl BisectState {
             // Each term's gains read only its own degrees and write only its
             // own entries, so the terms can be done in any order.
             let Self {
-                deg_left,
-                deg_right,
+                deg,
+                n_terms,
                 move_gain_left,
                 move_gain_right,
                 cost_left,
@@ -1307,15 +1381,16 @@ impl BisectState {
                 touched,
                 ..
             } = self;
+            let n_terms = *n_terms;
             let (gain_left, gain_right) = (as_atomic(move_gain_left), as_atomic(move_gain_right));
-            let (deg_left, deg_right) = (&*deg_left, &*deg_right);
+            let deg = &*deg;
             let (cost_left, cost_right) = (cost_left.as_slice(), cost_right.as_slice());
             touched
                 .par_iter()
                 .with_min_len(PAR_MIN_ITEMS)
                 .for_each(|&t| {
                     let t = t as usize;
-                    let (dl, dr) = (deg_left[t], deg_right[t]);
+                    let (dl, dr) = (deg[at_left::<P>(t)], deg[at_right::<P>(t, n_terms)]);
                     let left = Side {
                         deg: dl,
                         size: n_left,
@@ -1335,9 +1410,16 @@ impl BisectState {
                 });
             return;
         }
-        for &t in &self.touched {
+        // A term whose degrees no swap changed keeps the gains it has: they
+        // are a function of its degrees and the split's sizes alone.
+        let dirty = match exp_dirty_gains() {
+            true => self.dirty.replace(Vec::new()),
+            false => None,
+        };
+        let terms = dirty.as_deref().unwrap_or(&self.touched);
+        for &t in terms {
+            let (dl, dr) = (self.deg[self.l(t)], self.deg[self.r(t)]);
             let t = t as usize;
-            let (dl, dr) = (self.deg_left[t], self.deg_right[t]);
             let left = Side {
                 deg: dl,
                 size: n_left,
@@ -1355,6 +1437,11 @@ impl BisectState {
                 self.move_gain_right[t] = move_gain(&right, &left);
             }
         }
+        if let (Some(mut done), Some(fresh)) = (dirty, self.dirty.as_mut()) {
+            // Keep the allocation for the next round's list.
+            done.clear();
+            mem::swap(&mut done, fresh);
+        }
     }
 
     /// Count each term's documents on either side of `mid` into the degree
@@ -1368,52 +1455,52 @@ impl BisectState {
     /// beyond the count itself; a pass over the whole vocabulary would.
     fn count_degrees(&mut self, fwd: &ForwardIndex, order: &[u32], mid: usize, parallel: bool) {
         if parallel {
-            let Self {
-                deg_left,
-                deg_right,
-                touched,
-                ..
-            } = self;
+            let n_terms = self.n_terms;
+            let Self { deg, touched, .. } = self;
             let (left, right) = order.split_at(mid);
             {
-                let (deg_left, deg_right) = (as_atomic(deg_left), as_atomic(deg_right));
+                let deg = as_atomic(deg);
                 join(
                     || {
                         left.par_iter().with_min_len(PAR_MIN_ITEMS).for_each(|&d| {
                             for &t in fwd.doc(d) {
-                                deg_left[t as usize].fetch_add(1, Relaxed);
+                                deg[at_left::<P>(t as usize)].fetch_add(1, Relaxed);
                             }
                         })
                     },
                     || {
                         right.par_iter().with_min_len(PAR_MIN_ITEMS).for_each(|&d| {
                             for &t in fwd.doc(d) {
-                                deg_right[t as usize].fetch_add(1, Relaxed);
+                                deg[at_right::<P>(t as usize, n_terms)].fetch_add(1, Relaxed);
                             }
                         })
                     },
                 );
             }
-            let (deg_left, deg_right) = (&*deg_left, &*deg_right);
+            let deg = &*deg;
             touched.clear();
             touched.par_extend(
-                (0..deg_left.len() as u32)
+                (0..n_terms as u32)
                     .into_par_iter()
                     .with_min_len(PAR_MIN_ITEMS)
-                    .filter(|&t| deg_left[t as usize] > 0 || deg_right[t as usize] > 0),
+                    .filter(|&t| {
+                        let t = t as usize;
+                        deg[at_left::<P>(t)] > 0 || deg[at_right::<P>(t, n_terms)] > 0
+                    }),
             );
             return;
         }
         for (i, &d) in order.iter().enumerate() {
             let side_left = i < mid;
             for &t in fwd.doc(d) {
+                let (a, b) = (self.l(t), self.r(t));
                 // Seen on neither side yet: first sight in this partition.
-                if self.deg_left[t as usize] == 0 && self.deg_right[t as usize] == 0 {
+                if self.deg[a] == 0 && self.deg[b] == 0 {
                     self.touched.push(t);
                 }
                 let slot = match side_left {
-                    true => &mut self.deg_left[t as usize],
-                    false => &mut self.deg_right[t as usize],
+                    true => &mut self.deg[a],
+                    false => &mut self.deg[b],
                 };
                 *slot += 1;
             }
@@ -1421,11 +1508,14 @@ impl BisectState {
     }
 
     fn clear_degrees(&mut self) {
-        for &t in &self.touched {
-            self.deg_left[t as usize] = 0;
-            self.deg_right[t as usize] = 0;
+        for i in 0..self.touched.len() {
+            let t = self.touched[i];
+            let (a, b) = (self.l(t), self.r(t));
+            self.deg[a] = 0;
+            self.deg[b] = 0;
         }
         self.touched.clear();
+        self.dirty = None;
     }
 }
 
@@ -1442,9 +1532,25 @@ fn rank_by_gain(
     out: &mut Vec<u64>,
 ) {
     // Keys for the documents of one stretch of `half` starting at `first`.
+    let fast = exp_rank_fast();
     let keys_of = |first: usize, docs: &[u32], keys: &mut Vec<u64>| {
         for (j, group) in docs.chunks(GAIN_LANES).enumerate() {
-            let gains = lane_gains(fwd, group, move_gain);
+            let gains = match fast {
+                true => {
+                    // Fetch the terms of the group after next while this one sums.
+                    if let Some(ahead) = docs.get((j + 2) * GAIN_LANES..(j + 3) * GAIN_LANES) {
+                        for &d in ahead {
+                            prefetch(
+                                fwd.terms
+                                    .as_ptr()
+                                    .wrapping_add(fwd.starts[d as usize] as usize),
+                            );
+                        }
+                    }
+                    lane_gains_fast(fwd, group, move_gain)
+                }
+                false => lane_gains(fwd, group, move_gain),
+            };
             let at = first + j * GAIN_LANES;
             keys.extend(
                 gains[..group.len()]
@@ -1497,6 +1603,47 @@ fn lane_gains(fwd: &ForwardIndex, group: &[u32], move_gain: &[f32]) -> [f32; GAI
             if let Some(&t) = doc.get(k) {
                 *gain += move_gain[t as usize];
             }
+        }
+    }
+    gains
+}
+
+/// Experiment knob: rank with a fixed-width lane loop and prefetching.
+fn exp_rank_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test) || *ON.get_or_init(|| std::env::var("INFINO_EXP_RANK_FAST").is_ok_and(|v| v == "1"))
+}
+
+/// Ask for the cache line at `p` ahead of its use.
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch is a hint and never faults, whatever the address.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
+/// [`lane_gains`], with the common case of a full group whose documents all
+/// carry the same number of terms summed without a per-term length test.
+#[inline]
+fn lane_gains_fast(fwd: &ForwardIndex, group: &[u32], move_gain: &[f32]) -> [f32; GAIN_LANES] {
+    let Ok(group) = <&[u32; GAIN_LANES]>::try_from(group) else {
+        return lane_gains(fwd, group, move_gain);
+    };
+    let terms: [&[u32]; GAIN_LANES] = group.map(|d| fwd.doc(d));
+    let len = terms[0].len();
+    if terms.iter().any(|t| t.len() != len) {
+        return lane_gains(fwd, group, move_gain);
+    }
+    let mut gains = [0.0f32; GAIN_LANES];
+    for k in 0..len {
+        for (gain, doc) in gains.iter_mut().zip(&terms) {
+            // SAFETY: every document in the group carries `len` terms, and a
+            // term id is below the table's length by construction.
+            *gain += unsafe { *move_gain.get_unchecked(*doc.get_unchecked(k) as usize) };
         }
     }
     gains
@@ -2297,8 +2444,8 @@ mod tests {
                 parent: &report.span,
             };
             let mid = order.len() / 2;
-            let refined =
-                BisectState::new(fwd.n_terms).refine(&fwd, &mut order, mid, 0, parallel, run);
+            let refined = BisectState::<false>::new(fwd.n_terms)
+                .refine(&fwd, &mut order, mid, 0, parallel, run);
             let distinct = |half: &[u32]| {
                 half.iter()
                     .flat_map(|&d| fwd.doc(d).iter().copied())
@@ -2410,7 +2557,7 @@ mod tests {
             report: &report,
             parent: &report.span,
         };
-        let mut state = BisectState::new(fwd.n_terms);
+        let mut state = BisectState::<false>::new(fwd.n_terms);
         state.split(&fwd, &mut order, 0, run, None);
         state.flush(run.report);
         let report = report.finish(0.0);
@@ -2457,7 +2604,7 @@ mod tests {
             report: &report,
             parent: &report.span,
         };
-        BisectState::new(fwd.n_terms).split(&fwd, &mut serial, 0, run, None);
+        BisectState::<false>::new(fwd.n_terms).split(&fwd, &mut serial, 0, run, None);
         assert_eq!(bisect_order(&fwd, exhaustive()), serial);
     }
 

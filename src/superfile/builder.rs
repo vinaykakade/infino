@@ -309,9 +309,11 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
         first_row: usize,
         past_row: usize,
         slots: &mut [u32],
+        slot_dfs: &mut [u32],
         picks: &mut [RowPick],
     ) -> Result<(), BuildError> {
         let (terms_per_doc, df) = (self.terms_per_doc, self.df);
+        let keep_dfs = exp_pick_df();
         let fts = reader.fts().expect("checked by the caller");
         for column_id in 0..self.n_fts_columns {
             // An ineligible term is skipped before its postings are read.
@@ -333,6 +335,9 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
                 let used = pick.filled as usize;
                 if used < terms_per_doc {
                     slots[slot_base + used] = t;
+                    if keep_dfs {
+                        slot_dfs[slot_base + used] = term_df;
+                    }
                     if used == 0 || term_df > pick.worst_df {
                         pick.worst = used as u8;
                         pick.worst_df = term_df;
@@ -344,6 +349,18 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
                     return;
                 }
                 slots[slot_base + pick.worst as usize] = t;
+                if keep_dfs {
+                    let dfs = &mut slot_dfs[slot_base..slot_base + terms_per_doc];
+                    dfs[pick.worst as usize] = term_df;
+                    let (mut w, mut w_df) = (0usize, dfs[0]);
+                    for (i, &d) in dfs.iter().enumerate().skip(1) {
+                        if d > w_df {
+                            (w, w_df) = (i, d);
+                        }
+                    }
+                    (pick.worst, pick.worst_df) = (w as u8, w_df);
+                    return;
+                }
 
                 // The worst moved; find it again over the fixed, small slot
                 // count.
@@ -364,6 +381,12 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
         }
         Ok(())
     }
+}
+
+/// Experiment knob: keep each slot's document count beside it.
+fn exp_pick_df() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test) || *ON.get_or_init(|| std::env::var("INFINO_EXP_PICK_DF").is_ok_and(|v| v == "1"))
 }
 
 /// Bits of bucket space the bisection groups terms in. Terms are hashed
@@ -2989,6 +3012,10 @@ impl SuperfileBuilder {
             let past_row = first_row.saturating_add(plan.chunk_docs).min(n);
             let run = past_row - first_row;
             let mut slots: Vec<u32> = vec![0; run * terms_per_doc];
+            let mut slot_dfs: Vec<u32> = match exp_pick_df() {
+                true => vec![0; run * terms_per_doc],
+                false => Vec::new(),
+            };
             let mut picks: Vec<RowPick> = vec![RowPick::default(); run];
             let collect_span = detail_span!("merge_order_collect", docs = run).entered();
             let picker = TermPicker {
@@ -3015,6 +3042,7 @@ impl SuperfileBuilder {
                 // interleave fill disjoint stretches of the slots, side by side;
                 // each still reads its own terms in the order it always did.
                 let (mut slots_rest, mut picks_rest) = (&mut slots[..], &mut picks[..]);
+                let mut dfs_rest = &mut slot_dfs[..];
                 let mut at = first_row;
                 let mut windows = Vec::with_capacity(covering.len());
                 for &(i, start, end) in &covering {
@@ -3023,16 +3051,25 @@ impl SuperfileBuilder {
                     let (_, rest) = slots_rest.split_at_mut(skip * terms_per_doc);
                     let (s, rest) = rest.split_at_mut(take * terms_per_doc);
                     slots_rest = rest;
+                    let sd = match dfs_rest.is_empty() {
+                        true => &mut [][..],
+                        false => {
+                            let (_, rest) = dfs_rest.split_at_mut(skip * terms_per_doc);
+                            let (sd, rest) = rest.split_at_mut(take * terms_per_doc);
+                            dfs_rest = rest;
+                            sd
+                        }
+                    };
                     let (_, rest) = picks_rest.split_at_mut(skip);
                     let (p, rest) = rest.split_at_mut(take);
                     picks_rest = rest;
-                    windows.push((i, start, end, s, p));
+                    windows.push((i, start, end, s, sd, p));
                     at = end;
                 }
                 windows
                     .into_par_iter()
-                    .try_for_each(|(i, start, end, s, p)| {
-                        picker.pick(&readers[i].0, &rows_by_blob[i], start, end, s, p)
+                    .try_for_each(|(i, start, end, s, sd, p)| {
+                        picker.pick(&readers[i].0, &rows_by_blob[i], start, end, s, sd, p)
                     })?;
             } else {
                 for &(i, _, _) in &covering {
@@ -3042,12 +3079,14 @@ impl SuperfileBuilder {
                         first_row,
                         past_row,
                         &mut slots,
+                        &mut slot_dfs,
                         &mut picks,
                     )?;
                 }
             }
 
             drop(collect_span);
+            drop(slot_dfs);
 
             let docs: Vec<&[u32]> = (0..run)
                 .map(|row| {
