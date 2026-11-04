@@ -821,6 +821,12 @@ fn piece_bounds(weights: &[u64], n: usize) -> Vec<usize> {
 
 /// The buffered bytes one superfile of a commit is cut at, from
 /// [`SupertableOptions::superfile_buffer_split_mb`].
+/// Experiment: `INFINO_EXP_LANES_OPEN_MB`, the buffer size live lanes open
+/// at when it is below the split.
+fn exp_lanes_open_mb() -> Option<u64> {
+    std::env::var("INFINO_EXP_LANES_OPEN_MB").ok()?.parse().ok()
+}
+
 fn split_target_bytes(options: &SupertableOptions) -> usize {
     (options.superfile_buffer_split_mb as usize).saturating_mul(MIB)
 }
@@ -2620,7 +2626,14 @@ impl SupertableWriter {
                 // Open once the buffer holds a superfile's worth of rows, so a
                 // small commit keeps today's one superfile; then feed everything
                 // buffered so far.
-                if self.buffer_visible_scalar_bytes < target_bytes {
+                // Experiment: open at the default split's size when the
+                // configured split is larger, so a one-piece commit of a
+                // large append still tokenises in parallel.
+                let open_bytes = match exp_lanes_open_mb() {
+                    Some(mb) => target_bytes.min((mb as usize).saturating_mul(MIB)),
+                    None => target_bytes,
+                };
+                if self.buffer_visible_scalar_bytes < open_bytes {
                     return;
                 }
                 // The lanes are opened once, before the append's rows are
