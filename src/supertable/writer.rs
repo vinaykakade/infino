@@ -3899,8 +3899,10 @@ impl LiveLanes {
         Ok(())
     }
 
-    /// The feed with the rows cut into chunks the lanes take in turn, and
-    /// (when on) lanes added while the pool's share for this append grows.
+    /// The feed with each lane owning a contiguous range of the rows, taken
+    /// a chunk at a time, so a lane added while the feed runs (or a lane
+    /// that finished early) can take the back half of the largest range
+    /// left; a lane's rows stay a few contiguous runs.
     fn feed_chunked(
         &mut self,
         pool: &Arc<ThreadPool>,
@@ -3913,25 +3915,23 @@ impl LiveLanes {
         let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
         let target_chunks = pool.current_num_threads().max(1) * exp_lane_chunks();
         let chunk_rows = total.div_ceil(target_chunks).max(exp_lane_min_chunk_rows()).max(1);
-        let mut chunks = Vec::new();
-        let mut base = first_row;
-        for (b, batch) in batches.iter().enumerate() {
-            let rows = batch.num_rows();
-            let mut start = 0;
-            while start < rows {
-                let len = chunk_rows.min(rows - start);
-                chunks.push(LaneChunk { batch: b, start, len, row: base + start });
-                start += len;
-            }
-            base += rows;
+        let mut batch_starts = Vec::with_capacity(batches.len() + 1);
+        let mut at = 0;
+        for batch in &batches {
+            batch_starts.push(at);
+            at += batch.num_rows();
         }
+        batch_starts.push(at);
+        let owned: Vec<(usize, usize)> = (0..n).map(|i| (total * i / n, total * (i + 1) / n)).collect();
         let threshold = in_ram_threshold(self.fts_bytes, self.threshold_floor);
         let (tx, rx) = std_channel();
         let started = Arc::new(AtomicUsize::new(n));
-        let ctx = Arc::new(ChunkedFeed {
+        let ctx = Arc::new(RangeFeed {
             batches,
-            chunks,
-            next: AtomicUsize::new(0),
+            batch_starts,
+            first_row,
+            chunk_rows,
+            owned: Mutex::new(owned),
             started: Arc::clone(&started),
             col_idxs: self.col_idxs.clone(),
             threshold,
@@ -3939,30 +3939,26 @@ impl LiveLanes {
             pool: Arc::clone(pool),
             stats: op_stats.clone(),
             grow: exp_lane_grow(),
+            steal: exp_lane_steal(),
         });
         for (i, lane) in lanes.into_iter().enumerate() {
             let (ctx, tx) = (Arc::clone(&ctx), tx.clone());
-            pool.spawn(move || run_chunked_lane(ctx, i, Some(lane), tx));
+            pool.spawn(move || run_range_lane(ctx, i, Some(lane), tx));
         }
         self.pending = Some((rx, started));
         Ok(())
     }
 }
 
-/// One chunk of a chunked feed: rows `start..start + len` of batch
-/// `batch`, which are commit rows from `row`.
-struct LaneChunk {
-    batch: usize,
-    start: usize,
-    len: usize,
-    row: usize,
-}
-
-/// A chunked feed shared by its lanes.
-struct ChunkedFeed {
+/// A feed whose lanes own contiguous ranges of its rows.
+struct RangeFeed {
     batches: Vec<RecordBatch>,
-    chunks: Vec<LaneChunk>,
-    next: AtomicUsize,
+    /// Where each batch starts among the feed's rows, and the total last.
+    batch_starts: Vec<usize>,
+    first_row: usize,
+    chunk_rows: usize,
+    /// Per lane, the feed rows `next..end` it has yet to take.
+    owned: Mutex<Vec<(usize, usize)>>,
     started: Arc<AtomicUsize>,
     col_idxs: Vec<Option<usize>>,
     threshold: usize,
@@ -3970,14 +3966,24 @@ struct ChunkedFeed {
     pool: Arc<ThreadPool>,
     stats: Option<Arc<OpStatsCollector>>,
     grow: bool,
+    steal: bool,
 }
 
-fn run_chunked_lane(
-    ctx: Arc<ChunkedFeed>,
-    i: usize,
-    lane: Option<LiveLane>,
-    tx: StdSender<(usize, Result<LiveLane, BuildError>)>,
-) {
+type LaneTx = StdSender<(usize, Result<LiveLane, BuildError>)>;
+
+/// The lane, among `owned`, with the most rows left past `from`, and
+/// where its range splits: the back half goes to the taker. None when no
+/// range has two chunks' worth left.
+fn split_point(owned: &[(usize, usize)], from: usize, chunk_rows: usize) -> Option<(usize, usize)> {
+    owned
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.0 >= from && r.1 - r.0 >= 2 * chunk_rows)
+        .max_by_key(|(_, r)| r.1 - r.0)
+        .map(|(j, r)| (j, r.0 + (r.1 - r.0) / 2))
+}
+
+fn run_range_lane(ctx: Arc<RangeFeed>, i: usize, lane: Option<LiveLane>, tx: LaneTx) {
     let fed = catch_unwind(AssertUnwindSafe(|| {
         timed_kernel(&ctx.stats, || {
             let mut lane = match lane {
@@ -3989,29 +3995,33 @@ fn run_chunked_lane(
                 },
             };
             lane.builder.set_spill_threshold_bytes(ctx.threshold);
+            // The feed row this lane has taken up to: what it takes next
+            // must lie past it, so its rows keep ascending.
+            let mut pos = 0usize;
             loop {
-                let c = ctx.next.fetch_add(1, Ordering::Relaxed);
-                let Some(chunk) = ctx.chunks.get(c) else {
-                    break;
+                let claim = {
+                    let mut owned = ctx.owned.lock().unwrap_or_else(PoisonError::into_inner);
+                    let (next, end) = owned[i];
+                    if next < end {
+                        let stop = (next + ctx.chunk_rows).min(end);
+                        owned[i].0 = stop;
+                        Some(next..stop)
+                    } else if ctx.steal
+                        && let Some((j, mid)) = split_point(&owned, pos, ctx.chunk_rows)
+                    {
+                        let stop = (mid + ctx.chunk_rows).min(owned[j].1);
+                        owned[i] = (stop, owned[j].1);
+                        owned[j].1 = mid;
+                        Some(mid..stop)
+                    } else {
+                        None
+                    }
                 };
-                let first_doc = lane.stretches.last().map_or(0, |s| s.doc + s.len);
-                index_fts_rows(
-                    &mut lane.builder,
-                    &ctx.col_idxs,
-                    &ctx.batches[chunk.batch].slice(chunk.start, chunk.len),
-                    first_doc,
-                )?;
-                let (row, len) = (chunk.row as u32, chunk.len as u32);
-                match lane.stretches.last_mut() {
-                    Some(s) if s.row + s.len == row => s.len += len,
-                    _ => lane.stretches.push(Stretch {
-                        doc: first_doc,
-                        row,
-                        len,
-                    }),
-                }
+                let Some(rows) = claim else { break };
+                pos = rows.end;
+                index_range(&ctx, &mut lane, rows)?;
                 if ctx.grow {
-                    grow_chunked_lanes(&ctx, &tx);
+                    grow_range_lanes(&ctx, &tx);
                 }
             }
             Ok::<LiveLane, BuildError>(lane)
@@ -4021,29 +4031,56 @@ fn run_chunked_lane(
     let _ = tx.send((i, fed));
 }
 
+/// Tokenize feed rows `rows` into `lane`, batch by batch.
+fn index_range(ctx: &RangeFeed, lane: &mut LiveLane, rows: Range<usize>) -> Result<(), BuildError> {
+    let mut b = ctx.batch_starts.partition_point(|&s| s <= rows.start) - 1;
+    let mut at = rows.start;
+    while at < rows.end {
+        let (bs, be) = (ctx.batch_starts[b], ctx.batch_starts[b + 1]);
+        let stop = rows.end.min(be);
+        if stop > at {
+            let first_doc = lane.stretches.last().map_or(0, |s| s.doc + s.len);
+            index_fts_rows(
+                &mut lane.builder,
+                &ctx.col_idxs,
+                &ctx.batches[b].slice(at - bs, stop - at),
+                first_doc,
+            )?;
+            let (row, len) = ((ctx.first_row + at) as u32, (stop - at) as u32);
+            match lane.stretches.last_mut() {
+                Some(s) if s.row + s.len == row => s.len += len,
+                _ => lane.stretches.push(Stretch {
+                    doc: first_doc,
+                    row,
+                    len,
+                }),
+            }
+        }
+        at = stop;
+        b += 1;
+    }
+    Ok(())
+}
+
 /// Start more lanes on `ctx` while the append's share of the pool exceeds
-/// the lanes it has and chunks remain for them.
-fn grow_chunked_lanes(
-    ctx: &Arc<ChunkedFeed>,
-    tx: &StdSender<(usize, Result<LiveLane, BuildError>)>,
-) {
-    let threads = ctx.pool.current_num_threads();
-    let open = open_appends_on(&ctx.pool);
-    let want = lanes_for(threads, open);
-    loop {
-        let have = ctx.started.load(Ordering::SeqCst);
-        let remaining = ctx.chunks.len().saturating_sub(ctx.next.load(Ordering::Relaxed));
-        if have >= want || remaining <= have {
+/// the lanes it has; each takes the back half of the largest range left.
+fn grow_range_lanes(ctx: &Arc<RangeFeed>, tx: &LaneTx) {
+    let want = lanes_for(ctx.pool.current_num_threads(), open_appends_on(&ctx.pool));
+    if ctx.started.load(Ordering::SeqCst) >= want {
+        return;
+    }
+    let mut owned = ctx.owned.lock().unwrap_or_else(PoisonError::into_inner);
+    while owned.len() < want {
+        let Some((j, mid)) = split_point(&owned, 0, ctx.chunk_rows) else {
             return;
-        }
-        if ctx
-            .started
-            .compare_exchange(have, have + 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            let (ctx2, tx2) = (Arc::clone(ctx), tx.clone());
-            ctx.pool.spawn(move || run_chunked_lane(ctx2, have, None, tx2));
-        }
+        };
+        let i = owned.len();
+        let end = owned[j].1;
+        owned[j].1 = mid;
+        owned.push((mid, end));
+        ctx.started.fetch_add(1, Ordering::SeqCst);
+        let (ctx2, tx2) = (Arc::clone(ctx), tx.clone());
+        ctx.pool.spawn(move || run_range_lane(ctx2, i, None, tx2));
     }
 }
 
@@ -4066,6 +4103,11 @@ fn exp_lane_chunks() -> usize {
 fn exp_lane_min_chunk_rows() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| exp_env("INFINO_EXP_LANE_MIN_CHUNK", 1024))
+}
+
+fn exp_lane_steal() -> bool {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| exp_env("INFINO_EXP_LANE_STEAL", 0)) != 0
 }
 
 fn exp_lane_grow() -> bool {
