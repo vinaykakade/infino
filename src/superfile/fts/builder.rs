@@ -507,17 +507,10 @@ struct Vocab {
     /// Id → term bytes, for the dictionary emit and the lex-rank table.
     /// Entries borrow from `term_arena` like the map's keys.
     id_to_term: Vec<&'static str>,
-    /// Per-doc tf accumulator indexed by id. Dense ids make this one
-    /// array store per token where a hash probe would cost several
-    /// times more. `dense_doc_tf[id] != 0` iff `id` is in
-    /// `updated_terms`; the per-doc drain restores the zero.
-    dense_doc_tf: Vec<u32>,
-    /// Per-id position state for the current document, indexed by id;
-    /// empty for a positionless column. While the store is in RAM it is
-    /// the term's last position in this document (read only while the
-    /// term's tf is non-zero); once spilled it is the term's chain head
-    /// (`CHAIN_END` = no occurrence in this doc).
-    dense_doc_poshead: Vec<u32>,
+    /// Per-id state for the current document (see [`DocTerm`]), indexed
+    /// by id. Dense ids make this one array access per token where a hash
+    /// probe would cost several times more.
+    dense_doc: Vec<DocTerm>,
     /// Ids the current document touched; drained at the end of each
     /// `add_doc`. Bounded by the doc's distinct terms, reused across docs.
     updated_terms: Vec<u32>,
@@ -528,6 +521,27 @@ struct Vocab {
     term_arena: Bump,
 }
 
+/// A term's state within the document being indexed. The count and the
+/// position state sit together so a token touches one place for both.
+#[derive(Clone, Copy)]
+struct DocTerm {
+    /// Occurrences so far. `tf != 0` iff the id is in `updated_terms`;
+    /// the per-doc drain restores the zero.
+    tf: u32,
+    /// Unused by a positionless column. While the store is in RAM it is
+    /// the term's last position in this document (read only while `tf`
+    /// is non-zero); once spilled it is the term's chain head
+    /// (`CHAIN_END` = no occurrence in this doc).
+    head: u32,
+}
+
+impl DocTerm {
+    const CLEAR: Self = Self {
+        tf: 0,
+        head: CHAIN_END,
+    };
+}
+
 impl Vocab {
     fn new() -> Self {
         Self {
@@ -535,8 +549,7 @@ impl Vocab {
             term_table: TermTable::new(),
             use_table: exp_term_table(),
             id_to_term: Vec::new(),
-            dense_doc_tf: Vec::new(),
-            dense_doc_poshead: Vec::new(),
+            dense_doc: Vec::new(),
             updated_terms: Vec::new(),
             term_arena: Bump::new(),
         }
@@ -549,7 +562,7 @@ impl Vocab {
 
     /// Intern `term`, growing the per-id arrays when it is new.
     #[inline(always)]
-    fn intern(&mut self, term: &str, positional: bool) -> u32 {
+    fn intern(&mut self, term: &str, _positional: bool) -> u32 {
         let (term_id, is_new) = intern_any(
             &mut self.term_to_id,
             &mut self.term_table,
@@ -559,10 +572,7 @@ impl Vocab {
             term,
         );
         if is_new {
-            self.dense_doc_tf.push(0);
-            if positional {
-                self.dense_doc_poshead.push(CHAIN_END);
-            }
+            self.dense_doc.push(DocTerm::CLEAR);
         }
         term_id
     }
@@ -2355,8 +2365,7 @@ impl FtsBuilder {
             term_table,
             use_table,
             id_to_term,
-            dense_doc_tf,
-            dense_doc_poshead,
+            dense_doc,
             updated_terms,
             term_arena,
         } = vocab;
@@ -2377,15 +2386,15 @@ impl FtsBuilder {
                 );
                 let idx = term_id as usize;
                 if is_new {
-                    debug_assert_eq!(idx, dense_doc_tf.len());
-                    dense_doc_tf.push(0);
+                    debug_assert_eq!(idx, dense_doc.len());
+                    dense_doc.push(DocTerm::CLEAR);
                 }
                 // SAFETY: lockstep invariant between `dense_doc_tf`
                 // and `id_to_term` (see [`Vocab`]) holds here:
                 // `intern_term_id` returns `term_id < id_to_term.len()`
                 // and we just `push(0)` on `is_new`, so `idx <
                 // dense_doc_tf.len()`.
-                let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
+                let slot = unsafe { &mut dense_doc.get_unchecked_mut(idx).tf };
                 if *slot == 0 {
                     updated_terms.push(term_id);
                 }
@@ -2421,9 +2430,8 @@ impl FtsBuilder {
                 );
                 let idx = term_id as usize;
                 if is_new {
-                    debug_assert_eq!(idx, dense_doc_tf.len());
-                    dense_doc_tf.push(0);
-                    dense_doc_poshead.push(CHAIN_END);
+                    debug_assert_eq!(idx, dense_doc.len());
+                    dense_doc.push(DocTerm::CLEAR);
                     if let PositionSink::Runs { lists, .. } = &mut sink {
                         lists.push(TermLists::default());
                     }
@@ -2439,13 +2447,13 @@ impl FtsBuilder {
                 // closure; `dense_doc_poshead` (and the in-RAM store's
                 // per-id vectors) are pushed in the same `is_new` branch
                 // so they share the bound.
-                let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
-                let first = *slot == 0;
+                let doc_term = unsafe { dense_doc.get_unchecked_mut(idx) };
+                let first = doc_term.tf == 0;
                 if first {
                     updated_terms.push(term_id);
                 }
-                *slot += 1;
-                let state = unsafe { dense_doc_poshead.get_unchecked_mut(idx) };
+                doc_term.tf += 1;
+                let state = &mut doc_term.head;
                 match &mut sink {
                     PositionSink::Runs { lists, bytes } => {
                         let run = unsafe { &mut lists.get_unchecked_mut(idx).runs };
@@ -2500,10 +2508,7 @@ impl FtsBuilder {
             // unusable: the in-RAM store already holds part of this
             // document's position runs, which nothing can take back out.
             for &term_id in updated_terms.iter() {
-                dense_doc_tf[term_id as usize] = 0;
-                if positional {
-                    dense_doc_poshead[term_id as usize] = CHAIN_END;
-                }
+                dense_doc[term_id as usize] = DocTerm::CLEAR;
             }
             updated_terms.clear();
             self.failed = true;
@@ -2547,7 +2552,7 @@ impl FtsBuilder {
                 let mut new_bytes: usize = 0;
                 for &term_id in updated_terms.iter() {
                     let idx = term_id as usize;
-                    let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
+                    let slot = unsafe { &mut dense_doc.get_unchecked_mut(idx).tf };
                     let tf = *slot;
                     *slot = 0;
                     let lists = &mut ram.lists[idx];
@@ -2594,14 +2599,14 @@ impl FtsBuilder {
                     *store = PostingStore::Spilled(spilled);
                     // In RAM the per-id state held last positions; the
                     // spilled scan reads it as chain heads.
-                    dense_doc_poshead.fill(CHAIN_END);
+                    dense_doc.iter_mut().for_each(|d| d.head = CHAIN_END);
                 }
             }
             PostingStore::Spilled(SpillStore::Plain(partitions)) => {
                 let mask = partitions.len() - 1;
                 for &term_id in updated_terms.iter() {
                     let idx = term_id as usize;
-                    let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
+                    let slot = unsafe { &mut dense_doc.get_unchecked_mut(idx).tf };
                     let tf = *slot;
                     *slot = 0;
                     let p = (term_id as usize) & mask;
@@ -2613,10 +2618,10 @@ impl FtsBuilder {
                 let mask = partitions.len() - 1;
                 for &term_id in updated_terms.iter() {
                     let idx = term_id as usize;
-                    let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
+                    let slot = unsafe { &mut dense_doc.get_unchecked_mut(idx).tf };
                     let tf = *slot;
                     *slot = 0;
-                    let head_slot = unsafe { dense_doc_poshead.get_unchecked_mut(idx) };
+                    let head_slot = unsafe { &mut dense_doc.get_unchecked_mut(idx).head };
                     let head = *head_slot;
                     *head_slot = CHAIN_END;
                     pos_scratch.clear();
@@ -2727,7 +2732,7 @@ impl FtsBuilder {
                         }
                     };
                     *store = PostingStore::Spilled(spilled);
-                    vocab.dense_doc_poshead.fill(CHAIN_END);
+                    vocab.dense_doc.iter_mut().for_each(|d| d.head = CHAIN_END);
                 }
             }
             PostingStore::Spilled(SpillStore::Plain(parts)) => {
