@@ -2763,6 +2763,7 @@ impl SupertableWriter {
         let merge_span = detail_span!("seal.merge_lanes", pieces = n_pieces).entered();
         let frozen = Arc::new(freeze_lanes(pool, frozen, pieces)?);
         drop(merge_span);
+        let merged_at = sealing.elapsed();
         // Experiment: each piece's order, chosen here on the commit's own
         // thread so its parallel levels spread over the whole pool, rather
         // than inside a piece task, where they stole nested work.
@@ -2782,6 +2783,7 @@ impl SupertableWriter {
                     .collect::<Result<_, _>>()?
             }
         };
+        let ordered_at = sealing.elapsed();
         let orders = Arc::new(orders);
         let pieces_span = detail_span!("seal.build_pieces", pieces = n_pieces).entered();
         let (batches, bounds) = (Arc::new(batches), Arc::new(bounds));
@@ -2815,6 +2817,15 @@ impl SupertableWriter {
         )?;
         drop(pieces_span);
         let sealed = sealing.elapsed();
+        if exp_ingest_order() {
+            eprintln!(
+                "[seal] rows={total_rows} pieces={n_pieces} freeze+merge={:.1}s order={:.1}s \
+                 build={:.1}s",
+                merged_at.as_secs_f64(),
+                (ordered_at - merged_at).as_secs_f64(),
+                (sealed - ordered_at).as_secs_f64(),
+            );
+        }
         let superfiles = outputs.len();
         let cell_hints = vec![None; superfiles];
         let user_batch =
