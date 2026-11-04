@@ -54,6 +54,19 @@ use crate::{
     utils::trace::detail_span,
 };
 
+fn exp_knob(cell: &'static std::sync::OnceLock<u32>, name: &str) -> u32 {
+    *cell.get_or_init(|| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+fn exp_pack() -> u32 {
+    static C: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    exp_knob(&C, "INFINO_EXP_PACK")
+}
+
 /// The sign bit of an `f32`.
 const SIGN_BIT: u32 = 0x8000_0000;
 
@@ -885,11 +898,17 @@ struct BisectState {
     /// [`Self::flush`] adds them to the run's. Saves taking the shared lock
     /// once per split.
     levels: Vec<LevelReport>,
+    packed: ForwardIndex,
+    pos: Vec<u32>,
+    was: Vec<u32>,
 }
 
 impl BisectState {
     fn new(n_terms: usize) -> Self {
         Self {
+            packed: ForwardIndex::default(),
+            pos: Vec::new(),
+            was: Vec::new(),
             deg: vec![[0u32; 2]; n_terms],
             moved_terms: None,
             move_gain_left: vec![0f32; n_terms],
@@ -1020,6 +1039,74 @@ impl BisectState {
         parallel: bool,
         run: Bisect<'_>,
     ) -> Refined {
+        let knob = exp_pack();
+        let pack = match parallel {
+            false => knob & 1 != 0,
+            true => knob & 2 != 0,
+        };
+        if !pack {
+            return self.refine_in(fwd, order, mid, depth, parallel, run, false);
+        }
+        let mut pos = mem::take(&mut self.pos);
+        pos.clear();
+        pos.extend(0..order.len() as u32);
+        let refined = if parallel {
+            let packed = pack_parallel(fwd, order);
+            self.refine_in(&packed, &mut pos, mid, depth, parallel, run, false)
+        } else {
+            let mut packed = mem::take(&mut self.packed);
+            self.pack_and_count(fwd, order, mid, &mut packed);
+            let refined = self.refine_in(&packed, &mut pos, mid, depth, parallel, run, true);
+            self.packed = packed;
+            refined
+        };
+        let mut was = mem::take(&mut self.was);
+        was.clear();
+        was.extend_from_slice(order);
+        for (slot, &i) in order.iter_mut().zip(&pos) {
+            *slot = was[i as usize];
+        }
+        self.was = was;
+        self.pos = pos;
+        refined
+    }
+
+    fn pack_and_count(
+        &mut self,
+        fwd: &ForwardIndex,
+        order: &[u32],
+        mid: usize,
+        packed: &mut ForwardIndex,
+    ) {
+        packed.terms.clear();
+        packed.starts.clear();
+        packed.starts.push(0);
+        packed.n_terms = fwd.n_terms;
+        for (i, &d) in order.iter().enumerate() {
+            let side = usize::from(i >= mid);
+            for &t in fwd.doc(d) {
+                let degs = &mut self.deg[t as usize];
+                if *degs == [0, 0] {
+                    self.touched.push(t);
+                }
+                degs[side] += 1;
+                packed.terms.push(t);
+            }
+            packed.starts.push(packed.terms.len() as u32);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn refine_in(
+        &mut self,
+        fwd: &ForwardIndex,
+        order: &mut [u32],
+        mid: usize,
+        depth: u32,
+        parallel: bool,
+        run: Bisect<'_>,
+        counted: bool,
+    ) -> Refined {
         let started = REPORT.then(Instant::now);
         let span = match order.len() >= SPLIT_SPAN_MIN_DOCS {
             true => detail_span!(
@@ -1054,7 +1141,9 @@ impl BisectState {
 
         let step = timed.then(Instant::now);
         let cpu = timed.then(thread_cpu_ns).flatten();
-        self.count_degrees(fwd, order, mid, parallel);
+        if !counted {
+            self.count_degrees(fwd, order, mid, parallel);
+        }
         if let Some(step) = step {
             level.count_ns += ns_since(step);
             level.serial_cpu_ns += thread_cpu_delta_ns(cpu);
@@ -1458,6 +1547,48 @@ impl BisectState {
         }
         self.touched.clear();
         self.moved_terms = None;
+    }
+}
+
+fn pack_parallel(fwd: &ForwardIndex, order: &[u32]) -> ForwardIndex {
+    let chunk = PAR_MIN_ITEMS;
+    let sums: Vec<u32> = order
+        .par_chunks(chunk)
+        .map(|docs| docs.iter().map(|&d| fwd.doc(d).len() as u32).sum())
+        .collect();
+    let mut bases = Vec::with_capacity(sums.len());
+    let mut total = 0u32;
+    for s in &sums {
+        bases.push(total);
+        total += s;
+    }
+    let mut terms = vec![0u32; total as usize];
+    let mut starts = vec![0u32; order.len() + 1];
+    starts[order.len()] = total;
+    let mut term_parts: Vec<&mut [u32]> = Vec::with_capacity(sums.len());
+    let mut rest = &mut terms[..];
+    for &s in &sums {
+        let (a, b) = rest.split_at_mut(s as usize);
+        term_parts.push(a);
+        rest = b;
+    }
+    order
+        .par_chunks(chunk)
+        .zip(starts[..order.len()].par_chunks_mut(chunk))
+        .zip(term_parts.into_par_iter().zip(bases.par_iter()))
+        .for_each(|((docs, st), (out, &base))| {
+            let mut at = 0usize;
+            for (s, &d) in st.iter_mut().zip(docs) {
+                *s = base + at as u32;
+                let doc = fwd.doc(d);
+                out[at..at + doc.len()].copy_from_slice(doc);
+                at += doc.len();
+            }
+        });
+    ForwardIndex {
+        terms,
+        starts,
+        n_terms: fwd.n_terms,
     }
 }
 
