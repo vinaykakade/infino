@@ -3508,6 +3508,11 @@ impl SupertableWriter {
             lead.batch.absorb(follower.batch);
             segments.push(follower.segment);
         }
+        let deferred_warm = if exp_warm_after() {
+            mem::take(&mut lead.batch.pending_cache_inserts)
+        } else {
+            Vec::new()
+        };
         let published = bridge_on_runtime(
             persist_superfile_publish_batch_async(
                 &self.inner,
@@ -3531,6 +3536,20 @@ impl SupertableWriter {
             .append_queue
             .publish_followers(&mut ticket, &published);
         drop(ticket);
+        let t_warm = Instant::now();
+        let n_warm = deferred_warm.len();
+        if published.is_ok()
+            && !deferred_warm.is_empty()
+            && let Some(cache) = self.inner.options.disk_cache.as_ref()
+        {
+            warm_cache_after_commit(&self.inner, cache, deferred_warm);
+            if let Some(budget) = self.inner.options.memory_budget_bytes {
+                cache.sweep_for_budget(budget);
+            }
+        }
+        if crate::storage::io_counters::timeline_enabled() && n_warm > 0 {
+            info!("[publish] warm after {:.0}ms ({n_warm})", t_warm.elapsed().as_secs_f64() * 1e3);
+        }
         published
     }
 }
@@ -4162,6 +4181,11 @@ fn exp_lane_chunks() -> usize {
 fn exp_lane_min_chunk_rows() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| exp_env("INFINO_EXP_LANE_MIN_CHUNK", 1024))
+}
+
+fn exp_warm_after() -> bool {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| exp_env("INFINO_EXP_WARM_AFTER", 0)) != 0
 }
 
 fn exp_put_hedge() -> bool {
@@ -5653,8 +5677,13 @@ pub(super) async fn persist_superfile_publish_batch_async(
         // `warm_cache_after_commit` here: its sync `block_in_place` + nested
         // `block_on` inside the `tokio::join!` commit future deadlocks the
         // runtime (main thread parked, all workers idle).
+        let t_warm = Instant::now();
+        let n_warm = batch.pending_cache_inserts.len();
         if let Some(cache) = inner.options.disk_cache.as_ref() {
             warm_cache_inserts(cache, batch.pending_cache_inserts).await;
+        }
+        if crate::storage::io_counters::timeline_enabled() && n_warm > 0 {
+            info!("[publish] warm in turn {:.0}ms ({n_warm})", t_warm.elapsed().as_secs_f64() * 1e3);
         }
         if let (Some(cache), Some(budget)) = (
             inner.options.disk_cache.as_ref(),
