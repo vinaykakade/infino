@@ -1672,6 +1672,31 @@ impl FtsReader {
         column_id: u32,
         entries: impl Iterator<Item = (&'t [u8], DictEntry)>,
         positions_buf: &mut Vec<u32>,
+        emit: impl FnMut(&[u8], u32, u32, &[u32]) -> Result<(), FtsError>,
+    ) -> Result<(), FtsError> {
+        self.for_each_posting_with::<false>(column_id, entries, positions_buf, emit)
+    }
+
+    /// [`Self::for_each_posting_in`] handing each posting its position run
+    /// as stored, the first position then the gap to each next one, rather
+    /// than as positions.
+    pub(crate) fn for_each_posting_run_in<'t>(
+        &self,
+        column_id: u32,
+        entries: impl Iterator<Item = (&'t [u8], DictEntry)>,
+        run_buf: &mut Vec<u32>,
+        emit: impl FnMut(&[u8], u32, u32, &[u32]) -> Result<(), FtsError>,
+    ) -> Result<(), FtsError> {
+        self.for_each_posting_with::<true>(column_id, entries, run_buf, emit)
+    }
+
+    /// The walk behind [`Self::for_each_posting_in`] (`RUNS` false: runs
+    /// summed into positions) and [`Self::for_each_posting_run_in`].
+    fn for_each_posting_with<'t, const RUNS: bool>(
+        &self,
+        column_id: u32,
+        entries: impl Iterator<Item = (&'t [u8], DictEntry)>,
+        positions_buf: &mut Vec<u32>,
         mut emit: impl FnMut(&[u8], u32, u32, &[u32]) -> Result<(), FtsError>,
     ) -> Result<(), FtsError> {
         let col_meta = &self.columns[column_id as usize];
@@ -1723,7 +1748,7 @@ impl FtsReader {
                                 Some(bytes) => {
                                     positions_buf.clear();
                                     group
-                                        .run_positions(bytes.as_ref(), i, t[i], positions_buf)
+                                        .run(RUNS, bytes.as_ref(), i, t[i], positions_buf)
                                         .ok_or_else(|| {
                                             FtsError::Read(ReadError::Malformed(
                                                 "position run overflowing in merge read".into(),
@@ -1788,12 +1813,7 @@ impl FtsReader {
                                 Some(bytes) => {
                                     positions_buf.clear();
                                     group
-                                        .run_positions(
-                                            bytes.as_ref(),
-                                            cursor.pos,
-                                            tf,
-                                            positions_buf,
-                                        )
+                                        .run(RUNS, bytes.as_ref(), cursor.pos, tf, positions_buf)
                                         .ok_or_else(|| {
                                             FtsError::Read(ReadError::Malformed(
                                                 "position run overflowing in merge read".into(),

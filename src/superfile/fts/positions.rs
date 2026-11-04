@@ -595,15 +595,9 @@ impl GroupIndex {
         Some(())
     }
 
-    /// The absolute positions of pair `pair` (whose term frequency is
-    /// `tf`), appended to `out`. `None` on an overflowing gap.
-    pub(crate) fn run_positions(
-        &mut self,
-        bytes: &[u8],
-        pair: usize,
-        tf: u32,
-        out: &mut Vec<u32>,
-    ) -> Option<()> {
+    /// Where pair `pair`'s lanes start, counting it as served; past enough
+    /// runs of a packed group, its streams are decoded whole first.
+    fn serve(&mut self, bytes: &[u8], pair: usize) -> Option<usize> {
         let start = *self.starts.get(pair)? as usize;
         if self.kind == GroupKind::Packed
             && self.served >= BULK_AFTER_RUNS
@@ -620,6 +614,72 @@ impl GroupIndex {
             self.kind = GroupKind::Bulk;
         }
         self.served += 1;
+        Some(start)
+    }
+
+    /// The run values of pair `pair` (whose term frequency is `tf`): its
+    /// first position, then the gap to each next one, appended to `out` as
+    /// stored, without summing them into positions. `None` on a run whose
+    /// positions would overflow, as [`Self::run_positions`] refuses it.
+    pub(crate) fn run_values(
+        &mut self,
+        bytes: &[u8],
+        pair: usize,
+        tf: u32,
+        out: &mut Vec<u32>,
+    ) -> Option<()> {
+        let start = self.serve(bytes, pair)?;
+        let base = out.len();
+        match self.kind {
+            GroupKind::Leb128 => {
+                out.extend_from_slice(self.values.get(start..start + tf as usize)?);
+            }
+            GroupKind::Packed => {
+                if tf as usize <= SMALL_TF {
+                    out.push(self.first.lane(bytes, pair)?);
+                    for k in 0..tf as usize - 1 {
+                        out.push(self.gap.lane(bytes, start + k)?);
+                    }
+                } else {
+                    self.first.read_lanes(bytes, pair, 1, out)?;
+                    self.gap.read_lanes(bytes, start, tf as usize - 1, out)?;
+                }
+            }
+            GroupKind::Bulk => {
+                out.push(*self.firsts.get(pair)?);
+                out.extend_from_slice(self.gaps.get(start..start + tf as usize - 1)?);
+            }
+        }
+        let total: u64 = out[base..].iter().map(|&v| u64::from(v)).sum();
+        u32::try_from(total).ok().map(|_| ())
+    }
+
+    /// [`Self::run_values`] when `values`, else [`Self::run_positions`].
+    #[inline]
+    pub(crate) fn run(
+        &mut self,
+        values: bool,
+        bytes: &[u8],
+        pair: usize,
+        tf: u32,
+        out: &mut Vec<u32>,
+    ) -> Option<()> {
+        match values {
+            true => self.run_values(bytes, pair, tf, out),
+            false => self.run_positions(bytes, pair, tf, out),
+        }
+    }
+
+    /// The absolute positions of pair `pair` (whose term frequency is
+    /// `tf`), appended to `out`. `None` on an overflowing gap.
+    pub(crate) fn run_positions(
+        &mut self,
+        bytes: &[u8],
+        pair: usize,
+        tf: u32,
+        out: &mut Vec<u32>,
+    ) -> Option<()> {
+        let start = self.serve(bytes, pair)?;
         match self.kind {
             GroupKind::Leb128 => {
                 positions_from_run_values(self.values.get(start..start + tf as usize)?, out)

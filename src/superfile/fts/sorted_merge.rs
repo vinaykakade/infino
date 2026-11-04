@@ -495,29 +495,42 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
         runs.clear();
         run_starts.clear();
         let mut ascending = true;
+        let raw = exp_raw_runs();
         for &(i, value) in term_inputs {
             let remap = &self.inputs[i].remap;
-            self.readers[i]
-                .for_each_posting_in(
+            let emit = |_: &[u8], doc: u32, tf: u32, pos: &[u32]| {
+                if let Some(out_doc) = remap[doc as usize] {
+                    debug_assert!(
+                        pos.is_empty() || pos.len() == tf as usize,
+                        "sorted merge: a position run must hold tf positions"
+                    );
+                    let out_doc = out_doc.get();
+                    ascending &= postings.last().is_none_or(|&(d, _)| d < out_doc);
+                    postings.push((out_doc, tf));
+                    run_starts.push(runs.len());
+                    match raw {
+                        true => runs.extend_from_slice(pos),
+                        false => push_run_values(runs, pos),
+                    }
+                }
+                Ok(())
+            };
+            let reader = self.readers[i];
+            match raw {
+                true => reader.for_each_posting_run_in(
                     self.column_id,
                     once((term, value)),
                     positions_buf,
-                    |_, doc, tf, pos| {
-                        if let Some(out_doc) = remap[doc as usize] {
-                            debug_assert!(
-                                pos.is_empty() || pos.len() == tf as usize,
-                                "sorted merge: a position run must hold tf positions"
-                            );
-                            let out_doc = out_doc.get();
-                            ascending &= postings.last().is_none_or(|&(d, _)| d < out_doc);
-                            postings.push((out_doc, tf));
-                            run_starts.push(runs.len());
-                            push_run_values(runs, pos);
-                        }
-                        Ok(())
-                    },
-                )
-                .map_err(read_error)?;
+                    emit,
+                ),
+                false => reader.for_each_posting_in(
+                    self.column_id,
+                    once((term, value)),
+                    positions_buf,
+                    emit,
+                ),
+            }
+            .map_err(read_error)?;
         }
         if postings.is_empty() {
             return Ok(None);
@@ -544,6 +557,11 @@ const RADIX_MIN_POSTINGS: usize = if cfg!(test) { 8 } else { 512 };
 
 /// Widest digit one counting pass orders by: its buckets fit in L1.
 const RADIX_MAX_DIGIT_BITS: u32 = 11;
+
+fn exp_raw_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INFINO_EXP_RAW_RUNS").is_ok_and(|v| v == "1"))
+}
 
 fn exp_radix() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
