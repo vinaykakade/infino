@@ -1711,11 +1711,7 @@ impl SuperfileBuilder {
     /// in lane mode, for a lane of a build fed as its rows arrive (see
     /// [`Self::set_fts_lane_view`]).
     pub(crate) fn lane_builder(&self) -> Result<Option<FtsBuilder>, BuildError> {
-        let mut lane = fts_builder_for(&self.opts)?;
-        if let Some(fb) = lane.as_mut() {
-            fb.set_lane_mode();
-        }
-        Ok(lane)
+        lane_builder_of(&self.opts)
     }
 
     /// Where each FTS column sits in a batch's schema, for
@@ -4226,6 +4222,16 @@ fn scalar_batches_in_stable_id_order(
 /// The FTS builder `opts` describes, with every text column registered
 /// under its analysis chain and the table's length statistics; `None`
 /// for a build without text columns.
+/// A text-only accumulator in lane mode for a builder of `opts` (see
+/// [`SuperfileBuilder::lane_builder`]).
+pub(crate) fn lane_builder_of(opts: &BuilderOptions) -> Result<Option<FtsBuilder>, BuildError> {
+    let mut lane = fts_builder_for(opts)?;
+    if let Some(fb) = lane.as_mut() {
+        fb.set_lane_mode();
+    }
+    Ok(lane)
+}
+
 fn fts_builder_for(opts: &BuilderOptions) -> Result<Option<FtsBuilder>, BuildError> {
     if opts.fts_columns.is_empty() {
         return Ok(None);

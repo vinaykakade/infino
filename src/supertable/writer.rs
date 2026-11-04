@@ -73,8 +73,8 @@ use std::{
     str::from_utf8,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver as StdReceiver, sync_channel as std_sync_channel},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{Receiver as StdReceiver, Sender as StdSender, channel as std_channel},
     },
     thread::available_parallelism,
     time,
@@ -131,7 +131,7 @@ use crate::{
     storage::{StorageError, StorageProvider, stuck_after},
     superfile::{
         BuildError as SuperfileBuildError, FtsError, ReadError, SuperfileReader,
-        builder::{BuilderOptions, SuperfileBuilder, VectorConfig, index_fts_rows},
+        builder::{BuilderOptions, SuperfileBuilder, VectorConfig, index_fts_rows, lane_builder_of},
         format::{
             CRC_BYTES,
             footer::read_kv_metadata,
@@ -3630,7 +3630,9 @@ struct LiveLanes {
     /// The feed in flight, returning the lanes (or the first error).
     /// The feed in flight: one message per lane, in whatever order the
     /// lanes finish, and how many to wait for.
-    pending: Option<(StdReceiver<(usize, Result<LiveLane, BuildError>)>, usize)>,
+    pending: Option<(StdReceiver<(usize, Result<LiveLane, BuildError>)>, Arc<AtomicUsize>)>,
+    /// The options a lane opened mid-feed is built from.
+    lane_opts: Arc<BuilderOptions>,
     /// Rows fed so far, which is also the row number the next batch
     /// starts at.
     rows_fed: usize,
@@ -3732,6 +3734,7 @@ impl LiveLanes {
         vector_layout: VectorLayout,
     ) -> Result<Self, BuildError> {
         let (template, _, _) = open_shard_builder(&manifest, vector_layout, None, 0)?;
+        let lane_opts = Arc::new(builder_options_of(&manifest).with_vector_layout(vector_layout));
         let lanes = (0..lanes)
             .map(|_| {
                 let builder = template
@@ -3748,6 +3751,7 @@ impl LiveLanes {
             col_idxs: template.fts_column_indexes(),
             lanes: Some(lanes),
             pending: None,
+            lane_opts,
             rows_fed: 0,
             reservations: Vec::new(),
             fts_bytes: 0,
@@ -3759,16 +3763,21 @@ impl LiveLanes {
     /// Wait for the feed in flight, if any, and take the lanes back.
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all, fields(rows_fed = self.rows_fed)))]
     fn join(&mut self) -> Result<Vec<LiveLane>, BuildError> {
-        if let Some((rx, n)) = self.pending.take() {
+        if let Some((rx, started)) = self.pending.take() {
             // Every lane reports before the first error is returned, so a
             // failed feed's sibling lanes do not run on, holding the fed
             // batches and their builders, after the append has failed.
-            let mut lanes: Vec<Option<LiveLane>> = (0..n).map(|_| None).collect();
+            let mut lanes: Vec<Option<LiveLane>> = Vec::new();
             let mut first_error = None;
-            for _ in 0..n {
+            let mut received = 0usize;
+            while received < started.load(Ordering::SeqCst) {
                 let (i, lane) = rx.recv().map_err(|_| {
                     BuildError::Store("live lane feed ended without a result".into())
                 })?;
+                received += 1;
+                if lanes.len() <= i {
+                    lanes.resize_with(i + 1, || None);
+                }
                 match lane {
                     Ok(lane) => lanes[i] = Some(lane),
                     Err(error) => {
@@ -3801,7 +3810,7 @@ impl LiveLanes {
     /// caller has already reserved the build scratch for them.
     fn feed(
         &mut self,
-        pool: &ThreadPool,
+        pool: &Arc<ThreadPool>,
         op_stats: &Option<Arc<OpStatsCollector>>,
         batches: Vec<RecordBatch>,
         fts_bytes: u64,
@@ -3811,6 +3820,9 @@ impl LiveLanes {
         let first_row = self.rows_fed;
         self.rows_fed += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         self.fts_bytes = self.fts_bytes.saturating_add(fts_bytes);
+        if exp_lane_chunks() > 0 {
+            return self.feed_chunked(pool, op_stats, lanes, batches, first_row);
+        }
         // Each lane's share of the reserve for the text fed so far.
         let threshold = in_ram_threshold(self.fts_bytes / n as u64, self.threshold_floor);
         // One pool task per lane, waited for from the caller's thread when
@@ -3819,7 +3831,7 @@ impl LiveLanes {
         // — other appends' pieces and layer ranges — and the lanes of a
         // feed, the pieces of a seal and the ranges of a layer build now
         // all reach the pool the same way, served in the order they came.
-        let (tx, rx) = std_sync_channel(n.max(1));
+        let (tx, rx) = std_channel();
         let stats = op_stats.clone();
         let col_idxs = Arc::new(self.col_idxs.clone());
         let batches = Arc::new(batches);
@@ -3883,9 +3895,182 @@ impl LiveLanes {
                 let _ = tx.send((i, fed));
             });
         }
-        self.pending = Some((rx, n));
+        self.pending = Some((rx, Arc::new(AtomicUsize::new(n))));
         Ok(())
     }
+
+    /// The feed with the rows cut into chunks the lanes take in turn, and
+    /// (when on) lanes added while the pool's share for this append grows.
+    fn feed_chunked(
+        &mut self,
+        pool: &Arc<ThreadPool>,
+        op_stats: &Option<Arc<OpStatsCollector>>,
+        lanes: Vec<LiveLane>,
+        batches: Vec<RecordBatch>,
+        first_row: usize,
+    ) -> Result<(), BuildError> {
+        let n = lanes.len();
+        let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let target_chunks = pool.current_num_threads().max(1) * exp_lane_chunks();
+        let chunk_rows = total.div_ceil(target_chunks).max(exp_lane_min_chunk_rows()).max(1);
+        let mut chunks = Vec::new();
+        let mut base = first_row;
+        for (b, batch) in batches.iter().enumerate() {
+            let rows = batch.num_rows();
+            let mut start = 0;
+            while start < rows {
+                let len = chunk_rows.min(rows - start);
+                chunks.push(LaneChunk { batch: b, start, len, row: base + start });
+                start += len;
+            }
+            base += rows;
+        }
+        let threshold = in_ram_threshold(self.fts_bytes, self.threshold_floor);
+        let (tx, rx) = std_channel();
+        let started = Arc::new(AtomicUsize::new(n));
+        let ctx = Arc::new(ChunkedFeed {
+            batches,
+            chunks,
+            next: AtomicUsize::new(0),
+            started: Arc::clone(&started),
+            col_idxs: self.col_idxs.clone(),
+            threshold,
+            lane_opts: Arc::clone(&self.lane_opts),
+            pool: Arc::clone(pool),
+            stats: op_stats.clone(),
+            grow: exp_lane_grow(),
+        });
+        for (i, lane) in lanes.into_iter().enumerate() {
+            let (ctx, tx) = (Arc::clone(&ctx), tx.clone());
+            pool.spawn(move || run_chunked_lane(ctx, i, Some(lane), tx));
+        }
+        self.pending = Some((rx, started));
+        Ok(())
+    }
+}
+
+/// One chunk of a chunked feed: rows `start..start + len` of batch
+/// `batch`, which are commit rows from `row`.
+struct LaneChunk {
+    batch: usize,
+    start: usize,
+    len: usize,
+    row: usize,
+}
+
+/// A chunked feed shared by its lanes.
+struct ChunkedFeed {
+    batches: Vec<RecordBatch>,
+    chunks: Vec<LaneChunk>,
+    next: AtomicUsize,
+    started: Arc<AtomicUsize>,
+    col_idxs: Vec<Option<usize>>,
+    threshold: usize,
+    lane_opts: Arc<BuilderOptions>,
+    pool: Arc<ThreadPool>,
+    stats: Option<Arc<OpStatsCollector>>,
+    grow: bool,
+}
+
+fn run_chunked_lane(
+    ctx: Arc<ChunkedFeed>,
+    i: usize,
+    lane: Option<LiveLane>,
+    tx: StdSender<(usize, Result<LiveLane, BuildError>)>,
+) {
+    let fed = catch_unwind(AssertUnwindSafe(|| {
+        timed_kernel(&ctx.stats, || {
+            let mut lane = match lane {
+                Some(lane) => lane,
+                None => LiveLane {
+                    builder: lane_builder_of(&ctx.lane_opts)?
+                        .ok_or_else(|| BuildError::Store("live lanes need a text column".into()))?,
+                    stretches: Vec::new(),
+                },
+            };
+            lane.builder.set_spill_threshold_bytes(ctx.threshold);
+            loop {
+                let c = ctx.next.fetch_add(1, Ordering::Relaxed);
+                let Some(chunk) = ctx.chunks.get(c) else {
+                    break;
+                };
+                let first_doc = lane.stretches.last().map_or(0, |s| s.doc + s.len);
+                index_fts_rows(
+                    &mut lane.builder,
+                    &ctx.col_idxs,
+                    &ctx.batches[chunk.batch].slice(chunk.start, chunk.len),
+                    first_doc,
+                )?;
+                let (row, len) = (chunk.row as u32, chunk.len as u32);
+                match lane.stretches.last_mut() {
+                    Some(s) if s.row + s.len == row => s.len += len,
+                    _ => lane.stretches.push(Stretch {
+                        doc: first_doc,
+                        row,
+                        len,
+                    }),
+                }
+                if ctx.grow {
+                    grow_chunked_lanes(&ctx, &tx);
+                }
+            }
+            Ok::<LiveLane, BuildError>(lane)
+        })
+    }))
+    .unwrap_or_else(|_| Err(BuildError::Store("a live lane's feed panicked".into())));
+    let _ = tx.send((i, fed));
+}
+
+/// Start more lanes on `ctx` while the append's share of the pool exceeds
+/// the lanes it has and chunks remain for them.
+fn grow_chunked_lanes(
+    ctx: &Arc<ChunkedFeed>,
+    tx: &StdSender<(usize, Result<LiveLane, BuildError>)>,
+) {
+    let threads = ctx.pool.current_num_threads();
+    let open = open_appends_on(&ctx.pool);
+    let want = lanes_for(threads, open);
+    loop {
+        let have = ctx.started.load(Ordering::SeqCst);
+        let remaining = ctx.chunks.len().saturating_sub(ctx.next.load(Ordering::Relaxed));
+        if have >= want || remaining <= have {
+            return;
+        }
+        if ctx
+            .started
+            .compare_exchange(have, have + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let (ctx2, tx2) = (Arc::clone(ctx), tx.clone());
+            ctx.pool.spawn(move || run_chunked_lane(ctx2, have, None, tx2));
+        }
+    }
+}
+
+/// Appends with lanes open on `pool` now.
+fn open_appends_on(pool: &Arc<ThreadPool>) -> usize {
+    let open = OPEN_APPENDS.lock().unwrap_or_else(PoisonError::into_inner);
+    open.get(&pool_key(pool)).copied().unwrap_or(0)
+}
+
+fn exp_env(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Chunks per pool thread a feed is cut into; 0 keeps the even split.
+fn exp_lane_chunks() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| exp_env("INFINO_EXP_LANE_CHUNKS", 0))
+}
+
+fn exp_lane_min_chunk_rows() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| exp_env("INFINO_EXP_LANE_MIN_CHUNK", 1024))
+}
+
+fn exp_lane_grow() -> bool {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| exp_env("INFINO_EXP_LANE_GROW", 0)) != 0
 }
 
 /// The rows `start..end` of a commit, as `batches` hold them: the slices
