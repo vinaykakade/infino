@@ -132,9 +132,20 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         .map_err(read_error)?;
     let ranges = walk_ranges(&readers, &dicts, column_id)?;
 
+    let compact: Vec<Vec<u32>> = inputs
+        .iter()
+        .map(|input| {
+            input
+                .remap
+                .iter()
+                .map(|d| d.map_or(DROPPED, |d| d.get()))
+                .collect()
+        })
+        .collect();
     let work = BatchWork {
         readers: &readers,
         inputs,
+        compact: &compact,
         column_id,
         workers: Mutex::new(Vec::new()),
         new_state: &new_state,
@@ -395,6 +406,7 @@ impl TermWork {
 struct BatchWork<'a, S, N, E> {
     readers: &'a [&'a FtsReader],
     inputs: &'a [SortedInput],
+    compact: &'a [Vec<u32>],
     column_id: u32,
     /// Idle workers; a task takes one and puts it back.
     workers: Mutex<Vec<(TermWork, S)>>,
@@ -452,9 +464,20 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
             .pop();
         let (mut work, mut state) =
             taken.unwrap_or_else(|| (TermWork::default(), (self.new_state)()));
+        let mode = exp_remap();
         let merged = chunk
             .iter()
-            .map(|pending| {
+            .enumerate()
+            .map(|(k, pending)| {
+                if mode >= 2
+                    && let Some(ahead) = chunk.get(k + PREFETCH_TERMS_AHEAD)
+                {
+                    for &(i, value) in &batch.inputs[ahead.inputs.clone()] {
+                        if let DictEntry::Inline { doc_id, .. } = value {
+                            prefetch(self.compact[i].as_ptr().wrapping_add(doc_id as usize));
+                        }
+                    }
+                }
                 let term = &batch.term_bytes[pending.term.clone()];
                 let inputs = &batch.inputs[pending.inputs.clone()];
                 let merged = self.merge_term(term, inputs, &mut work, &mut state);
@@ -496,15 +519,20 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
         run_starts.clear();
         let mut ascending = true;
         let raw = exp_raw_runs();
+        let compact_on = exp_remap() >= 1;
         for &(i, value) in term_inputs {
             let remap = &self.inputs[i].remap;
+            let compact = &self.compact[i];
             let emit = |_: &[u8], doc: u32, tf: u32, pos: &[u32]| {
-                if let Some(out_doc) = remap[doc as usize] {
+                let out = match compact_on {
+                    true => Some(compact[doc as usize]).filter(|&d| d != DROPPED),
+                    false => remap[doc as usize].map(|d| d.get()),
+                };
+                if let Some(out_doc) = out {
                     debug_assert!(
                         pos.is_empty() || pos.len() == tf as usize,
                         "sorted merge: a position run must hold tf positions"
                     );
-                    let out_doc = out_doc.get();
                     ascending &= postings.last().is_none_or(|&(d, _)| d < out_doc);
                     postings.push((out_doc, tf));
                     run_starts.push(runs.len());
@@ -557,6 +585,30 @@ const RADIX_MIN_POSTINGS: usize = if cfg!(test) { 8 } else { 512 };
 
 /// Widest digit one counting pass orders by: its buckets fit in L1.
 const RADIX_MAX_DIGIT_BITS: u32 = 11;
+
+const DROPPED: u32 = u32::MAX;
+const PREFETCH_TERMS_AHEAD: usize = 4;
+
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch never faults, whatever the address.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
+fn exp_remap() -> u32 {
+    static ON: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("INFINO_EXP_REMAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
 
 fn exp_raw_runs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
