@@ -1213,6 +1213,7 @@ impl BisectState {
         let mut left_gains = mem::take(&mut self.left_gains);
         let mut right_gains = mem::take(&mut self.right_gains);
         let mut last_swaps = 0usize;
+        let mut prev_swaps = 0usize;
         // A round is judged by its realised gain: the cost before it less
         // the cost after, read off the degree tables the swaps just moved.
         // The pair gains the swap loop adds up predict that only while the
@@ -1319,6 +1320,15 @@ impl BisectState {
                 let mut ready = match exp_ready() {
                     1 => last_swaps.max(SWAP_BLOCK).min(pairs),
                     2 => (last_swaps + last_swaps / 4).max(SWAP_BLOCK).min(pairs),
+                    3 => {
+                        let est = match prev_swaps {
+                            0 => last_swaps,
+                            p => ((last_swaps as f64 * (last_swaps as f64 / p as f64).min(1.0))
+                                * 1.25)
+                                .ceil() as usize,
+                        };
+                        est.max(SWAP_BLOCK).min(pairs)
+                    }
                     _ => last_swaps.saturating_mul(2).max(SWAP_BLOCK).min(pairs),
                 };
                 if let Some(hint) = first_hint {
@@ -1427,6 +1437,7 @@ impl BisectState {
                 }
                 swaps
             };
+            prev_swaps = last_swaps;
             last_swaps = moved;
             if round == 0 && exp_first() > 0 {
                 let d = depth as usize;
