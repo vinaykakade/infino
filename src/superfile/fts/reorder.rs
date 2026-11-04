@@ -625,6 +625,45 @@ pub(crate) fn bisect_order_reported(
     (order, report)
 }
 
+/// How a split's rounds run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spread {
+    /// On the calling thread. Terms are listed as the count first meets
+    /// them, and the cost is summed in that order.
+    Serial,
+    /// Across threads. Terms are listed by id, and the cost is summed a
+    /// fixed chunk of them at a time.
+    Parallel,
+    /// Across threads, to the same sums as [`Spread::Serial`]: terms listed
+    /// in the order a serial count first meets them, and the cost summed in
+    /// that order. For a partition the serial path would split, so it splits
+    /// to the same order with the whole pool behind it.
+    ParallelAsSerial,
+}
+
+impl Spread {
+    fn parallel(self) -> bool {
+        self != Spread::Serial
+    }
+}
+
+/// A partition at the top of the tree, waiting for its level to split it.
+struct Part<'a> {
+    /// The index its documents are numbered against: the run's, or the one
+    /// it or a partition above it renumbered into.
+    fwd: &'a ForwardIndex,
+    /// Scratch states sized for `fwd`.
+    pool: &'a StatePool,
+    order: &'a mut [u32],
+    /// Its distinct terms, where its parent's refine counted them; nothing
+    /// has counted the root's or a just renumbered partition's.
+    distinct: Option<usize>,
+    /// Whether it splits as the serial path would: it renumbered, or lies
+    /// below a partition that did, and [`split_parallel`] splits those
+    /// serially.
+    as_serial: bool,
+}
+
 /// Split the top of the tree a level at a time, then hand each partition to
 /// [`split_parallel`].
 ///
@@ -635,80 +674,156 @@ pub(crate) fn bisect_order_reported(
 /// only pick up another split of the same level, never a subtree many times
 /// its size; and a completed level offers its realised gain as the bar in
 /// partition order, the same on every run. Every partition goes through
-/// exactly the steps [`split_parallel`] would take it through, so the order
-/// is the same.
+/// exactly the steps [`split_parallel`] would take it through, to the same
+/// sums, so the order is the same.
 fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bisect<'_>) {
-    let width = rayon::current_num_threads();
-    // Each partition travels with its distinct terms once a refine has
-    // counted them; nothing has counted the root's.
-    let mut level: Vec<(&mut [u32], Option<usize>)> = vec![(order, None)];
-    let mut handed_on: Vec<(&mut [u32], u32, Option<usize>)> = Vec::new();
-    let mut depth = 0u32;
-    // A level at a time while the level is narrower than the pool, and for
-    // as long as no level has set the bar: each completed level offers its
-    // realised gain in partition order, so a run whose root moved nothing
-    // still takes its bar from the first level that lowered the cost, and
-    // takes the same bar on every run.
-    while !level.is_empty() && (level.len() < width || !run.has_reference()) {
-        // Only a partition `split_parallel` would refine and halve itself is
-        // split here; any other takes its own path there. A small partition
-        // is halved here too while no bar is set — the same serial refine
-        // `BisectState::split` would give it — so the levels keep offering until
-        // one lowers the cost.
-        let wide = run.has_reference();
-        let (here, rest): (Vec<_>, Vec<_>) = level.into_iter().partition(|(part, distinct)| {
-            part.len() > MIN_PARTITION
-                && depth < MAX_DEPTH
-                && (part.len() >= PARALLEL_MIN_PARTITION || !wide)
-                // A partition that renumbers takes its own path, so its first
-                // round would not count towards the level's offer. Until a
-                // level has set the bar it stays here, renumbering later, so
-                // the bar is the one the plain bisection takes.
-                && !(wide && run.renumbers(fwd, *distinct))
+    let root = Part {
+        fwd,
+        pool,
+        order,
+        distinct: None,
+        as_serial: false,
+    };
+    split_level(vec![root], Vec::new(), 0, run, current_num_threads());
+}
+
+/// Split one level of [`split_levels`], then the levels below it, then hand
+/// on every partition the levels left.
+///
+/// A level at a time while the level is narrower than the pool, and for as
+/// long as no level has set the bar: each completed level offers its realised
+/// gain in partition order, so a run whose root moved nothing still takes its
+/// bar from the first level that lowered the cost, and takes the same bar on
+/// every run.
+fn split_level<'a>(
+    level: Vec<Part<'a>>,
+    mut handed_on: Vec<(Part<'a>, u32)>,
+    depth: u32,
+    run: Bisect<'_>,
+    width: usize,
+) {
+    if level.is_empty() || (level.len() >= width && run.has_reference()) {
+        handed_on.extend(level.into_iter().map(|part| (part, depth)));
+        handed_on.into_par_iter().for_each(|(part, depth)| {
+            split_parallel(part.fwd, part.order, depth, part.pool, run, part.distinct)
         });
-        handed_on.extend(
-            rest.into_iter()
-                .map(|(part, distinct)| (part, depth, distinct)),
-        );
-        let docs: usize = here.iter().map(|(part, _)| part.len()).sum();
-        let split: Vec<(Refined, [&mut [u32]; 2])> = here
-            .into_par_iter()
-            .map(|(part, _)| {
-                let mid = part.len() / 2;
-                let parallel = part.len() >= PARALLEL_MIN_PARTITION;
-                let refined = pool.with_state(|state| {
-                    let refined = state.refine(fwd, part, mid, depth, parallel, run);
-                    state.flush(run.report);
-                    refined
-                });
-                let (left, right) = part.split_at_mut(mid);
-                (refined, [left, right])
-            })
-            .collect();
-        // The level's splits ran side by side, but their first rounds' gains
-        // are summed here in partition order, so the bar they offer is the
-        // same on every run.
-        run.offer_reference(
-            split
-                .iter()
-                .map(|(refined, _)| refined.first_round_gain)
-                .sum(),
-            docs,
-        );
-        level = split
-            .into_iter()
-            .flat_map(|(refined, halves)| halves.into_iter().zip(refined.distinct.map(Some)))
-            .collect();
-        depth += 1;
+        return;
     }
-    handed_on.extend(
-        level
-            .into_iter()
-            .map(|(part, distinct)| (part, depth, distinct)),
-    );
-    handed_on
+    // Only a partition `split_parallel` would refine and halve itself is
+    // split here; any other takes its own path there. A small partition is
+    // halved here too while no bar is set — the same serial refine
+    // `BisectState::split` would give it — so the levels keep offering until
+    // one lowers the cost.
+    let wide = run.has_reference();
+    let (here, rest): (Vec<_>, Vec<_>) = level.into_iter().partition(|part| {
+        part.order.len() > MIN_PARTITION
+            && depth < MAX_DEPTH
+            && (part.order.len() >= PARALLEL_MIN_PARTITION || !wide)
+    });
+    handed_on.extend(rest.into_iter().map(|part| (part, depth)));
+    // A partition renumbers here as `split_parallel` would renumber it, and
+    // from then on splits as that path would. Until a level has set the bar
+    // none does, so the bar is the one the plain bisection takes.
+    let (renumbering, mut here): (Vec<_>, Vec<_>) = here
+        .into_iter()
+        .partition(|part| wide && run.renumbers(part.fwd, part.distinct));
+    if renumbering.is_empty() {
+        split_parts(here, handed_on, depth, run, width);
+        return;
+    }
+    let mut renumbered: Vec<(ForwardIndex, StatePool, Vec<u32>)> = renumbering
+        .par_iter()
+        .map(|part| {
+            let started = REPORT.then(Instant::now);
+            let local = part
+                .pool
+                .with_state(|state| state.localize(part.fwd, part.order));
+            if let Some(started) = started {
+                run.report.add(
+                    depth,
+                    &LevelReport {
+                        localized: 1,
+                        localize_ns: ns_since(started),
+                        ..LevelReport::default()
+                    },
+                );
+            }
+            let pool = StatePool {
+                n_terms: local.n_terms,
+                free: Mutex::new(Vec::new()),
+            };
+            (local, pool, (0..part.order.len() as u32).collect())
+        })
+        .collect();
+    let orders: Vec<&mut [u32]> = renumbering.into_iter().map(|part| part.order).collect();
+    // Its terms fill the new table exactly, so it does not renumber again
+    // before it splits.
+    here.extend(renumbered.iter_mut().map(|(fwd, pool, inner)| Part {
+        fwd,
+        pool,
+        order: inner,
+        distinct: None,
+        as_serial: true,
+    }));
+    split_parts(here, handed_on, depth, run, width);
+    orders
         .into_par_iter()
-        .for_each(|(part, depth, distinct)| split_parallel(fwd, part, depth, pool, run, distinct));
+        .zip(&renumbered)
+        .for_each(|(order, (_, _, inner))| apply_inner_order(order, inner));
+}
+
+/// Refine and halve every partition of one level side by side, offer the
+/// level's gain, and go on to the level below.
+fn split_parts<'a>(
+    here: Vec<Part<'a>>,
+    handed_on: Vec<(Part<'a>, u32)>,
+    depth: u32,
+    run: Bisect<'_>,
+    width: usize,
+) {
+    let docs: usize = here.iter().map(|part| part.order.len()).sum();
+    let split: Vec<(f64, [Part<'a>; 2])> = here
+        .into_par_iter()
+        .map(|part| {
+            let Part {
+                fwd,
+                pool,
+                order,
+                as_serial,
+                ..
+            } = part;
+            let mid = order.len() / 2;
+            let spread = match (order.len() >= PARALLEL_MIN_PARTITION, as_serial) {
+                (false, _) => Spread::Serial,
+                (true, false) => Spread::Parallel,
+                (true, true) => Spread::ParallelAsSerial,
+            };
+            let refined = pool.with_state(|state| {
+                let refined = state.refine(fwd, order, mid, depth, spread, run);
+                state.flush(run.report);
+                refined
+            });
+            let (left, right) = order.split_at_mut(mid);
+            let [left_distinct, right_distinct] = refined.distinct;
+            let half = |order, distinct| Part {
+                fwd,
+                pool,
+                order,
+                distinct: Some(distinct),
+                as_serial,
+            };
+            (
+                refined.first_round_gain,
+                [half(left, left_distinct), half(right, right_distinct)],
+            )
+        })
+        .collect();
+    // The level's splits ran side by side, but their first rounds' gains are
+    // summed here in partition order, so the bar they offer is the same on
+    // every run.
+    run.offer_reference(split.iter().map(|(gain, _)| gain).sum(), docs);
+    let level = split.into_iter().flat_map(|(_, halves)| halves).collect();
+    split_level(level, handed_on, depth + 1, run, width);
 }
 
 /// Split `order` as [`BisectState::split`] does, running the two halves
@@ -780,7 +895,11 @@ fn split_parallel(
     // before resuming, which put one split's ranking at 46 s instead of 0.3 s.
     // The root's first round offers the bar from inside `refine`.
     let [left_distinct, right_distinct] = pool.with_state(|state| {
-        let refined = state.refine(fwd, order, mid, depth, depth == 0, run);
+        let spread = match depth {
+            0 => Spread::Parallel,
+            _ => Spread::Serial,
+        };
+        let refined = state.refine(fwd, order, mid, depth, spread, run);
         state.flush(run.report);
         refined.distinct
     });
@@ -889,6 +1008,9 @@ struct BisectState {
     /// repeats, while a round can still redo just those; `None` when the
     /// next round has to compute every term's.
     moved_terms: Option<Vec<u32>>,
+    /// By term, the earliest place a [`Spread::ParallelAsSerial`] count met
+    /// it at; `u64::MAX` outside a count. Empty until such a count runs.
+    first_seen: Vec<AtomicU64>,
     /// What moving any one left document lowers a term's cost by. It
     /// depends only on the term's degrees, so it is computed once per
     /// term per round rather than once per document carrying it.
@@ -926,6 +1048,7 @@ impl BisectState {
         Self {
             deg: vec![[0u32; 2]; n_terms],
             moved_terms: None,
+            first_seen: Vec::new(),
             move_gain_left: vec![0f32; n_terms],
             move_gain_right: vec![0f32; n_terms],
             cost_left: Vec::new(),
@@ -1057,25 +1180,27 @@ impl BisectState {
         }
         let mid = order.len() / 2;
         // The root's first round offers the bar from inside `refine`.
-        let [left_distinct, right_distinct] =
-            self.refine(fwd, order, mid, depth, false, run).distinct;
+        let [left_distinct, right_distinct] = self
+            .refine(fwd, order, mid, depth, Spread::Serial, run)
+            .distinct;
         let (left, right) = order.split_at_mut(mid);
         self.split(fwd, left, depth + 1, run, Some(left_distinct));
         self.split(fwd, right, depth + 1, run, Some(right_distinct));
     }
 
     /// Move documents across the split while it lowers the cost, then
-    /// leave the two halves in `order`. `parallel` spreads each round's
-    /// gains and sorts across threads.
+    /// leave the two halves in `order`. `spread` says whether each round's
+    /// gains and sorts run across threads, and to which sums.
     fn refine(
         &mut self,
         fwd: &ForwardIndex,
         order: &mut [u32],
         mid: usize,
         depth: u32,
-        parallel: bool,
+        spread: Spread,
         run: Bisect<'_>,
     ) -> Refined {
+        let parallel = spread.parallel();
         let started = REPORT.then(Instant::now);
         let span = match order.len() >= SPLIT_SPAN_MIN_DOCS {
             true => detail_span!(
@@ -1110,7 +1235,7 @@ impl BisectState {
 
         let step = timed.then(Instant::now);
         let cpu = timed.then(thread_cpu_ns).flatten();
-        self.count_degrees(fwd, order, mid, parallel);
+        self.count_degrees(fwd, order, mid, spread);
         if let Some(step) = step {
             level.count_ns += ns_since(step);
             level.serial_cpu_ns += thread_cpu_delta_ns(cpu);
@@ -1119,7 +1244,7 @@ impl BisectState {
         let n_right = (order.len() - mid) as f32;
         fill_cost_table(&mut self.cost_left, n_left);
         fill_cost_table(&mut self.cost_right, n_right);
-        let mut cost_before = self.partition_cost(n_left, n_right, parallel);
+        let mut cost_before = self.partition_cost(n_left, n_right, spread);
         // What the split's first round lowered the cost by: its offer
         // towards the run's bar, which measures every later round against
         // what a first round over fresh halves is worth per document.
@@ -1281,7 +1406,7 @@ impl BisectState {
                 break;
             }
             level.swaps += moved as u64;
-            let cost_after = self.partition_cost(n_left, n_right, parallel);
+            let cost_after = self.partition_cost(n_left, n_right, spread);
             let round_gain = cost_before - cost_after;
             cost_before = cost_after;
             if round == 0 {
@@ -1348,26 +1473,35 @@ impl BisectState {
         })
     }
 
-    /// The cost of the current split, from its degree tables. A large split
-    /// sums in parallel, a fixed chunk of terms at a time, each chunk in
-    /// order and then the chunks in order, so the total is the same on any
-    /// thread count.
-    fn partition_cost(&self, n_left: f32, n_right: f32, parallel: bool) -> f64 {
-        let cost_of = |terms: &[u32]| -> f64 {
-            terms
-                .iter()
-                .map(|&t| self.term_split_cost(t as usize, n_left, n_right))
-                .sum()
-        };
-        if !parallel {
-            return cost_of(&self.touched);
+    /// The cost of the current split, from its degree tables. A
+    /// [`Spread::Parallel`] split sums in parallel, a fixed chunk of terms at
+    /// a time, each chunk in order and then the chunks in order, so the total
+    /// is the same on any thread count. A [`Spread::ParallelAsSerial`] one
+    /// works out each term's cost in parallel and adds them up in order, one
+    /// after another, as the serial path does.
+    fn partition_cost(&self, n_left: f32, n_right: f32, spread: Spread) -> f64 {
+        let cost = |&t: &u32| self.term_split_cost(t as usize, n_left, n_right);
+        let cost_of = |terms: &[u32]| -> f64 { terms.iter().map(cost).sum() };
+        match spread {
+            Spread::Serial => cost_of(&self.touched),
+            Spread::Parallel => {
+                let chunks: Vec<f64> = self
+                    .touched
+                    .par_chunks(PAR_MIN_ITEMS)
+                    .map(cost_of)
+                    .collect();
+                chunks.into_iter().sum()
+            }
+            Spread::ParallelAsSerial => {
+                let costs: Vec<f64> = self
+                    .touched
+                    .par_iter()
+                    .with_min_len(PAR_MIN_ITEMS)
+                    .map(cost)
+                    .collect();
+                costs.into_iter().sum()
+            }
         }
-        let chunks: Vec<f64> = self
-            .touched
-            .par_chunks(PAR_MIN_ITEMS)
-            .map(cost_of)
-            .collect();
-        chunks.into_iter().sum()
     }
 
     /// What term `t` costs across both halves of the current split.
@@ -1472,8 +1606,61 @@ impl BisectState {
     /// and the sums it makes, runs the same whichever threads counted. The
     /// serial path lists a term as it first meets it, which costs nothing
     /// beyond the count itself; a pass over the whole vocabulary would.
-    fn count_degrees(&mut self, fwd: &ForwardIndex, order: &[u32], mid: usize, parallel: bool) {
-        if parallel {
+    /// [`Spread::ParallelAsSerial`] lists them in that same order: each term
+    /// keeps the earliest place it occurs at, the document's position in the
+    /// partition and then its own in the document, and the terms are sorted
+    /// by it.
+    fn count_degrees(&mut self, fwd: &ForwardIndex, order: &[u32], mid: usize, spread: Spread) {
+        if spread == Spread::ParallelAsSerial {
+            if self.first_seen.len() != self.deg.len() {
+                self.first_seen = (0..self.deg.len())
+                    .into_par_iter()
+                    .map(|_| AtomicU64::new(u64::MAX))
+                    .collect();
+            }
+            let Self {
+                deg,
+                touched,
+                first_seen,
+                ..
+            } = self;
+            {
+                let deg = as_atomic(deg.as_flattened_mut());
+                let first_seen = &*first_seen;
+                order
+                    .par_iter()
+                    .enumerate()
+                    .with_min_len(PAR_MIN_ITEMS)
+                    .for_each(|(i, &d)| {
+                        let side = match i < mid {
+                            true => LEFT,
+                            false => RIGHT,
+                        };
+                        for (k, &t) in fwd.doc(d).iter().enumerate() {
+                            deg[flat_at(t, side)].fetch_add(1, Relaxed);
+                            let at = ((i as u64) << 32) | k as u64;
+                            let seen = &first_seen[t as usize];
+                            if at < seen.load(Relaxed) {
+                                seen.fetch_min(at, Relaxed);
+                            }
+                        }
+                    });
+            }
+            let (deg, first_seen) = (&*deg, &*first_seen);
+            // Reading a term's first place also clears it for the next split.
+            let mut by_first: Vec<(u64, u32)> = (0..deg.len() as u32)
+                .into_par_iter()
+                .with_min_len(PAR_MIN_ITEMS)
+                .filter(|&t| deg[t as usize] != [0, 0])
+                .map(|t| (first_seen[t as usize].swap(u64::MAX, Relaxed), t))
+                .collect();
+            // Every place holds one term, so the places are distinct.
+            by_first.par_sort_unstable();
+            touched.clear();
+            touched.par_extend(by_first.par_iter().map(|&(_, t)| t));
+            return;
+        }
+        if spread == Spread::Parallel {
             let Self { deg, touched, .. } = self;
             let (left, right) = order.split_at(mid);
             {
@@ -2059,7 +2246,15 @@ mod tests {
             }
             let mut sorted = keys.clone();
             sorted.sort_unstable();
-            for want in [1, 2, PAR_SELECT_MIN - 1, PAR_SELECT_MIN, len / 3, len - 2, len - 1] {
+            for want in [
+                1,
+                2,
+                PAR_SELECT_MIN - 1,
+                PAR_SELECT_MIN,
+                len / 3,
+                len - 2,
+                len - 1,
+            ] {
                 let mut serial = keys.clone();
                 serial.select_nth_unstable(want);
                 let mut parallel = keys.clone();
@@ -2071,7 +2266,11 @@ mod tests {
                 assert_eq!(front, serial[..want], "shape={shape} want={want}");
                 parallel.sort_unstable();
                 assert_eq!(parallel, sorted, "shape={shape} want={want}: a permutation");
-                assert_eq!(par_nth_key(&keys, want), sorted[want], "shape={shape} want={want}");
+                assert_eq!(
+                    par_nth_key(&keys, want),
+                    sorted[want],
+                    "shape={shape} want={want}"
+                );
             }
         }
     }
@@ -2587,13 +2786,111 @@ mod tests {
         assert_eq!(order, reference_order(&fwd));
     }
 
+    /// Documents in the corpus the serial-order tests split: large enough
+    /// that the partitions two levels below the root still split across
+    /// threads.
+    const AS_SERIAL_DOCS: usize = 5 * PARALLEL_MIN_PARTITION;
+
+    /// A count spread across threads to the serial path's sums lists the
+    /// terms exactly as the serial count does, in the order it first meets
+    /// them, and leaves the same degrees; and a refine with it ends at the
+    /// serial refine's order and counts, with the convergence test on, which
+    /// reads the realised cost each round. The documents are shuffled first
+    /// so the order the terms are met in is not their id order.
+    #[test]
+    fn a_parallel_refine_to_serial_sums_matches_the_serial_one() {
+        let (fwd, _) = scattered_into_buckets(AS_SERIAL_DOCS, 11, 7);
+        let mut rng = StdRng::seed_from_u64(3);
+        let mut shuffled: Vec<u32> = (0..fwd.len() as u32).collect();
+        for i in (1..shuffled.len()).rev() {
+            shuffled.swap(i, rng.random_range(0..=i));
+        }
+        let mid = shuffled.len() / 2;
+        let counted = |spread| {
+            let mut state = BisectState::new(fwd.n_terms);
+            state.count_degrees(&fwd, &shuffled, mid, spread);
+            let degrees: Vec<[u32; 2]> = state
+                .touched
+                .iter()
+                .map(|&t| state.deg[t as usize])
+                .collect();
+            (state.touched.clone(), degrees)
+        };
+        assert_eq!(counted(Spread::ParallelAsSerial), counted(Spread::Serial));
+
+        let refined = |spread| {
+            let reference = AtomicU64::new(0);
+            let report = RunReport::new();
+            let run = Bisect {
+                params: BisectParams::default(),
+                reference: &reference,
+                report: &report,
+                parent: &report.span,
+            };
+            let mut order = shuffled.clone();
+            let mut state = BisectState::new(fwd.n_terms);
+            // A first refine sets the bar, then a second one is measured
+            // against it, as the splits below the root are.
+            let first = state.refine(&fwd, &mut order, mid, 0, spread, run);
+            let second = state.refine(&fwd, &mut order[..mid], mid / 2, 1, spread, run);
+            assert!(reference.load(Relaxed) != 0, "the root set no bar");
+            (order, first.distinct, second.distinct, state.levels.clone())
+        };
+        let (serial, as_serial) = (refined(Spread::Serial), refined(Spread::ParallelAsSerial));
+        assert_eq!(as_serial.0, serial.0, "the order");
+        assert_eq!(
+            (as_serial.1, as_serial.2),
+            (serial.1, serial.2),
+            "the distinct terms"
+        );
+        let rounds = |levels: &[LevelReport]| levels.iter().map(|l| l.rounds).collect::<Vec<_>>();
+        assert_eq!(
+            rounds(&as_serial.3),
+            rounds(&serial.3),
+            "the rounds each split ran"
+        );
+    }
+
+    /// Partitions that renumber just below the root split at the top of the
+    /// tree across the whole pool, and end at the order a one-thread pool
+    /// gives, where they are split one to a thread on the serial path: under
+    /// the parameters a real merge runs with, so with every convergence test
+    /// reading the cost sums.
+    #[test]
+    fn renumbered_partitions_split_across_the_pool_keep_the_order() {
+        let (fwd, _) = scattered_into_buckets(AS_SERIAL_DOCS, 13, 9);
+        let ordered = |threads: usize| {
+            ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool")
+                .install(|| bisect_order_reported(&fwd, BisectParams::default()))
+        };
+        let (serial, report) = ordered(1);
+        assert!(
+            report.levels.get(1).is_some_and(|l| l.localized > 0),
+            "this corpus no longer renumbers just below the root"
+        );
+        for threads in [2, 8] {
+            let (order, report) = ordered(threads);
+            assert!(
+                report.levels.get(2).is_some_and(|l| l.parallel_splits > 0) || threads < 8,
+                "the level two below the root no longer splits across threads"
+            );
+            assert_eq!(order, serial, "threads={threads}");
+        }
+    }
+
     /// A refine reports, for each half it leaves, exactly the distinct terms
     /// that half carries.
     #[test]
     fn a_refine_counts_the_distinct_terms_of_each_half() {
-        for (n, clusters, seed, parallel) in [(64usize, 2usize, 1u64), (500, 4, 2), (2_000, 9, 3)]
+        for (n, clusters, seed, spread) in [(64usize, 2usize, 1u64), (500, 4, 2), (2_000, 9, 3)]
             .into_iter()
-            .flat_map(|(n, c, s)| [false, true].map(|parallel| (n, c, s, parallel)))
+            .flat_map(|(n, c, s)| {
+                [Spread::Serial, Spread::Parallel, Spread::ParallelAsSerial]
+                    .map(|spread| (n, c, s, spread))
+            })
         {
             let (fwd, _) = clustered(n, clusters, seed);
             let mut order: Vec<u32> = (0..fwd.len() as u32).collect();
@@ -2607,7 +2904,7 @@ mod tests {
             };
             let mid = order.len() / 2;
             let refined =
-                BisectState::new(fwd.n_terms).refine(&fwd, &mut order, mid, 0, parallel, run);
+                BisectState::new(fwd.n_terms).refine(&fwd, &mut order, mid, 0, spread, run);
             let distinct = |half: &[u32]| {
                 half.iter()
                     .flat_map(|&d| fwd.doc(d).iter().copied())
@@ -2617,7 +2914,7 @@ mod tests {
             assert_eq!(
                 refined.distinct,
                 [distinct(&order[..mid]), distinct(&order[mid..])],
-                "n={n} clusters={clusters} parallel={parallel}"
+                "n={n} clusters={clusters} spread={spread:?}"
             );
         }
     }
