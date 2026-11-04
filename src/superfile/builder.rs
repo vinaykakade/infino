@@ -314,6 +314,13 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
     ) -> Result<(), BuildError> {
         let (terms_per_doc, df) = (self.terms_per_doc, self.df);
         let keep_dfs = exp_pick_df();
+        // An input that keeps every document, numbered consecutively and
+        // wholly inside this stretch, places local doc `d` at a fixed offset
+        // plus `d`; such an input needs no row lookup or range test.
+        let dense_off = match exp_pick_dense() {
+            true => dense_offset(rows, first_row, past_row),
+            false => None,
+        };
         let fts = reader.fts().expect("checked by the caller");
         for column_id in 0..self.n_fts_columns {
             // An ineligible term is skipped before its postings are read.
@@ -322,14 +329,19 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
                 (self.eligible)(t).then(|| (t, df[t as usize]))
             };
             fts.for_each_term_doc(column_id, on_term, |&(t, term_df), local_doc| {
-                let Some(row) = rows[local_doc as usize] else {
-                    return;
+                let row = match dense_off {
+                    Some(off) => off + local_doc as usize,
+                    None => {
+                        let Some(row) = rows[local_doc as usize] else {
+                            return;
+                        };
+                        let row = row.get() as usize;
+                        if row < first_row || row >= past_row {
+                            return;
+                        }
+                        row - first_row
+                    }
                 };
-                let row = row.get() as usize;
-                if row < first_row || row >= past_row {
-                    return;
-                }
-                let row = row - first_row;
                 let slot_base = row * terms_per_doc;
                 let pick = &mut picks[row];
                 let used = pick.filled as usize;
@@ -381,6 +393,24 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
         }
         Ok(())
     }
+}
+
+/// Experiment knob: skip the row lookup for an input numbered densely.
+fn exp_pick_dense() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test) || *ON.get_or_init(|| std::env::var("INFINO_EXP_PICK_DENSE").is_ok_and(|v| v == "1"))
+}
+
+/// Where local doc 0 of an input lands within the stretch `first_row..past_row`,
+/// when every one of its documents survives, they take consecutive rows, and
+/// all of them fall inside the stretch.
+fn dense_offset(rows: &[Option<RowId>], first_row: usize, past_row: usize) -> Option<usize> {
+    let base = rows.first()?.as_ref()?.get() as usize;
+    let consecutive = rows
+        .iter()
+        .enumerate()
+        .all(|(d, row)| row.is_some_and(|row| row.get() as usize == base + d));
+    (consecutive && base >= first_row && base + rows.len() <= past_row).then(|| base - first_row)
 }
 
 /// Experiment knob: keep each slot's document count beside it.

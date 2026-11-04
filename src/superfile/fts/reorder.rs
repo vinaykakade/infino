@@ -1623,6 +1623,7 @@ fn rank_by_gain(
 ) {
     // Keys for the documents of one stretch of `half` starting at `first`.
     let fast = exp_rank_fast();
+    let gains_ahead = exp_rank_pf();
     let keys_of = |first: usize, docs: &[u32], keys: &mut Vec<u64>| {
         for (j, group) in docs.chunks(GAIN_LANES).enumerate() {
             let gains = match fast {
@@ -1635,6 +1636,17 @@ fn rank_by_gain(
                                     .as_ptr()
                                     .wrapping_add(fwd.starts[d as usize] as usize),
                             );
+                        }
+                    }
+                    // And the gains the next group will read, whose terms
+                    // the step above fetched a group ago.
+                    if gains_ahead
+                        && let Some(next) = docs.get((j + 1) * GAIN_LANES..(j + 2) * GAIN_LANES)
+                    {
+                        for &d in next {
+                            for &t in fwd.doc(d) {
+                                prefetch(move_gain.as_ptr().wrapping_add(t as usize));
+                            }
                         }
                     }
                     lane_gains_fast(fwd, group, move_gain)
@@ -1702,6 +1714,12 @@ fn lane_gains(fwd: &ForwardIndex, group: &[u32], move_gain: &[f32]) -> [f32; GAI
 fn exp_rank_fast() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     cfg!(test) || *ON.get_or_init(|| std::env::var("INFINO_EXP_RANK_FAST").is_ok_and(|v| v == "1"))
+}
+
+/// Experiment knob: prefetch the next group's move gains while ranking.
+fn exp_rank_pf() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test) || *ON.get_or_init(|| std::env::var("INFINO_EXP_RANK_PF").is_ok_and(|v| v == "1"))
 }
 
 /// Ask for the cache line at `p` ahead of its use.
