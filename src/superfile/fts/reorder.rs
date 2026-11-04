@@ -35,9 +35,9 @@
 //! an order, so it can be tested against the cost it claims to lower.
 
 use std::{
-    fmt, mem,
+    env, fmt, mem,
     sync::{
-        Mutex, PoisonError,
+        Mutex, OnceLock, PoisonError,
         atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed},
     },
     time::Instant,
@@ -647,7 +647,7 @@ fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bi
     handed_on.extend(level.into_iter().map(|part| (part, depth)));
     handed_on
         .into_par_iter()
-        .for_each(|(part, depth)| split_parallel(fwd, part, depth, pool, run));
+        .for_each(|(part, depth)| split_parallel(fwd, part, depth, pool, run, true));
 }
 
 /// Split `order` as [`BisectState::split`] does, running the two halves
@@ -658,11 +658,14 @@ fn split_parallel(
     depth: u32,
     pool: &StatePool,
     run: Bisect<'_>,
+    may_localize: bool,
 ) {
     if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
         return;
     }
-    if localizing_pays(fwd, order) {
+    // A partition just renumbered goes straight to its split: its halves
+    // decide afresh, so a partition is renumbered at most once.
+    if may_localize && localizing_pays(fwd, order) {
         let started = REPORT.then(Instant::now);
         let local = pool.with_state(|state| state.localize(fwd, order));
         if let Some(started) = started {
@@ -680,7 +683,7 @@ fn split_parallel(
             n_terms: local.n_terms,
             free: Mutex::new(Vec::new()),
         };
-        split_parallel(&local, &mut inner, depth, &inner_pool, run);
+        split_parallel(&local, &mut inner, depth, &inner_pool, run, false);
         apply_inner_order(order, &inner);
         return;
     }
@@ -723,11 +726,11 @@ fn split_parallel(
     let (left, right) = order.split_at_mut(mid);
     let (left_done, right_done) = join(
         || {
-            split_parallel(fwd, left, depth + 1, pool, run);
+            split_parallel(fwd, left, depth + 1, pool, run, true);
             REPORT.then(Instant::now)
         },
         || {
-            split_parallel(fwd, right, depth + 1, pool, run);
+            split_parallel(fwd, right, depth + 1, pool, run, true);
             REPORT.then(Instant::now)
         },
     );
@@ -762,7 +765,19 @@ fn localizing_pays(fwd: &ForwardIndex, order: &[u32]) -> bool {
         return false;
     }
     let postings: usize = order.iter().map(|&d| fwd.doc(d).len()).sum();
-    postings.saturating_mul(2) <= fwd.n_terms
+    (postings as f64) * exp_localize_factor() <= fwd.n_terms as f64
+}
+
+/// Experiment: `INFINO_EXP_LOCALIZE_FACTOR`, the `m` in "renumber when
+/// postings × m fit the table"; 2 when unset, as before.
+fn exp_localize_factor() -> f64 {
+    static FACTOR: OnceLock<f64> = OnceLock::new();
+    *FACTOR.get_or_init(|| {
+        env::var("INFINO_EXP_LOCALIZE_FACTOR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2.0)
+    })
 }
 
 /// Apply a permutation computed over a partition's own positions back onto
@@ -927,7 +942,7 @@ impl BisectState {
             }
             let mut inner: Vec<u32> = (0..order.len() as u32).collect();
             let mut inner_state = BisectState::new(local.n_terms);
-            inner_state.split(&local, &mut inner, depth, run);
+            inner_state.split_halves(&local, &mut inner, depth, run);
             inner_state.flush(run.report);
             apply_inner_order(order, &inner);
             return;
