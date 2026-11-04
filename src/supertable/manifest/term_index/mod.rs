@@ -625,6 +625,15 @@ struct LayerBytes {
 }
 
 impl ReservedLayer {
+    /// Content hashes of every slice and tier object this layer wrote.
+    pub(crate) fn written_objects(&self) -> impl Iterator<Item = ContentHash> + '_ {
+        self.bytes
+            .slices
+            .iter()
+            .chain(&self.bytes.tiers)
+            .map(|(hash, _)| *hash)
+    }
+
     /// Whether it was built from `contributions`, in their order.
     fn built_from(&self, contributions: &[Contribution]) -> bool {
         self.superfiles.len() == contributions.len()

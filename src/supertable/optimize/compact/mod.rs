@@ -1426,6 +1426,18 @@ impl Supertable {
                     .instrument(detail_span!("commit_finalize"))
                     .await;
 
+                    // The layer's objects were written by this process in the
+                    // current layout, so the term-index refresh need not ask
+                    // storage whether they are there.
+                    if crate::utils::exp::ti_seen()
+                        && let Some(layer) = reserved_layer.as_ref()
+                    {
+                        inner
+                            .term_index_objects_seen
+                            .lock()
+                            .expect("term-index objects seen")
+                            .extend(layer.written_objects());
+                    }
                     // What the commit no longer needs: the merged outputs'
                     // spilled term contributions and the layer's spilled
                     // objects, whose scratch files go with them.

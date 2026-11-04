@@ -51,3 +51,5 @@ flag!(encode_pool, "INFINO_EXP_ENCODE_POOL");
 flag!(bg_drop, "INFINO_EXP_BG_DROP");
 // Gc deletes in flight at once.
 count!(gc_deletes, "INFINO_EXP_GC_DELETES", 256);
+// Count a compaction commit's own term-index objects as already checked.
+flag!(ti_seen, "INFINO_EXP_TI_SEEN");
