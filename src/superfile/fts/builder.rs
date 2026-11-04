@@ -97,10 +97,12 @@ use std::{
     fs::File,
     hash::{BuildHasher, Hash},
     io::{self, BufReader, BufWriter, Error, ErrorKind, Read, Seek, SeekFrom, Write},
+    iter::from_fn,
     mem,
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError, mpsc::sync_channel},
+    thread,
     time::{Duration, Instant},
     vec::IntoIter,
 };
@@ -108,9 +110,9 @@ use std::{
 use bumpalo::Bump;
 use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
-use rayon::ThreadPool;
 #[cfg(test)]
 use rayon::ThreadPoolBuilder;
+use rayon::{ThreadPool, prelude::*};
 use rustc_hash::FxBuildHasher;
 use tempfile::{Builder, TempDir};
 use tracing::debug;
@@ -132,7 +134,10 @@ use crate::{
             posting::{BLOCK_LEN, Block, EncodedBlock, block_lanes, encode_block_with},
             reader::{ColumnLengthStats, TopKEntry, finish_head},
             short::{SHORT_MAX_DF, encode_short},
-            sorted_merge::{SortedInput, merge_column},
+            sorted_merge::{
+                BATCH_POSTINGS, BATCH_TERMS, ENCODED_BATCHES_AHEAD, SortedInput, merge_column,
+                task_terms,
+            },
             tokenize::{StandardTokenizer, Tokenizer},
         },
         id_space::FtsDocId,
@@ -3451,29 +3456,7 @@ impl FtsBuilder {
                     |(scratch, profile), pairs, runs| {
                         let positions = col_positions.then_some(runs);
                         let encoded = encode_term_timed(pairs, positions, &enc, profile, scratch)?;
-                        // A long term's buffers are moved out rather than
-                        // copied, so a worker does not keep their size. A
-                        // short body is small; copying it keeps the
-                        // scratch's capacity for the next term.
-                        let (body, positions) = match encoded {
-                            EncodedTerm::Inline(_) => (Vec::new(), Vec::new()),
-                            EncodedTerm::Short => (scratch.term_buf.clone(), Vec::new()),
-                            EncodedTerm::Long => {
-                                // Positions grow without a reserve; drop
-                                // the spare capacity while the term waits.
-                                let mut positions = mem::take(&mut scratch.pos_out);
-                                positions.shrink_to_fit();
-                                // Its blocks' bytes are in the body now.
-                                scratch.encoded_blocks.clear();
-                                (mem::take(&mut scratch.term_buf), positions)
-                            }
-                        };
-                        Ok(MergedTerm {
-                            encoded,
-                            body,
-                            positions,
-                            head: scratch.head.clone(),
-                        })
+                        Ok(take_encoded(encoded, scratch))
                     },
                     |term, mut merged| {
                         n_emitted += 1;
@@ -4466,7 +4449,7 @@ fn run_offset(col: &FrozenColumn, id: u32, p: usize) -> usize {
 /// the rows is passed over at once, one within them is taken whole, and
 /// one spanning several pieces is cut where [`freeze_lanes`] recorded;
 /// its runs come by byte range.
-fn emit_lanes_column<W: Write>(
+fn emit_lanes_column<W: Write + Send>(
     view: &LaneView,
     column: usize,
     enc: &TermEncoding<'_>,
@@ -4474,141 +4457,331 @@ fn emit_lanes_column<W: Write>(
     term_scratch: &mut TermScratch,
     sink: &mut TermSink<'_, W>,
 ) -> Result<usize, BuildError> {
-    let col_positions = sink.col_positions;
-    let rows = view.rows();
-    let first_row = rows.start;
-    let lanes = &view.lanes.lanes;
-    let docs = lane_doc_ranges(lanes, rows);
+    if view.order.is_some() {
+        return emit_ordered_lanes_column(view, column, enc, finish_profile, sink);
+    }
+    let docs = lane_doc_ranges(&view.lanes.lanes, view.rows());
     let order = &view.lanes.order[column];
-
-    let mut pairs: Vec<(u32, u32)> = Vec::new();
-    // The runs of a term several lanes hold, in merged posting order: a
-    // byte range of one lane's runs per stretch taken, copied as they are.
-    let mut merged_runs: Vec<u8> = Vec::new();
-    // The lanes holding the current term: the list, the postings of it in
-    // the view, how far the merge has read, and the lane's row stretch its
-    // next document is in.
-    let mut holders: Vec<Holder> = Vec::new();
-    // A reordered piece's runs, decoded so they move with their postings.
-    let mut renumbered = Renumbered::default();
+    let mut work = LaneTermWork::default();
     let mut n_emitted = 0usize;
-    let mut at = 0usize;
-    while at < order.len() {
-        let group_end = term_group_end(order, at);
-        holders.clear();
-        for entry in &order[at..group_end] {
-            let lane = entry.lane as usize;
-            let col = &lanes[lane].columns[column];
-            let Some((lo, hi)) = piece_span(view.piece, &docs[lane], col, entry) else {
-                continue;
-            };
-            holders.push(Holder {
-                lane,
-                col,
-                id: entry.id,
-                pos: lo,
-                hi,
-                read: match col_positions {
-                    true => run_offset(col, entry.id, lo),
-                    false => 0,
-                },
-                cursor: 0,
-            });
-        }
-        at = group_end;
-        if holders.is_empty() {
+    for group in term_groups(order) {
+        let Some((term, pairs, runs)) = gather_lane_term(
+            view,
+            column,
+            &docs,
+            &order[group],
+            sink.col_positions,
+            &mut work,
+        ) else {
             continue;
-        }
-        let term = {
-            let entry = order[at - 1];
-            lanes[entry.lane as usize].columns[column].term(entry.id)
         };
-        pairs.clear();
-        let runs: Option<TermRuns<'_>> = if holders.len() == 1 {
-            let Holder {
-                lane,
-                col,
-                id,
-                pos: lo,
-                hi,
-                ..
-            } = holders[0];
-            let stretches = &lanes[lane].stretches;
-            let mut cursor = 0usize;
-            pairs.extend(
-                col.postings[id as usize][lo..hi]
-                    .iter()
-                    .map(|&(doc, tf)| (row_of(stretches, &mut cursor, doc) - first_row, tf)),
-            );
-            // Only a positional column has runs to slice.
-            let from = holders[0].read;
-            col_positions.then(|| {
-                TermRuns::Encoded(&col.pos_runs[id as usize][from..run_offset(col, id, hi)])
-            })
-        } else {
-            // A merge of ascending runs. A lane's documents of a batch are
-            // one stretch of rows, so the holder with the lowest next row
-            // is taken in a stretch, up to the next row any other holder
-            // has, before the holders are compared again; its runs for the
-            // stretch are one byte range, located by the recorded run
-            // ends and copied without decoding.
-            merged_runs.clear();
-            loop {
-                let mut lowest: Option<(usize, u32)> = None;
-                let mut bound = u32::MAX;
-                for (h, holder) in holders.iter_mut().enumerate() {
-                    if holder.pos < holder.hi {
-                        let (doc, _) = holder.col.postings[holder.id as usize][holder.pos];
-                        let row = row_of(&lanes[holder.lane].stretches, &mut holder.cursor, doc);
-                        match lowest {
-                            Some((_, r)) if row >= r => bound = bound.min(row),
-                            Some((_, r)) => {
-                                bound = r;
-                                lowest = Some((h, row));
-                            }
-                            None => lowest = Some((h, row)),
-                        }
-                    }
-                }
-                let Some((h, _)) = lowest else {
-                    break;
-                };
-                let holder = &mut holders[h];
-                let stretches = &lanes[holder.lane].stretches;
-                let list = &holder.col.postings[holder.id as usize];
-                let mut to = holder.pos;
-                while to < holder.hi {
-                    let (doc, tf) = list[to];
-                    let row = row_of(stretches, &mut holder.cursor, doc);
-                    if row >= bound {
-                        break;
-                    }
-                    pairs.push((row - first_row, tf));
-                    to += 1;
-                }
-                if col_positions {
-                    let from = holder.read;
-                    holder.read_to(to);
-                    merged_runs.extend_from_slice(
-                        &holder.col.pos_runs[holder.id as usize][from..holder.read],
-                    );
-                }
-                holder.pos = to;
-            }
-            col_positions.then_some(TermRuns::Encoded(&merged_runs))
-        };
-        match &view.order {
-            None => {
-                encode_and_emit_term(term, &pairs, runs, enc, finish_profile, term_scratch, sink)?
-            }
-            Some((_, inverse)) => {
-                let runs = renumber(&mut pairs, runs, inverse, &mut renumbered);
-                encode_and_emit_term(term, &pairs, runs, enc, finish_profile, term_scratch, sink)?
-            }
-        }
+        encode_and_emit_term(term, pairs, runs, enc, finish_profile, term_scratch, sink)?;
         n_emitted += 1;
     }
     Ok(n_emitted)
+}
+
+/// [`emit_lanes_column`] for a piece stored in an order of its own, where
+/// every term is renumbered and sorted before it is encoded: too much for
+/// one thread on a large piece. Terms are gathered and encoded in batches
+/// on the pool, each on a worker with scratch of its own, and written in
+/// term order on a thread of their own, a batch behind, as a compaction
+/// merge writes its terms.
+fn emit_ordered_lanes_column<W: Write + Send>(
+    view: &LaneView,
+    column: usize,
+    enc: &TermEncoding<'_>,
+    finish_profile: &mut FinishProfile,
+    sink: &mut TermSink<'_, W>,
+) -> Result<usize, BuildError> {
+    let col_positions = sink.col_positions;
+    let lanes = &view.lanes.lanes;
+    let docs = lane_doc_ranges(lanes, view.rows());
+    let order = &view.lanes.order[column];
+    let profiling = finish_profile.enabled;
+    let workers: Mutex<Vec<LaneWorker<'_>>> = Mutex::new(Vec::new());
+    // Encode one task's terms on a worker taken from the shared stack.
+    let encode_chunk =
+        |groups: &[Range<usize>]| -> Result<Vec<Option<LaneEncoded<'_>>>, BuildError> {
+            let taken = workers.lock().unwrap_or_else(PoisonError::into_inner).pop();
+            let mut worker = taken.unwrap_or_else(|| LaneWorker {
+                work: LaneTermWork::default(),
+                scratch: TermScratch::default(),
+                profile: FinishProfile {
+                    enabled: profiling,
+                    ..FinishProfile::default()
+                },
+            });
+            let encoded = groups
+                .iter()
+                .map(|group| {
+                    let LaneWorker {
+                        work,
+                        scratch,
+                        profile,
+                    } = &mut worker;
+                    let Some((term, pairs, runs)) = gather_lane_term(
+                        view,
+                        column,
+                        &docs,
+                        &order[group.clone()],
+                        col_positions,
+                        work,
+                    ) else {
+                        return Ok(None);
+                    };
+                    let encoded = encode_term_timed(pairs, runs, enc, profile, scratch)?;
+                    Ok(Some((term, take_encoded(encoded, scratch))))
+                })
+                .collect();
+            workers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(worker);
+            encoded
+        };
+    let mut n_emitted = 0usize;
+    let (encoded_tx, encoded_rx) =
+        sync_channel::<Vec<Option<LaneEncoded<'_>>>>(ENCODED_BATCHES_AHEAD);
+    // The writer's own borrow, given back when the scope ends.
+    let write_profile = &mut *finish_profile;
+    thread::scope(|scope| -> Result<(), BuildError> {
+        let n_emitted = &mut n_emitted;
+        let writer = scope.spawn(move || -> Result<(), BuildError> {
+            for batch in encoded_rx {
+                for (term, mut merged) in batch.into_iter().flatten() {
+                    *n_emitted += 1;
+                    write_term(
+                        term,
+                        merged.encoded,
+                        &mut merged.body,
+                        &merged.positions,
+                        &merged.head,
+                        write_profile,
+                        sink,
+                    )?;
+                }
+            }
+            Ok(())
+        });
+        // Batches are cut, as a compaction merge's are, by terms and by
+        // postings, so a batch's gathered postings stay bounded.
+        let mut batch: Vec<Range<usize>> = Vec::new();
+        let mut batch_postings = 0u64;
+        let mut groups = term_groups(order).peekable();
+        while let Some(group) = groups.next() {
+            let postings: u64 = order[group.clone()]
+                .iter()
+                .filter_map(|entry| {
+                    let col = &lanes[entry.lane as usize].columns[column];
+                    piece_span(view.piece, &docs[entry.lane as usize], col, entry)
+                        .map(|(lo, hi)| (hi - lo) as u64)
+                })
+                .sum();
+            if postings > 0 {
+                batch.push(group);
+                batch_postings += postings;
+            }
+            let full = batch.len() >= BATCH_TERMS || batch_postings >= BATCH_POSTINGS;
+            if batch.is_empty() || !(full || groups.peek().is_none()) {
+                continue;
+            }
+            let encoded: Vec<Option<LaneEncoded<'_>>> = batch
+                .par_chunks(task_terms(batch.len()))
+                .map(encode_chunk)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            batch.clear();
+            batch_postings = 0;
+            // The writer is gone only after an error of its own, which the
+            // join below reports.
+            if encoded_tx.send(encoded).is_err() {
+                break;
+            }
+        }
+        drop(encoded_tx);
+        writer.join().map_err(|_| {
+            BuildError::Io(Error::other(
+                "fts lane emit: the writer thread ended without a result",
+            ))
+        })?
+    })?;
+    for worker in workers.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        finish_profile.absorb(&worker.profile);
+    }
+    Ok(n_emitted)
+}
+
+/// A term of an ordered lane piece, encoded on a worker: its bytes, and
+/// the term they are written under.
+type LaneEncoded<'v> = (&'v str, MergedTerm);
+
+/// One worker of [`emit_ordered_lanes_column`]: its gathering buffers, its
+/// encode scratch and the profile its encodes are timed in.
+struct LaneWorker<'v> {
+    work: LaneTermWork<'v>,
+    scratch: TermScratch,
+    profile: FinishProfile,
+}
+
+/// The ranges of a merged order's entries, one per term.
+fn term_groups(order: &[OrderedTerm]) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut at = 0usize;
+    from_fn(move || {
+        (at < order.len()).then(|| {
+            let end = term_group_end(order, at);
+            let group = at..end;
+            at = end;
+            group
+        })
+    })
+}
+
+/// Buffers [`gather_lane_term`] reuses from term to term.
+#[derive(Default)]
+struct LaneTermWork<'v> {
+    pairs: Vec<(u32, u32)>,
+    /// The runs of a term several lanes hold, in merged posting order: a
+    /// byte range of one lane's runs per stretch taken, copied as they are.
+    merged_runs: Vec<u8>,
+    /// The lanes holding the current term: the list, the postings of it in
+    /// the view, how far the merge has read, and the lane's row stretch its
+    /// next document is in.
+    holders: Vec<Holder<'v>>,
+    /// A reordered piece's runs, decoded so they move with their postings.
+    renumbered: Renumbered,
+}
+
+/// Gather one term of a lane view, its entries `group` of the merged
+/// order: a term held by one lane is the stretch of that lane's list that
+/// falls in the rows, its documents mapped to their rows; a term several
+/// lanes hold has their stretches merged by row, which is a merge of
+/// ascending runs since every lane's documents are in row order, with
+/// each posting's positions brought along. A view stored in an order of
+/// its own has the postings renumbered to it. `None` when no lane holds
+/// the term in the view's rows.
+fn gather_lane_term<'v, 'w>(
+    view: &'v LaneView,
+    column: usize,
+    docs: &[Range<usize>],
+    group: &[OrderedTerm],
+    col_positions: bool,
+    work: &'w mut LaneTermWork<'v>,
+) -> Option<(&'v str, &'w [(u32, u32)], Option<TermRuns<'w>>)> {
+    let lanes = &view.lanes.lanes;
+    let first_row = view.rows().start;
+    let LaneTermWork {
+        pairs,
+        merged_runs,
+        holders,
+        renumbered,
+    } = work;
+    holders.clear();
+    for entry in group {
+        let lane = entry.lane as usize;
+        let col = &lanes[lane].columns[column];
+        let Some((lo, hi)) = piece_span(view.piece, &docs[lane], col, entry) else {
+            continue;
+        };
+        holders.push(Holder {
+            lane,
+            col,
+            id: entry.id,
+            pos: lo,
+            hi,
+            read: match col_positions {
+                true => run_offset(col, entry.id, lo),
+                false => 0,
+            },
+            cursor: 0,
+        });
+    }
+    if holders.is_empty() {
+        return None;
+    }
+    let term = {
+        let entry = group[group.len() - 1];
+        lanes[entry.lane as usize].columns[column].term(entry.id)
+    };
+    pairs.clear();
+    let runs: Option<TermRuns<'_>> = if holders.len() == 1 {
+        let Holder {
+            lane,
+            col,
+            id,
+            pos: lo,
+            hi,
+            ..
+        } = holders[0];
+        let stretches = &lanes[lane].stretches;
+        let mut cursor = 0usize;
+        pairs.extend(
+            col.postings[id as usize][lo..hi]
+                .iter()
+                .map(|&(doc, tf)| (row_of(stretches, &mut cursor, doc) - first_row, tf)),
+        );
+        // Only a positional column has runs to slice.
+        let from = holders[0].read;
+        col_positions
+            .then(|| TermRuns::Encoded(&col.pos_runs[id as usize][from..run_offset(col, id, hi)]))
+    } else {
+        // A merge of ascending runs. A lane's documents of a batch are
+        // one stretch of rows, so the holder with the lowest next row
+        // is taken in a stretch, up to the next row any other holder
+        // has, before the holders are compared again; its runs for the
+        // stretch are one byte range, located by the recorded run
+        // ends and copied without decoding.
+        merged_runs.clear();
+        loop {
+            let mut lowest: Option<(usize, u32)> = None;
+            let mut bound = u32::MAX;
+            for (h, holder) in holders.iter_mut().enumerate() {
+                if holder.pos < holder.hi {
+                    let (doc, _) = holder.col.postings[holder.id as usize][holder.pos];
+                    let row = row_of(&lanes[holder.lane].stretches, &mut holder.cursor, doc);
+                    match lowest {
+                        Some((_, r)) if row >= r => bound = bound.min(row),
+                        Some((_, r)) => {
+                            bound = r;
+                            lowest = Some((h, row));
+                        }
+                        None => lowest = Some((h, row)),
+                    }
+                }
+            }
+            let Some((h, _)) = lowest else {
+                break;
+            };
+            let holder = &mut holders[h];
+            let stretches = &lanes[holder.lane].stretches;
+            let list = &holder.col.postings[holder.id as usize];
+            let mut to = holder.pos;
+            while to < holder.hi {
+                let (doc, tf) = list[to];
+                let row = row_of(stretches, &mut holder.cursor, doc);
+                if row >= bound {
+                    break;
+                }
+                pairs.push((row - first_row, tf));
+                to += 1;
+            }
+            if col_positions {
+                let from = holder.read;
+                holder.read_to(to);
+                merged_runs
+                    .extend_from_slice(&holder.col.pos_runs[holder.id as usize][from..holder.read]);
+            }
+            holder.pos = to;
+        }
+        col_positions.then_some(TermRuns::Encoded(merged_runs.as_slice()))
+    };
+    let runs = match &view.order {
+        None => runs,
+        Some((_, inverse)) => renumber(pairs.as_mut_slice(), runs, inverse, renumbered),
+    };
+    Some((term, pairs.as_slice(), runs))
 }
 
 /// Emit one in-RAM column's terms in dictionary order: the ids are
@@ -4822,6 +4995,33 @@ struct MergedTerm {
     body: Vec<u8>,
     positions: Vec<u8>,
     head: HeadOut,
+}
+
+/// Take a term [`encode_term`] just encoded on a worker out of its
+/// scratch, to be written later. A long term's buffers are moved out
+/// rather than copied, so a worker does not keep their size. A short
+/// body is small; copying it keeps the scratch's capacity for the next
+/// term.
+fn take_encoded(encoded: EncodedTerm, scratch: &mut TermScratch) -> MergedTerm {
+    let (body, positions) = match encoded {
+        EncodedTerm::Inline(_) => (Vec::new(), Vec::new()),
+        EncodedTerm::Short => (scratch.term_buf.clone(), Vec::new()),
+        EncodedTerm::Long => {
+            // Positions grow without a reserve; drop the spare capacity
+            // while the term waits.
+            let mut positions = mem::take(&mut scratch.pos_out);
+            positions.shrink_to_fit();
+            // Its blocks' bytes are in the body now.
+            scratch.encoded_blocks.clear();
+            (mem::take(&mut scratch.term_buf), positions)
+        }
+    };
+    MergedTerm {
+        encoded,
+        body,
+        positions,
+        head: scratch.head.clone(),
+    }
 }
 
 /// What [`encode_term`] made of one term. A body sits in the scratch's

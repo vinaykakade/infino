@@ -66,16 +66,16 @@ const WALK_SPLIT_MIN_TERMS: usize = if cfg!(test) { 8 } else { 1 << 16 };
 /// overlap there is: a merge of 68 inputs and 9M terms spent 6 s of its
 /// 11 s dispatching encodes and 4.5 s writing, one after the other per
 /// batch. More would hold more encoded postings for no further overlap.
-const ENCODED_BATCHES_AHEAD: usize = 1;
+pub(crate) const ENCODED_BATCHES_AHEAD: usize = 1;
 
 /// Most terms in one parallel batch. Tiny under test, so the merge tests
 /// cross a batch boundary at every kind of term they build.
-const BATCH_TERMS: usize = if cfg!(test) { 3 } else { 1 << 16 };
+pub(crate) const BATCH_TERMS: usize = if cfg!(test) { 3 } else { 1 << 16 };
 
 /// Most postings in one batch, so its decoded postings stay bounded in
 /// memory whatever the thread count: about 40 bytes each while merged,
 /// plus 4 per position. A term with more postings is a batch of its own.
-const BATCH_POSTINGS: u64 = if cfg!(test) { 1_200 } else { 1 << 24 };
+pub(crate) const BATCH_POSTINGS: u64 = if cfg!(test) { 1_200 } else { 1 << 24 };
 
 /// Most terms one parallel task takes, so it takes a worker's scratch once
 /// per few hundred terms rather than once per term. Small under test, so
@@ -348,7 +348,7 @@ fn walk_batches(
 }
 
 /// Terms per task for a batch of `n_terms`.
-fn task_terms(n_terms: usize) -> usize {
+pub(crate) fn task_terms(n_terms: usize) -> usize {
     (n_terms / (current_num_threads() * TASKS_PER_THREAD)).clamp(1, TASK_TERMS)
 }
 
