@@ -226,6 +226,23 @@ fn exp_block_remap() -> bool {
     *ON.get_or_init(|| std::env::var_os("INFINO_EXP_BLOCK_REMAP").is_some_and(|v| v == "1"))
 }
 
+/// Experiment knob: pick counting-pass digits by the key count too.
+fn exp_radix_plan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("INFINO_EXP_RADIX_PLAN").is_some_and(|v| v == "1"))
+}
+
+/// Experiment knob: the posting count counting passes start at.
+fn exp_radix_min() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("INFINO_EXP_RADIX_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(RADIX_MIN_POSTINGS)
+    })
+}
+
 /// A dropped row in a packed remap. No output doc id takes it: a blob
 /// holds fewer than `u32::MAX` documents.
 const DROPPED: u32 = u32::MAX;
@@ -661,7 +678,7 @@ impl SortScratch {
         );
         self.tfs.clear();
         self.tfs.extend(postings.iter().map(|&(_, tf)| tf));
-        match self.keys.len() >= RADIX_MIN_POSTINGS {
+        match self.keys.len() >= exp_radix_min() {
             true => self.count_sort(u32::BITS - (max - min).leading_zeros()),
             false => self.keys.sort_unstable(),
         }
@@ -679,7 +696,15 @@ impl SortScratch {
     /// counts every pass's digits; a pass whose digit every key shares is
     /// skipped.
     fn count_sort(&mut self, bits: u32) {
-        let passes = bits.div_ceil(RADIX_MAX_DIGIT_BITS).max(1) as usize;
+        let mut passes = bits.div_ceil(RADIX_MAX_DIGIT_BITS).max(1) as usize;
+        if exp_radix_plan() {
+            // More, narrower passes while a pass's buckets outnumber half
+            // the keys: each pass walks its buckets twice.
+            let n = self.keys.len();
+            while passes < bits as usize && (1usize << bits.div_ceil(passes as u32)) > n / 2 {
+                passes += 1;
+            }
+        }
         let digit = bits.div_ceil(passes as u32);
         let buckets = 1usize << digit;
         let mask = buckets as u64 - 1;

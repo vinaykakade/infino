@@ -237,7 +237,7 @@ fn encode_group_as(
     let mut vi = 0usize;
     for &tf in tfs {
         firsts.push(values[vi]);
-        gaps.extend_from_slice(&values[vi + 1..vi + tf as usize]);
+        extend_run(gaps, &values[vi + 1..vi + tf as usize]);
         vi += tf as usize;
     }
     plan_stream(firsts, fixed, &mut scratch.plan_a, &mut scratch.candidates);
@@ -255,6 +255,48 @@ fn encode_group_as(
         }
     }
     out.push(packed);
+    write_stream(out, firsts, first_plan, fixed);
+    write_stream(out, gaps, gap_plan, fixed);
+}
+
+/// [`encode_group`] over runs that sit in `values`, run `i` at
+/// `starts[i]` with `tfs[i]` values, without gathering them first.
+pub(crate) fn encode_group_values(
+    out: &mut Vec<u8>,
+    tfs: &[u32],
+    values: &[u32],
+    starts: &[usize],
+    allow_leb128: bool,
+    scratch: &mut PackScratch,
+) {
+    let fixed = true;
+    let firsts = &mut scratch.lanes_a;
+    let gaps = &mut scratch.lanes_b;
+    firsts.clear();
+    gaps.clear();
+    for (&tf, &s) in tfs.iter().zip(starts) {
+        firsts.push(values[s]);
+        gaps.extend_from_slice(&values[s + 1..s + tf as usize]);
+    }
+    plan_stream(firsts, fixed, &mut scratch.plan_a, &mut scratch.candidates);
+    plan_stream(gaps, fixed, &mut scratch.plan_b, &mut scratch.candidates);
+    let (first_plan, gap_plan) = (&scratch.plan_a, &scratch.plan_b);
+    let packed_len = 1 + first_plan.bytes + gap_plan.bytes;
+    if allow_leb128 {
+        let leb_len: usize = 1
+            + firsts.iter().map(|&v| varint_len(v)).sum::<usize>()
+            + gaps.iter().map(|&v| varint_len(v)).sum::<usize>();
+        if leb_len <= packed_len {
+            out.push(GROUP_LEB128);
+            for (&tf, &s) in tfs.iter().zip(starts) {
+                for &v in &values[s..s + tf as usize] {
+                    push_varint(out, v);
+                }
+            }
+            return;
+        }
+    }
+    out.push(GROUP_PACKED_FIXED);
     write_stream(out, firsts, first_plan, fixed);
     write_stream(out, gaps, gap_plan, fixed);
 }

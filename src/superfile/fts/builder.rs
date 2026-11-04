@@ -4621,6 +4621,12 @@ fn encode_and_emit_term<W: Write>(
     )
 }
 
+/// Experiment knob: encode position groups straight from the merged runs.
+fn exp_direct_group() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("INFINO_EXP_DIRECT_GROUP").is_some_and(|v| v == "1"))
+}
+
 /// [`encode_term`], counted and timed in `profile`.
 fn encode_term_timed(
     pairs: &[(u32, u32)],
@@ -4756,6 +4762,15 @@ fn encode_term(
         // skip entry, coarse slot or block header, and no lane padding. Its positions sit inline in the body.
         profile.encode_short += 1;
         let positions = match term_positions.as_ref() {
+            Some(TermRuns::Values { values, starts }) if exp_direct_group() => {
+                let out = &mut scratch.pos_out;
+                out.clear();
+                let tfs = &mut scratch.tfs;
+                tfs.clear();
+                tfs.extend(pairs.iter().map(|&(_, tf)| tf));
+                encode_group_values(out, tfs, values, starts, true, &mut scratch.pack);
+                Some(out.as_slice())
+            }
             Some(runs) => {
                 // The whole term is one position group, inline in the body:
                 // its run values, packed or LEB128, whichever is smaller.
@@ -4886,6 +4901,21 @@ fn encode_term(
             let vals = &mut scratch.pos_vals;
             for (c, chunk) in pairs.chunks(block_len).enumerate() {
                 pos_block_offsets.push(pos_out.len() as u32);
+                if let (true, TermRuns::Values { values, starts }) = (exp_direct_group(), *runs) {
+                    let tfs = &mut scratch.tfs;
+                    tfs.clear();
+                    tfs.extend(chunk.iter().map(|&(_, tf)| tf));
+                    let first = c * block_len;
+                    encode_group_values(
+                        pos_out,
+                        tfs,
+                        values,
+                        &starts[first..first + chunk.len()],
+                        false,
+                        &mut scratch.pack,
+                    );
+                    continue;
+                }
                 vals.clear();
                 for (k, &(_, tf)) in chunk.iter().enumerate() {
                     runs.push_run(c * block_len + k, tf, &mut at, vals);
