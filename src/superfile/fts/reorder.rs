@@ -852,15 +852,8 @@ impl StatePool {
 /// Scratch reused down the whole recursion, so a split allocates
 /// nothing beyond what the first one needed.
 struct BisectState {
-    /// How many documents on each side of the split carry each term, left
-    /// then right. A term's two degrees are read and written together by
-    /// every pass over the partition, so they share a cache line rather than
-    /// costing a miss in each of two tables.
-    deg: Vec<[u32; 2]>,
-    /// Terms a swap moved since their move gains were last computed, with
-    /// repeats, while a round can still redo just those; `None` when the
-    /// next round has to compute every term's.
-    moved_terms: Option<Vec<u32>>,
+    deg_left: Vec<u32>,
+    deg_right: Vec<u32>,
     /// What moving any one left document lowers a term's cost by. It
     /// depends only on the term's degrees, so it is computed once per
     /// term per round rather than once per document carrying it.
@@ -890,8 +883,8 @@ struct BisectState {
 impl BisectState {
     fn new(n_terms: usize) -> Self {
         Self {
-            deg: vec![[0u32; 2]; n_terms],
-            moved_terms: None,
+            deg_left: vec![0u32; n_terms],
+            deg_right: vec![0u32; n_terms],
             move_gain_left: vec![0f32; n_terms],
             move_gain_right: vec![0f32; n_terms],
             cost_left: Vec::new(),
@@ -933,7 +926,7 @@ impl BisectState {
     /// unchanged, and the terms within a document keep their order, so the
     /// gain sums add in the same sequence and to the same float.
     fn localize(&mut self, fwd: &ForwardIndex, order: &[u32]) -> ForwardIndex {
-        // Outside a refine the degrees are all zeros — `clear_degrees` leaves it
+        // Outside a refine `deg_left` is all zeros — `clear_degrees` leaves it
         // that way and this runs in a refine's place — so it serves as the
         // global-to-local term map without a second table that size. Zero
         // means "not seen here"; a local id is held as `id + 1`.
@@ -943,7 +936,7 @@ impl BisectState {
         let mut n_local = 0u32;
         for &d in order.iter() {
             for &t in fwd.doc(d) {
-                let slot = &mut self.deg[t as usize][0];
+                let slot = &mut self.deg_left[t as usize];
                 if *slot == 0 {
                     n_local += 1;
                     *slot = n_local;
@@ -954,7 +947,7 @@ impl BisectState {
             starts.push(terms.len() as u32);
         }
         for &t in &self.touched {
-            self.deg[t as usize][0] = 0;
+            self.deg_left[t as usize] = 0;
         }
         self.touched.clear();
         ForwardIndex {
@@ -1149,23 +1142,12 @@ impl BisectState {
                     let (ld, rd) = (left[li], right[ri]);
                     // The degree tables follow the documents across.
                     for &t in fwd.doc(ld) {
-                        let [l, r] = &mut self.deg[t as usize];
-                        *l -= 1;
-                        *r += 1;
+                        self.deg_left[t as usize] -= 1;
+                        self.deg_right[t as usize] += 1;
                     }
                     for &t in fwd.doc(rd) {
-                        let [l, r] = &mut self.deg[t as usize];
-                        *r -= 1;
-                        *l += 1;
-                    }
-                    if let Some(moved) = &mut self.moved_terms {
-                        moved.extend_from_slice(fwd.doc(ld));
-                        moved.extend_from_slice(fwd.doc(rd));
-                        // Past one entry per term, a pass over every term is
-                        // the cheaper way to bring them up to date.
-                        if moved.len() > self.touched.len() {
-                            self.moved_terms = None;
-                        }
+                        self.deg_right[t as usize] -= 1;
+                        self.deg_left[t as usize] += 1;
                     }
                     left[li] = rd;
                     right[ri] = ld;
@@ -1175,7 +1157,10 @@ impl BisectState {
                     // every pair names its own two positions, so the swaps can
                     // land in any order. Degrees are counts, so adding them up
                     // in parallel ends at the same tables.
-                    let deg = as_atomic(self.deg.as_flattened_mut());
+                    let (deg_left, deg_right) = (
+                        as_atomic(&mut self.deg_left),
+                        as_atomic(&mut self.deg_right),
+                    );
                     let (lefts, rights) = (&left_gains[..swaps], &right_gains[..swaps]);
                     let (left_docs, right_docs) = (&*left, &*right);
                     lefts
@@ -1184,12 +1169,12 @@ impl BisectState {
                         .with_min_len(PAR_MIN_ITEMS)
                         .for_each(|(&l, &r)| {
                             for &t in fwd.doc(left_docs[key_pos(l) as usize]) {
-                                deg[flat_at(t, LEFT)].fetch_sub(1, Relaxed);
-                                deg[flat_at(t, RIGHT)].fetch_add(1, Relaxed);
+                                deg_left[t as usize].fetch_sub(1, Relaxed);
+                                deg_right[t as usize].fetch_add(1, Relaxed);
                             }
                             for &t in fwd.doc(right_docs[key_pos(r) as usize]) {
-                                deg[flat_at(t, RIGHT)].fetch_sub(1, Relaxed);
-                                deg[flat_at(t, LEFT)].fetch_add(1, Relaxed);
+                                deg_right[t as usize].fetch_sub(1, Relaxed);
+                                deg_left[t as usize].fetch_add(1, Relaxed);
                             }
                         });
                     for (&l, &r) in lefts.iter().zip(rights) {
@@ -1276,8 +1261,8 @@ impl BisectState {
     fn distinct_by_side(&self) -> [usize; 2] {
         self.touched.iter().fold([0, 0], |[left, right], &t| {
             [
-                left + usize::from(self.deg[t as usize][0] > 0),
-                right + usize::from(self.deg[t as usize][1] > 0),
+                left + usize::from(self.deg_left[t as usize] > 0),
+                right + usize::from(self.deg_right[t as usize] > 0),
             ]
         })
     }
@@ -1307,14 +1292,13 @@ impl BisectState {
     /// What term `t` costs across both halves of the current split.
     #[inline]
     fn term_split_cost(&self, t: usize, n_left: f32, n_right: f32) -> f64 {
-        let [dl, dr] = self.deg[t];
         let left = Side {
-            deg: dl,
+            deg: self.deg_left[t],
             size: n_left,
             costs: &self.cost_left,
         };
         let right = Side {
-            deg: dr,
+            deg: self.deg_right[t],
             size: n_right,
             costs: &self.cost_right,
         };
@@ -1329,7 +1313,8 @@ impl BisectState {
             // Each term's gains read only its own degrees and write only its
             // own entries, so the terms can be done in any order.
             let Self {
-                deg,
+                deg_left,
+                deg_right,
                 move_gain_left,
                 move_gain_right,
                 cost_left,
@@ -1338,14 +1323,14 @@ impl BisectState {
                 ..
             } = self;
             let (gain_left, gain_right) = (as_atomic(move_gain_left), as_atomic(move_gain_right));
-            let deg = &*deg;
+            let (deg_left, deg_right) = (&*deg_left, &*deg_right);
             let (cost_left, cost_right) = (cost_left.as_slice(), cost_right.as_slice());
             touched
                 .par_iter()
                 .with_min_len(PAR_MIN_ITEMS)
                 .for_each(|&t| {
                     let t = t as usize;
-                    let [dl, dr] = deg[t];
+                    let (dl, dr) = (deg_left[t], deg_right[t]);
                     let left = Side {
                         deg: dl,
                         size: n_left,
@@ -1365,14 +1350,9 @@ impl BisectState {
                 });
             return;
         }
-        // A term no swap moved keeps the gains it has: they are a function
-        // of its degrees and the split's sizes alone. So after a round that
-        // moved few documents only their terms are redone, and the next
-        // round's swaps start a fresh list.
-        let moved = self.moved_terms.replace(Vec::new());
-        for &t in moved.as_deref().unwrap_or(&self.touched) {
+        for &t in &self.touched {
             let t = t as usize;
-            let [dl, dr] = self.deg[t];
+            let (dl, dr) = (self.deg_left[t], self.deg_right[t]);
             let left = Side {
                 deg: dl,
                 size: n_left,
@@ -1390,11 +1370,6 @@ impl BisectState {
                 self.move_gain_right[t] = move_gain(&right, &left);
             }
         }
-        if let (Some(mut done), Some(fresh)) = (moved, self.moved_terms.as_mut()) {
-            // The list just read becomes the next round's, allocation and all.
-            done.clear();
-            mem::swap(&mut done, fresh);
-        }
     }
 
     /// Count each term's documents on either side of `mid` into the degree
@@ -1408,56 +1383,64 @@ impl BisectState {
     /// beyond the count itself; a pass over the whole vocabulary would.
     fn count_degrees(&mut self, fwd: &ForwardIndex, order: &[u32], mid: usize, parallel: bool) {
         if parallel {
-            let Self { deg, touched, .. } = self;
+            let Self {
+                deg_left,
+                deg_right,
+                touched,
+                ..
+            } = self;
             let (left, right) = order.split_at(mid);
             {
-                let deg = as_atomic(deg.as_flattened_mut());
+                let (deg_left, deg_right) = (as_atomic(deg_left), as_atomic(deg_right));
                 join(
                     || {
                         left.par_iter().with_min_len(PAR_MIN_ITEMS).for_each(|&d| {
                             for &t in fwd.doc(d) {
-                                deg[flat_at(t, LEFT)].fetch_add(1, Relaxed);
+                                deg_left[t as usize].fetch_add(1, Relaxed);
                             }
                         })
                     },
                     || {
                         right.par_iter().with_min_len(PAR_MIN_ITEMS).for_each(|&d| {
                             for &t in fwd.doc(d) {
-                                deg[flat_at(t, RIGHT)].fetch_add(1, Relaxed);
+                                deg_right[t as usize].fetch_add(1, Relaxed);
                             }
                         })
                     },
                 );
             }
-            let deg = &*deg;
+            let (deg_left, deg_right) = (&*deg_left, &*deg_right);
             touched.clear();
             touched.par_extend(
-                (0..deg.len() as u32)
+                (0..deg_left.len() as u32)
                     .into_par_iter()
                     .with_min_len(PAR_MIN_ITEMS)
-                    .filter(|&t| deg[t as usize] != [0, 0]),
+                    .filter(|&t| deg_left[t as usize] > 0 || deg_right[t as usize] > 0),
             );
             return;
         }
         for (i, &d) in order.iter().enumerate() {
-            let side = usize::from(i >= mid);
+            let side_left = i < mid;
             for &t in fwd.doc(d) {
-                let degs = &mut self.deg[t as usize];
                 // Seen on neither side yet: first sight in this partition.
-                if *degs == [0, 0] {
+                if self.deg_left[t as usize] == 0 && self.deg_right[t as usize] == 0 {
                     self.touched.push(t);
                 }
-                degs[side] += 1;
+                let slot = match side_left {
+                    true => &mut self.deg_left[t as usize],
+                    false => &mut self.deg_right[t as usize],
+                };
+                *slot += 1;
             }
         }
     }
 
     fn clear_degrees(&mut self) {
         for &t in &self.touched {
-            self.deg[t as usize] = [0, 0];
+            self.deg_left[t as usize] = 0;
+            self.deg_right[t as usize] = 0;
         }
         self.touched.clear();
-        self.moved_terms = None;
     }
 }
 
@@ -1517,26 +1500,14 @@ fn rank_by_gain(
 /// different documents do not wait on one another: summed one document at a
 /// time, every add waited on the one before it, and the gather spent its
 /// time in that chain rather than in its loads.
-///
-/// Up to the shortest document's length every lane has a term at every
-/// step, so that stretch is summed without asking each lane whether it has
-/// one; only the steps past it test. A document's terms are still added one
-/// after another in its own order, so the split changes no sum.
 fn lane_gains(fwd: &ForwardIndex, group: &[u32], move_gain: &[f32]) -> [f32; GAIN_LANES] {
     let mut terms: [&[u32]; GAIN_LANES] = [&[]; GAIN_LANES];
     for (slot, &d) in terms.iter_mut().zip(group) {
         *slot = fwd.doc(d);
     }
-    let shortest = terms.iter().map(|t| t.len()).min().unwrap_or(0);
     let longest = terms.iter().map(|t| t.len()).max().unwrap_or(0);
     let mut gains = [0.0f32; GAIN_LANES];
-    let heads = terms.map(|t| &t[..shortest]);
-    for k in 0..shortest {
-        for (gain, head) in gains.iter_mut().zip(&heads) {
-            *gain += move_gain[head[k] as usize];
-        }
-    }
-    for k in shortest..longest {
+    for k in 0..longest {
         for (gain, doc) in gains.iter_mut().zip(&terms) {
             if let Some(&t) = doc.get(k) {
                 *gain += move_gain[t as usize];
@@ -1606,18 +1577,6 @@ fn key_gain(key: u64) -> f32 {
 /// The position a [`rank_key`] was made from.
 fn key_pos(key: u64) -> u32 {
     key as u32
-}
-
-/// A term's left degree's place in the degree table viewed as flat words.
-const LEFT: usize = 0;
-/// Its right degree's.
-const RIGHT: usize = 1;
-
-/// Where term `t`'s degree on `side` sits in the degree table viewed as flat
-/// words, as the parallel passes view it.
-#[inline]
-fn flat_at(t: u32, side: usize) -> usize {
-    2 * t as usize + side
 }
 
 /// A table of 32-bit words viewed as atomics, so threads that each update
