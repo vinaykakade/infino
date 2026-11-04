@@ -623,7 +623,7 @@ fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bi
         });
         handed_on.extend(rest.into_iter().map(|(part, known)| (part, depth, known)));
         let docs: usize = here.iter().map(|(part, _)| part.len()).sum();
-        let split: Vec<(f64, [&mut [u32]; 2], usize)> = here
+        let split: Vec<(f64, [&mut [u32]; 2], (usize, usize))> = here
             .into_par_iter()
             .map(|(part, _)| {
                 let mid = part.len() / 2;
@@ -643,7 +643,7 @@ fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bi
         run.offer_reference(split.iter().map(|(gain, _, _)| gain).sum(), docs);
         level = split
             .into_iter()
-            .flat_map(|(_, halves, distinct)| halves.map(|half| (half, distinct)))
+            .flat_map(|(_, [left, right], (l, r))| [(left, l), (right, r)])
             .collect();
         depth += 1;
     }
@@ -662,14 +662,14 @@ fn split_parallel(
     pool: &StatePool,
     run: Bisect<'_>,
     may_localize: bool,
-    parent_distinct: usize,
+    distinct: usize,
 ) {
     if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
         return;
     }
     // A partition just renumbered goes straight to its split: its halves
     // decide afresh, so a partition is renumbered at most once.
-    if may_localize && localizing_pays(fwd, order, parent_distinct) {
+    if may_localize && localizing_pays(fwd, order, distinct) {
         let started = REPORT.then(Instant::now);
         let local = pool.with_state(|state| state.localize(fwd, order));
         if let Some(started) = started {
@@ -687,15 +687,7 @@ fn split_parallel(
             n_terms: local.n_terms,
             free: Mutex::new(Vec::new()),
         };
-        split_parallel(
-            &local,
-            &mut inner,
-            depth,
-            &inner_pool,
-            run,
-            false,
-            parent_distinct,
-        );
+        split_parallel(&local, &mut inner, depth, &inner_pool, run, false, distinct);
         apply_inner_order(order, &inner);
         return;
     }
@@ -739,11 +731,11 @@ fn split_parallel(
     let (left, right) = order.split_at_mut(mid);
     let (left_done, right_done) = join(
         || {
-            split_parallel(fwd, left, depth + 1, pool, run, true, distinct);
+            split_parallel(fwd, left, depth + 1, pool, run, true, distinct.0);
             REPORT.then(Instant::now)
         },
         || {
-            split_parallel(fwd, right, depth + 1, pool, run, true, distinct);
+            split_parallel(fwd, right, depth + 1, pool, run, true, distinct.1);
             REPORT.then(Instant::now)
         },
     );
@@ -771,14 +763,14 @@ fn split_parallel(
 /// the relationship between a partition and its vocabulary, which is the thing
 /// that actually decides whether the tables are oversized. Halving at minimum
 /// also bounds how often it can fire on any root-to-leaf path.
-fn localizing_pays(fwd: &ForwardIndex, order: &[u32], parent_distinct: usize) -> bool {
+fn localizing_pays(fwd: &ForwardIndex, order: &[u32], distinct: usize) -> bool {
     // An empty table cannot shrink, and without this a partition carrying no
     // terms at all satisfies the test against its own renumbering forever.
     if fwd.n_terms == 0 {
         return false;
     }
     if exp_localize_by_distinct() {
-        return parent_distinct.saturating_mul(2) <= fwd.n_terms;
+        return distinct.saturating_mul(2) <= fwd.n_terms;
     }
     let postings: usize = order.iter().map(|&d| fwd.doc(d).len()).sum();
     (postings as f64) * exp_localize_factor() <= fwd.n_terms as f64
@@ -797,8 +789,8 @@ fn exp_localize_factor() -> f64 {
 }
 
 /// Experiment: `INFINO_EXP_LOCALIZE_RULE=distinct` renumbers a partition once
-/// its parent's distinct terms, counted by the parent's refine, fill at most
-/// half the table.
+/// its own distinct terms, read off its parent's final degree tables, fill at
+/// most half the table.
 fn exp_localize_by_distinct() -> bool {
     static BY_DISTINCT: OnceLock<bool> = OnceLock::new();
     *BY_DISTINCT.get_or_init(|| env::var("INFINO_EXP_LOCALIZE_RULE").is_ok_and(|v| v == "distinct"))
@@ -868,8 +860,9 @@ struct BisectState {
     /// [`Self::flush`] adds them to the run's. Saves taking the shared lock
     /// once per split.
     levels: Vec<LevelReport>,
-    /// Distinct terms the last refine's partition carried.
-    last_distinct: usize,
+    /// Distinct terms the last refine left in each half, read off its final
+    /// degree tables.
+    last_distinct: (usize, usize),
 }
 
 impl BisectState {
@@ -885,7 +878,7 @@ impl BisectState {
             left_gains: Vec::new(),
             right_gains: Vec::new(),
             levels: Vec::new(),
-            last_distinct: usize::MAX,
+            last_distinct: (usize::MAX, usize::MAX),
         }
     }
 
@@ -956,12 +949,12 @@ impl BisectState {
         order: &mut [u32],
         depth: u32,
         run: Bisect<'_>,
-        parent_distinct: usize,
+        distinct: usize,
     ) {
         if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
             return;
         }
-        if localizing_pays(fwd, order, parent_distinct) {
+        if localizing_pays(fwd, order, distinct) {
             let started = REPORT.then(Instant::now);
             let local = self.localize(fwd, order);
             if let Some(started) = started {
@@ -996,8 +989,8 @@ impl BisectState {
         self.refine(fwd, order, mid, depth, false, run);
         let distinct = self.last_distinct;
         let (left, right) = order.split_at_mut(mid);
-        self.split(fwd, left, depth + 1, run, distinct);
-        self.split(fwd, right, depth + 1, run, distinct);
+        self.split(fwd, left, depth + 1, run, distinct.0);
+        self.split(fwd, right, depth + 1, run, distinct.1);
     }
 
     /// Move documents across the split while it lowers the cost, then
@@ -1226,7 +1219,12 @@ impl BisectState {
 
         self.left_gains = left_gains;
         self.right_gains = right_gains;
-        self.last_distinct = self.touched.len();
+        self.last_distinct = self.touched.iter().fold((0, 0), |(l, r), &t| {
+            (
+                l + usize::from(self.deg_left[t as usize] > 0),
+                r + usize::from(self.deg_right[t as usize] > 0),
+            )
+        });
         self.clear_degrees();
 
         let Some(started) = started else {
