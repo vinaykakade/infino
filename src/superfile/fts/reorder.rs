@@ -62,6 +62,14 @@ fn exp_knob(cell: &'static std::sync::OnceLock<u32>, name: &str) -> u32 {
             .unwrap_or(0)
     })
 }
+fn exp_lane() -> u32 {
+    static C: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    exp_knob(&C, "INFINO_EXP_LANE")
+}
+fn exp_sel() -> u32 {
+    static C: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    exp_knob(&C, "INFINO_EXP_SEL")
+}
 fn exp_pack() -> u32 {
     static C: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     exp_knob(&C, "INFINO_EXP_PACK")
@@ -1841,6 +1849,27 @@ fn lane_gains(fwd: &ForwardIndex, group: &[u32], move_gain: &[f32]) -> [f32; GAI
     let shortest = terms.iter().map(|t| t.len()).min().unwrap_or(0);
     let longest = terms.iter().map(|t| t.len()).max().unwrap_or(0);
     let mut gains = [0.0f32; GAIN_LANES];
+    if exp_lane() == 1 && longest > shortest {
+        // Past a lane's last term it adds +0.0, which leaves a sum that
+        // started at +0.0 unchanged: such a sum is never -0.0.
+        const NONE: [u32; 1] = [0];
+        let mut last: [&[u32]; GAIN_LANES] = [&NONE; GAIN_LANES];
+        let mut lens = [0usize; GAIN_LANES];
+        for ((slot, len), t) in last.iter_mut().zip(lens.iter_mut()).zip(&terms) {
+            *len = t.len();
+            if !t.is_empty() {
+                *slot = t;
+            }
+        }
+        for k in 0..longest {
+            for ((gain, doc), &len) in gains.iter_mut().zip(&last).zip(&lens) {
+                let i = k.min(doc.len() - 1);
+                let mask = 0u32.wrapping_sub(u32::from(k < len));
+                *gain += f32::from_bits(move_gain[doc[i] as usize].to_bits() & mask);
+            }
+        }
+        return gains;
+    }
     let heads = terms.map(|t| &t[..shortest]);
     for k in 0..shortest {
         for (gain, head) in gains.iter_mut().zip(&heads) {
@@ -1885,11 +1914,49 @@ fn order_leading_gains(gains: &mut [u64], want: usize, parallel: bool) {
     }
     // Linear-time partition around the `want`-th entry, then order only
     // what sits in front of it.
-    gains.select_nth_unstable(want);
+    if exp_sel() == 1 && !parallel && gains.len() >= 4096 {
+        radix_front(gains, want);
+    } else {
+        gains.select_nth_unstable(want);
+    }
     let head = &mut gains[..want];
     match parallel {
         true => head.par_sort_unstable(),
         false => head.sort_unstable(),
+    }
+}
+
+/// Leave the `want` smallest keys in front, in any order.
+fn radix_front(gains: &mut [u64], want: usize) {
+    const BITS: u32 = 11;
+    let shift = 64 - BITS;
+    let mut hist = [0u32; 1 << BITS];
+    for &k in gains.iter() {
+        hist[(k >> shift) as usize] += 1;
+    }
+    let mut below = 0usize;
+    let mut b = 0usize;
+    while below + hist[b] as usize <= want {
+        below += hist[b] as usize;
+        b += 1;
+    }
+    // Keys in buckets below `b` to the front, then bucket `b`'s.
+    let mut lo = 0usize;
+    for i in 0..gains.len() {
+        if ((gains[i] >> shift) as usize) < b {
+            gains.swap(lo, i);
+            lo += 1;
+        }
+    }
+    let mut hi = lo;
+    for i in lo..gains.len() {
+        if (gains[i] >> shift) as usize == b {
+            gains.swap(hi, i);
+            hi += 1;
+        }
+    }
+    if want > lo && want < hi {
+        gains[lo..hi].select_nth_unstable(want - lo);
     }
 }
 
