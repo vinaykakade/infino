@@ -3402,6 +3402,8 @@ impl SupertableWriter {
             .check_schema(&self.inner.manifest.load())
             .map_err(BuildError::from)?;
         let mut layer = None;
+        let t_pub = Instant::now();
+        let mut t_list = 0.0f64;
         let mut ticket = self.inner.append_queue.reserve();
         if let Some(storage) = &self.inner.options.storage {
             let list_span = detail_span!("publish.write_list").entered();
@@ -3415,6 +3417,7 @@ impl SupertableWriter {
                 &runtime,
             )?;
             drop(list_span);
+            t_list = t_pub.elapsed().as_secs_f64();
             let contributions = &batch.term_contributions;
             if !contributions.is_empty() {
                 let reserve_span =
@@ -3433,6 +3436,7 @@ impl SupertableWriter {
                 drop(reserve_span);
             }
         }
+        let t_reserved = t_pub.elapsed().as_secs_f64();
         let wait_span = detail_span!("publish.wait_turn").entered();
         let parked = ParkedPublish {
             number: ticket.number,
@@ -3445,8 +3449,20 @@ impl SupertableWriter {
         };
         let mut run = match self.inner.append_queue.lead_or_follow(&mut ticket, parked) {
             Turn::Lead(run) => run,
-            Turn::Published(result) => return result,
+            Turn::Published(result) => {
+                if crate::storage::io_counters::timeline_enabled() {
+                    info!(
+                        "[publish] follower list {:.0}ms layer {:.0}ms waited {:.0}ms",
+                        t_list * 1e3,
+                        (t_reserved - t_list) * 1e3,
+                        (t_pub.elapsed().as_secs_f64() - t_reserved) * 1e3
+                    );
+                }
+                return result;
+            }
         };
+        let t_lead = t_pub.elapsed().as_secs_f64();
+        let n_run = run.len();
         drop(wait_span);
         let _turn_span = detail_span!("publish.turn", publishes = run.len()).entered();
         // This ticket's own publish first, then the ones it took on, oldest
@@ -3468,6 +3484,15 @@ impl SupertableWriter {
             &runtime,
         );
         let published = published.map(drop);
+        if crate::storage::io_counters::timeline_enabled() {
+            info!(
+                "[publish] leader list {:.0}ms layer {:.0}ms waited {:.0}ms turn {:.0}ms run {n_run}",
+                t_list * 1e3,
+                (t_reserved - t_list) * 1e3,
+                (t_lead - t_reserved) * 1e3,
+                (t_pub.elapsed().as_secs_f64() - t_lead) * 1e3
+            );
+        }
         self.inner
             .append_queue
             .publish_followers(&mut ticket, &published);
