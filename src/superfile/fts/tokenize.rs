@@ -933,12 +933,44 @@ fn exp_ascii_runs() -> bool {
     *ON.get_or_init(|| std::env::var("INFINO_EXP_ASCII_RUNS").is_ok_and(|v| v == "1"))
 }
 
+/// Experiment knob: lowercase a word into the reused buffer instead of
+/// through a fresh `String`. Read once.
+fn exp_lower_inplace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INFINO_EXP_LOWER_INPLACE").is_ok_and(|v| v == "1"))
+}
+
+/// Append the lowercase form of `word` to `buf`, exactly as
+/// `str::to_lowercase` produces it.
+///
+/// `str::to_lowercase` maps each character through `char::to_lowercase`
+/// except `Σ`, whose form depends on its neighbours (Final_Sigma). A
+/// word without `Σ` is therefore folded character by character straight
+/// into `buf`, with no intermediate allocation; a word with one takes
+/// the library routine.
+#[inline]
+fn lower_into(buf: &mut String, word: &str) {
+    if exp_lower_inplace() && !word.contains('\u{03A3}') {
+        buf.extend(word.chars().flat_map(char::to_lowercase));
+    } else {
+        buf.push_str(&word.to_lowercase());
+    }
+}
+
 /// Offset of the first non-ASCII byte of `bytes`, if any. Eight bytes
 /// at a time: the high bit of every byte of a word is one mask test.
 #[inline]
 fn first_non_ascii(bytes: &[u8]) -> Option<usize> {
     const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
     let mut i = 0usize;
+    while i + 32 <= bytes.len() {
+        let w =
+            |k: usize| u64::from_le_bytes(bytes[i + k..i + k + 8].try_into().expect("eight bytes"));
+        if (w(0) | w(8) | w(16) | w(24)) & HIGH_BITS != 0 {
+            break;
+        }
+        i += 32;
+    }
     while i + 8 <= bytes.len() {
         let word = u64::from_le_bytes(bytes[i..i + 8].try_into().expect("eight bytes"));
         let high = word & HIGH_BITS;
@@ -1040,7 +1072,7 @@ fn tokenize_general<F: FnMut(&str)>(text: &str, buf: &mut String, f: &mut F) {
             emit_capped(word, f);
         } else {
             buf.clear();
-            buf.push_str(&word.to_lowercase());
+            lower_into(buf, word);
             emit_capped(buf.as_str(), f);
         }
     }
@@ -1072,7 +1104,7 @@ impl StandardTokenizer {
     #[inline]
     pub fn tokenize_each_inline<F: FnMut(&str)>(&self, text: &str, mut f: F) {
         let mut buf = String::new();
-        if exp_ascii_runs() {
+        if exp_ascii_runs() && !text.is_ascii() {
             tokenize_mixed(text, &mut buf, &mut f);
             return;
         }
@@ -1111,7 +1143,7 @@ impl StandardTokenizer {
                 // word-final `Σ` lowercases to `ς`, but to `σ` elsewhere);
                 // a char-by-char fold has no word context and would emit
                 // `σ` in both spots.
-                buf.push_str(&word.to_lowercase());
+                lower_into(&mut buf, word);
                 emit_capped(&buf, &mut f);
             }
         }
@@ -1719,6 +1751,34 @@ mod tests {
             }
             let text: String = chars.into_iter().collect();
             prop_assert_eq!(mixed_tokens(&text), whole_input_tokens(&text), "on {:?}", text);
+        }
+    }
+
+    proptest! {
+        /// The per-character fold equals `str::to_lowercase` on any word
+        /// without `Σ` — the only character whose fold reads context.
+        #[test]
+        fn char_fold_matches_to_lowercase_without_capital_sigma(word in "\\PC{0,24}") {
+            prop_assume!(!word.contains('\u{03A3}'));
+            let folded: String = word.chars().flat_map(char::to_lowercase).collect();
+            prop_assert_eq!(folded, word.to_lowercase());
+        }
+    }
+
+    #[test]
+    fn char_fold_matches_to_lowercase_over_every_scalar_value() {
+        for c in (0..=0x10FFFFu32).filter_map(char::from_u32) {
+            if c == '\u{03A3}' {
+                continue;
+            }
+            let s = format!("A{c}B{c}");
+            let folded: String = s.chars().flat_map(char::to_lowercase).collect();
+            assert_eq!(
+                folded,
+                s.to_lowercase(),
+                "fold diverged for U+{:04X}",
+                c as u32
+            );
         }
     }
 
