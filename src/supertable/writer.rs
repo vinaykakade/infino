@@ -4164,6 +4164,11 @@ fn exp_lane_min_chunk_rows() -> usize {
     *V.get_or_init(|| exp_env("INFINO_EXP_LANE_MIN_CHUNK", 1024))
 }
 
+fn exp_put_hedge() -> bool {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| exp_env("INFINO_EXP_PUT_HEDGE", 0)) != 0
+}
+
 fn exp_pub_join() -> bool {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| exp_env("INFINO_EXP_PUB_JOIN", 0)) != 0
@@ -13483,10 +13488,38 @@ async fn put_new_superfile_bytes(
     }
     let result = if (bytes.len() as u64) >= multipart_threshold {
         put_superfile_multipart(storage.as_ref(), &path, bytes).await
+    } else if exp_put_hedge() {
+        put_overwrite_hedged(storage.as_ref(), &path, bytes).await
     } else {
         storage.put_overwrite(&path, bytes).await
     };
     result.map_err(SupertableCommitError::from)
+}
+
+/// [`put_new_hedged`] for an overwriting PUT of the same bytes.
+async fn put_overwrite_hedged(
+    storage: &dyn StorageProvider,
+    uri: &str,
+    bytes: Bytes,
+) -> Result<(), StorageError> {
+    let delay = stuck_after(bytes.len() as u64);
+    let mut first = pin!(storage.put_overwrite(uri, bytes.clone()));
+    tokio::select! {
+        answer = &mut first => answer.map(|_| ()),
+        () = sleep(delay) => {
+            let mut second = pin!(storage.put_overwrite(uri, bytes));
+            tokio::select! {
+                answer = &mut first => match answer {
+                    Ok(_) => Ok(()),
+                    Err(_) => second.await.map(drop),
+                },
+                answer = &mut second => match answer {
+                    Ok(_) => Ok(()),
+                    Err(_) => first.await.map(drop),
+                },
+            }
+        }
+    }
 }
 
 /// Put `sealed` at `dest` without copying: a hard link next to `dest`, then
