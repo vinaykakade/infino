@@ -78,6 +78,10 @@ fn exp_loc() -> u32 {
     static C: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     exp_knob(&C, "INFINO_EXP_LOC")
 }
+fn exp_first() -> u32 {
+    static C: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    exp_knob(&C, "INFINO_EXP_FIRST")
+}
 fn exp_pack() -> u32 {
     static C: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     exp_knob(&C, "INFINO_EXP_PACK")
@@ -918,6 +922,7 @@ struct BisectState {
     pos: Vec<u32>,
     was: Vec<u32>,
     rerank: Rerank,
+    first_frac: Vec<f32>,
 }
 
 impl BisectState {
@@ -927,6 +932,7 @@ impl BisectState {
             pos: Vec::new(),
             was: Vec::new(),
             rerank: Rerank::default(),
+            first_frac: Vec::new(),
             deg: vec![[0u32; 2]; n_terms],
             moved_terms: None,
             move_gain_left: vec![0f32; n_terms],
@@ -1296,11 +1302,28 @@ impl BisectState {
                 // the leading `ready` entries need to be in order, and why
                 // extending the block cannot change the outcome.
                 let pairs = left_gains.len().min(right_gains.len());
+                let first_hint = match (round, exp_first()) {
+                    (0, k) if k > 0 => self
+                        .first_frac
+                        .get(depth as usize)
+                        .copied()
+                        .filter(|f| *f >= 0.0)
+                        .map(|f| {
+                            let margin = if k == 2 { 1.5 } else { 1.25 };
+                            ((f * pairs as f32 * margin).ceil() as usize)
+                                .max(SWAP_BLOCK)
+                                .min(pairs)
+                        }),
+                    _ => None,
+                };
                 let mut ready = match exp_ready() {
                     1 => last_swaps.max(SWAP_BLOCK).min(pairs),
                     2 => (last_swaps + last_swaps / 4).max(SWAP_BLOCK).min(pairs),
                     _ => last_swaps.saturating_mul(2).max(SWAP_BLOCK).min(pairs),
                 };
+                if let Some(hint) = first_hint {
+                    ready = hint;
+                }
                 order_leading_gains(&mut left_gains, ready, parallel);
                 order_leading_gains(&mut right_gains, ready, parallel);
                 if let Some(step) = step {
@@ -1405,6 +1428,14 @@ impl BisectState {
                 swaps
             };
             last_swaps = moved;
+            if round == 0 && exp_first() > 0 {
+                let d = depth as usize;
+                if self.first_frac.len() <= d {
+                    self.first_frac.resize(d + 1, -1.0);
+                }
+                let pairs = mid.min(order.len() - mid).max(1);
+                self.first_frac[d] = moved as f32 / pairs as f32;
+            }
             level.rounds += 1;
             if moved == 0 {
                 end = SplitEnd::Settled;
