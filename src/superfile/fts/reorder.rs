@@ -1071,13 +1071,10 @@ impl BisectState {
                 let mut gain = 0.0f64;
                 while swaps < pairs {
                     if swaps == ready {
-                        // The first `swaps` entries are already the largest,
-                        // in order, and every other entry sits behind them:
-                        // ordering the next ones from the rest alone ends at
-                        // the order a pass over the whole list would.
-                        ready = (ready * 2).min(pairs);
-                        order_leading_gains(&mut left_gains[swaps..], ready - swaps, parallel);
-                        order_leading_gains(&mut right_gains[swaps..], ready - swaps, parallel);
+                        let next = (ready * 2).min(pairs);
+                        extend_ordered_prefix(&mut left_gains, ready, next, parallel);
+                        extend_ordered_prefix(&mut right_gains, ready, next, parallel);
+                        ready = next;
                     }
                     let (l, r) = (left_gains[swaps], right_gains[swaps]);
                     let pair_gain = key_gain(l) + key_gain(r);
@@ -1454,6 +1451,14 @@ fn lane_gains(fwd: &ForwardIndex, group: &[u32], move_gain: &[f32]) -> [f32; GAI
     gains
 }
 
+/// Extend the ordered prefix of `gains` from its first `ordered` entries to
+/// its first `ready`. The first `ordered` are already the smallest keys, in
+/// order, and every other entry sits behind them, so ordering the next ones
+/// from the rest alone ends at the order a pass over the whole list would.
+fn extend_ordered_prefix(gains: &mut [u64], ordered: usize, ready: usize, parallel: bool) {
+    order_leading_gains(&mut gains[ordered..], ready - ordered, parallel);
+}
+
 /// Put the `want` highest-gain entries at the front of `gains`, in the
 /// order a full sort would have put them; leave the rest unordered.
 ///
@@ -1603,56 +1608,122 @@ mod tests {
     use super::*;
 
     /// Documents in the lane-gain test: several whole lane groups and a
-    /// ragged last one.
-    const LANE_TEST_DOCS: usize = 8 * GAIN_LANES + 3;
+    /// ragged last one; and enough for the parallel ranking to cut several
+    /// stretches, the last one ragged too.
+    const LANE_TEST_DOCS: [usize; 2] = [8 * GAIN_LANES + 3, 2 * PAR_MIN_ITEMS + GAIN_LANES + 5];
     /// Terms the lane-gain test's documents draw from.
     const LANE_TEST_TERMS: u32 = 1000;
+    /// The longest document in the lane-gain test, in terms.
+    const LANE_TEST_MAX_LEN: usize = 23;
 
     /// Summed side by side, each document's gain is the one a
     /// document-at-a-time loop adds up, bit for bit, whatever the lengths
     /// of the documents grouped with it — none, one term, or longer than
-    /// any other in its group.
+    /// any other in its group — and the ranking keys are the ones that loop
+    /// makes, serial or parallel.
     #[test]
     fn lane_gains_add_each_document_as_one_at_a_time_does() {
-        let mut rng = StdRng::seed_from_u64(7);
-        let docs: Vec<Vec<u32>> = (0..LANE_TEST_DOCS)
-            .map(|d| {
-                let len = (d * 5) % 23;
-                (0..len)
-                    .map(|_| rng.random_range(0..LANE_TEST_TERMS))
-                    .collect()
-            })
-            .collect();
-        let fwd = ForwardIndex::from_docs(&docs);
-        let move_gain: Vec<f32> = (0..LANE_TEST_TERMS)
-            .map(|_| rng.random_range(-1.0e3f32..1.0e3))
-            .collect();
-        let order: Vec<u32> = (0..LANE_TEST_DOCS as u32).rev().collect();
-        for group in order.chunks(GAIN_LANES) {
-            let gains = lane_gains(&fwd, group, &move_gain);
-            for (gain, &d) in gains.iter().zip(group) {
-                let mut one = 0.0f32;
+        for n_docs in LANE_TEST_DOCS {
+            let mut rng = StdRng::seed_from_u64(n_docs as u64);
+            let docs: Vec<Vec<u32>> = (0..n_docs)
+                .map(|d| {
+                    let len = (d * 5) % LANE_TEST_MAX_LEN;
+                    (0..len)
+                        .map(|_| rng.random_range(0..LANE_TEST_TERMS))
+                        .collect()
+                })
+                .collect();
+            let fwd = ForwardIndex::from_docs(&docs);
+            let move_gain: Vec<f32> = (0..LANE_TEST_TERMS)
+                .map(|_| rng.random_range(-1.0e3f32..1.0e3))
+                .collect();
+            let one_at_a_time = |d: u32| {
+                let mut gain = 0.0f32;
                 for &t in fwd.doc(d) {
-                    one += move_gain[t as usize];
+                    gain += move_gain[t as usize];
                 }
-                assert_eq!(gain.to_bits(), one.to_bits(), "document {d}");
+                gain
+            };
+            let order: Vec<u32> = (0..n_docs as u32).rev().collect();
+            for group in order.chunks(GAIN_LANES) {
+                let gains = lane_gains(&fwd, group, &move_gain);
+                for (gain, &d) in gains.iter().zip(group) {
+                    assert_eq!(gain.to_bits(), one_at_a_time(d).to_bits(), "document {d}");
+                }
             }
-        }
-        for parallel in [false, true] {
-            let mut keys = Vec::new();
-            rank_by_gain(&fwd, &order, &move_gain, parallel, &mut keys);
             let expected: Vec<u64> = order
                 .iter()
                 .enumerate()
-                .map(|(i, &d)| {
-                    let mut one = 0.0f32;
-                    for &t in fwd.doc(d) {
-                        one += move_gain[t as usize];
-                    }
-                    rank_key(one, i as u32)
+                .map(|(i, &d)| rank_key(one_at_a_time(d), i as u32))
+                .collect();
+            for parallel in [false, true] {
+                let mut keys = Vec::new();
+                rank_by_gain(&fwd, &order, &move_gain, parallel, &mut keys);
+                assert_eq!(keys, expected, "docs={n_docs} parallel={parallel}");
+            }
+        }
+    }
+
+    /// Entry counts the ordered-prefix test ranks: empty, one, around the
+    /// first block, odd, and several doublings past it.
+    const PREFIX_TEST_LENS: [usize; 9] = [
+        0,
+        1,
+        2,
+        SWAP_BLOCK - 1,
+        SWAP_BLOCK,
+        SWAP_BLOCK + 1,
+        3 * SWAP_BLOCK + 7,
+        1_001,
+        PAR_MIN_ITEMS + 13,
+    ];
+    /// Distinct gains the ordered-prefix test draws from, few enough that
+    /// many entries tie on the gain and are ordered by position.
+    const PREFIX_TEST_GAINS: i32 = 40;
+
+    /// The swap loop's way of growing its ordered prefix — order the first
+    /// `ready` entries, then on each doubling order only the next ones from
+    /// the entries behind the prefix — leaves every prefix it reaches as a
+    /// full sort of the whole list would, from any first `ready` and at
+    /// every size, odd and tiny ones included. Each step is checked before
+    /// the next, as the swap loop reads it.
+    #[test]
+    fn a_doubled_prefix_orders_as_a_full_sort_does() {
+        let mut rng = StdRng::seed_from_u64(11);
+        for len in PREFIX_TEST_LENS {
+            let keys: Vec<u64> = (0..len as u32)
+                .map(|pos| {
+                    let gain = rng.random_range(-PREFIX_TEST_GAINS..PREFIX_TEST_GAINS) as f32;
+                    rank_key(gain, pos)
                 })
                 .collect();
-            assert_eq!(keys, expected, "parallel={parallel}");
+            let mut sorted = keys.clone();
+            sorted.sort_unstable();
+            for first in [1, 2, 3, SWAP_BLOCK] {
+                for parallel in [false, true] {
+                    let mut gains = keys.clone();
+                    let mut ready = first.min(len);
+                    order_leading_gains(&mut gains, ready, parallel);
+                    loop {
+                        assert_eq!(
+                            gains[..ready],
+                            sorted[..ready],
+                            "len={len} first={first} ready={ready} parallel={parallel}"
+                        );
+                        if ready == len {
+                            break;
+                        }
+                        // The swap loop doubles once it has used the
+                        // whole prefix, with the step it takes there.
+                        let next = (ready * 2).min(len);
+                        extend_ordered_prefix(&mut gains, ready, next, parallel);
+                        ready = next;
+                    }
+                    let mut all = gains.clone();
+                    all.sort_unstable();
+                    assert_eq!(all, sorted, "the entries are a permutation");
+                }
+            }
         }
     }
 
