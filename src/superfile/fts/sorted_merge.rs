@@ -220,6 +220,12 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         .collect())
 }
 
+/// Experiment knob: look a decoded run's doc ids up together.
+fn exp_block_remap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("INFINO_EXP_BLOCK_REMAP").is_some_and(|v| v == "1"))
+}
+
 /// A dropped row in a packed remap. No output doc id takes it: a blob
 /// holds fewer than `u32::MAX` documents.
 const DROPPED: u32 = u32::MAX;
@@ -406,6 +412,8 @@ struct TermWork {
     run_starts: Vec<usize>,
     positions_buf: Vec<u32>,
     sort_scratch: SortScratch,
+    /// The output doc ids of the run of postings being read.
+    block_out: Vec<u32>,
 }
 
 impl TermWork {
@@ -414,7 +422,7 @@ impl TermWork {
         self.postings.capacity() * size_of::<(u32, u32)>()
             + self.runs.capacity() * size_of::<u32>()
             + self.run_starts.capacity() * size_of::<usize>()
-            + self.positions_buf.capacity() * size_of::<u32>()
+            + (self.positions_buf.capacity() + self.block_out.capacity()) * size_of::<u32>()
             + self.sort_scratch.capacity_bytes()
     }
 }
@@ -519,34 +527,71 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
             run_starts,
             positions_buf,
             sort_scratch,
+            block_out,
         } = work;
         postings.clear();
         runs.clear();
         run_starts.clear();
         let mut ascending = true;
-        for &(i, value) in term_inputs {
-            let remap = &self.remaps[i];
-            self.readers[i]
-                .for_each_posting_in(
-                    self.column_id,
-                    once((term, value)),
-                    positions_buf,
-                    |_, doc, tf, pos| {
-                        let out_doc = remap[doc as usize];
-                        if out_doc != DROPPED {
-                            debug_assert!(
-                                pos.is_empty() || pos.len() == tf as usize,
-                                "sorted merge: a position run must hold tf positions"
-                            );
-                            ascending &= postings.last().is_none_or(|&(d, _)| d < out_doc);
-                            postings.push((out_doc, tf));
-                            run_starts.push(runs.len());
-                            push_run_values(runs, pos);
-                        }
-                        Ok(())
-                    },
-                )
-                .map_err(read_error)?;
+        if exp_block_remap() {
+            // Each run of doc ids the reader decodes is looked up in one
+            // tight loop, so the remap loads miss the cache side by side
+            // rather than one per posting between the run decodes.
+            let block_out = std::cell::RefCell::new(block_out);
+            let next = std::cell::Cell::new(0usize);
+            for &(i, value) in term_inputs {
+                let remap = &self.remaps[i];
+                self.readers[i]
+                    .for_each_posting_block_in(
+                        self.column_id,
+                        once((term, value)),
+                        positions_buf,
+                        |docs| {
+                            let mut out = block_out.borrow_mut();
+                            out.clear();
+                            out.extend(docs.iter().map(|&d| remap[d as usize]));
+                            next.set(0);
+                        },
+                        |_, _, tf, pos| {
+                            let k = next.get();
+                            next.set(k + 1);
+                            let out_doc = block_out.borrow()[k];
+                            if out_doc != DROPPED {
+                                ascending &= postings.last().is_none_or(|&(d, _)| d < out_doc);
+                                postings.push((out_doc, tf));
+                                run_starts.push(runs.len());
+                                push_run_values(runs, pos);
+                            }
+                            Ok(())
+                        },
+                    )
+                    .map_err(read_error)?;
+            }
+        } else {
+            for &(i, value) in term_inputs {
+                let remap = &self.remaps[i];
+                self.readers[i]
+                    .for_each_posting_in(
+                        self.column_id,
+                        once((term, value)),
+                        positions_buf,
+                        |_, doc, tf, pos| {
+                            let out_doc = remap[doc as usize];
+                            if out_doc != DROPPED {
+                                debug_assert!(
+                                    pos.is_empty() || pos.len() == tf as usize,
+                                    "sorted merge: a position run must hold tf positions"
+                                );
+                                ascending &= postings.last().is_none_or(|&(d, _)| d < out_doc);
+                                postings.push((out_doc, tf));
+                                run_starts.push(runs.len());
+                                push_run_values(runs, pos);
+                            }
+                            Ok(())
+                        },
+                    )
+                    .map_err(read_error)?;
+            }
         }
         if postings.is_empty() {
             return Ok(None);

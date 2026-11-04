@@ -1672,6 +1672,20 @@ impl FtsReader {
         column_id: u32,
         entries: impl Iterator<Item = (&'t [u8], DictEntry)>,
         positions_buf: &mut Vec<u32>,
+        emit: impl FnMut(&[u8], u32, u32, &[u32]) -> Result<(), FtsError>,
+    ) -> Result<(), FtsError> {
+        self.for_each_posting_block_in(column_id, entries, positions_buf, |_| {}, emit)
+    }
+
+    /// [`Self::for_each_posting_in`], also handing `on_block` the doc ids
+    /// of each run of postings before they are emitted one by one: a
+    /// block of a long list, a short list whole, an inlined posting alone.
+    pub(crate) fn for_each_posting_block_in<'t>(
+        &self,
+        column_id: u32,
+        entries: impl Iterator<Item = (&'t [u8], DictEntry)>,
+        positions_buf: &mut Vec<u32>,
+        mut on_block: impl FnMut(&[u32]),
         mut emit: impl FnMut(&[u8], u32, u32, &[u32]) -> Result<(), FtsError>,
     ) -> Result<(), FtsError> {
         let col_meta = &self.columns[column_id as usize];
@@ -1681,6 +1695,7 @@ impl FtsReader {
         for (term, packed) in entries {
             match packed {
                 DictEntry::Inline { doc_id, tf } => {
+                    on_block(&[doc_id]);
                     // A positional column only inlines tf == 1 postings; the
                     // slot then carries the term's single position and tf is
                     // implied 1. Non-positional: `tf` is the frequency, no
@@ -1708,6 +1723,7 @@ impl FtsReader {
                         // A short body's positions are one group, inline
                         // after its postings.
                         let position_bytes = decoded.positions_at.map(|at| term_bytes.slice(at..));
+                        on_block(&d[..decoded.n]);
                         let mut group = GroupIndex::default();
                         if let Some(bytes) = &position_bytes {
                             group
@@ -1781,6 +1797,7 @@ impl FtsReader {
                                     ))
                                 })?;
                         }
+                        on_block(&cursor.block_doc_ids[cursor.pos..cursor.block_n]);
                         while cursor.pos < cursor.block_n {
                             let doc_id = cursor.block_doc_ids[cursor.pos];
                             let tf = cursor.block_tfs[cursor.pos];

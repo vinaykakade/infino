@@ -67,7 +67,7 @@ impl TermRuns<'_> {
             }
             Self::Values { values, starts } => {
                 let start = starts[i];
-                out.extend_from_slice(&values[start..start + tf as usize]);
+                extend_run(out, &values[start..start + tf as usize]);
             }
         }
     }
@@ -257,6 +257,26 @@ fn encode_group_as(
     out.push(packed);
     write_stream(out, firsts, first_plan, fixed);
     write_stream(out, gaps, gap_plan, fixed);
+}
+
+/// Experiment knob: copy short runs value by value.
+fn exp_small_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("INFINO_EXP_SMALL_COPY").is_some_and(|v| v == "1"))
+}
+
+/// Append `run` to `out`. Most runs are a few values, for which a call
+/// into the general memory copy costs more than the copy.
+#[inline]
+fn extend_run(out: &mut Vec<u32>, run: &[u32]) {
+    if exp_small_copy() && run.len() <= 8 {
+        out.reserve(run.len());
+        for &v in run {
+            out.push(v);
+        }
+    } else {
+        out.extend_from_slice(run);
+    }
 }
 
 /// The cheapest `(width, exceptions)` for one stream: a byte of width, a
@@ -639,7 +659,7 @@ impl GroupIndex {
             GroupKind::Bulk => {
                 let base = out.len();
                 out.push(*self.firsts.get(pair)?);
-                out.extend_from_slice(self.gaps.get(start..start + tf as usize - 1)?);
+                extend_run(out, self.gaps.get(start..start + tf as usize - 1)?);
                 prefix_sum_in_place(&mut out[base..])
             }
         }
