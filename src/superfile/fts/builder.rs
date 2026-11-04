@@ -1869,6 +1869,33 @@ fn term_head(
     let depth = enc.head_depth;
     heap.clear();
     out.df = pairs.len() as u64;
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let small = *K.get_or_init(|| std::env::var("INFINO_EXP_SMALL_HEAD").is_ok());
+    if small && pairs.len() <= depth {
+        let key = |(doc, tf): (u32, u32)| {
+            bm25::tf_factor(
+                tf,
+                enc.params
+                    .dl_norm_k1(bm25::stored_len(enc.doc_lengths[doc as usize]), enc.avgdl),
+            )
+        };
+        kept.clear();
+        kept.extend(pairs.iter().copied().zip(scores.iter().copied()));
+        kept.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        out.bound = kept.iter().map(|&(d, _)| key(d)).fold(0.0f32, f32::max);
+        out.tail = 0.0;
+        out.facts.clear();
+        push_head(
+            &mut out.facts,
+            kept.iter().map(|&((doc, tf), _)| {
+                let row = enc.rows.map_or(doc, |rows| rows[doc as usize]);
+                (row, tf, bm25::quantize_len(enc.doc_lengths[doc as usize]))
+            }),
+        );
+        out.avgdl = enc.avgdl;
+        out.params = enc.params;
+        return;
+    }
     for (&(doc, tf), &score) in pairs.iter().zip(scores) {
         if heap.len() <= depth {
             heap.push(TopKEntry(score, (doc, tf)));

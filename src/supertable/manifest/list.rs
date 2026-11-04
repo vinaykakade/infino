@@ -968,6 +968,13 @@ impl<'a> CountedStr<'a> {
 impl PartialEq for CountedStr<'_> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
+        static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let short = *K.get_or_init(|| std::env::var("INFINO_EXP_SHORT_EQ").is_ok());
+        if short {
+            return self.head == other.head
+                && self.len == other.len
+                && (self.len <= 8 || self.tail() == other.tail());
+        }
         self.head == other.head && self.len == other.len && self.tail() == other.tail()
     }
 }
