@@ -2771,6 +2771,71 @@ impl SupertableWriter {
         // A spawned task starts no span of its own, so each piece's is
         // parented here to read beside its append's.
         let parent = Span::current();
+        let (user_batch, sealed, superfiles) = if exp_early_up() {
+            // Each piece is prepared and starts its upload as soon as it is
+            // built, while the others are still building.
+            let inner = Arc::clone(&self.inner);
+            let stem_owned = stem.map(str::to_owned);
+            let runtime = self.inner.query_runtime();
+            let up_manifest = Arc::clone(&manifest);
+            let results: Vec<(
+                Option<PreparedSuperfile>,
+                Option<tokio::task::JoinHandle<Result<(), SupertableCommitError>>>,
+            )> = run_spawned(
+                pool,
+                (0..n_pieces).collect(),
+                move |i, _| {
+                    let _span = detail_span!("piece.build", parent: &parent, piece = i).entered();
+                    let out = timed_kernel(&piece_stats, || {
+                        let rows = piece_batches(&batches, bounds[i], bounds[i + 1]);
+                        build_piece(
+                            PieceRows::Lanes {
+                                batches: &rows,
+                                lanes: Arc::clone(&frozen),
+                                piece: i,
+                            },
+                            &piece_options,
+                            &piece_manifest,
+                            piece_options.vector_layout,
+                            None,
+                        )
+                    })?;
+                    let Some(mut p) =
+                        prepare_superfile_named(&inner, &up_manifest, out, stem_owned.as_deref())?
+                    else {
+                        return Ok((None, None));
+                    };
+                    p.entry = finish_superfile_entry(p.entry, None)?;
+                    let upload = match (p.bytes_for_storage.take(), inner.options.storage.as_ref()) {
+                        (Some((key, bytes)), Some(storage)) => {
+                            let storage = Arc::clone(storage);
+                            let threshold = inner.options.put_multipart_threshold_bytes;
+                            Some(runtime.spawn(async move {
+                                put_new_superfile_bytes(&storage, threshold, key, bytes).await
+                            }))
+                        }
+                        (taken, _) => {
+                            p.bytes_for_storage = taken;
+                            None
+                        }
+                    };
+                    Ok((Some(p), upload))
+                },
+                seal_task_lost,
+            )?;
+            drop(pieces_span);
+            let sealed = sealing.elapsed();
+            let mut prepared = Vec::with_capacity(results.len());
+            let mut uploads = Vec::new();
+            for (p, u) in results {
+                prepared.extend(p);
+                uploads.extend(u);
+            }
+            let superfiles = prepared.len();
+            let mut batch = collect_prepared_superfiles(&self.inner, prepared)?;
+            batch.uploads = uploads;
+            (batch, sealed, superfiles)
+        } else {
         let outputs: Vec<ShardOutput> = run_spawned(
             pool,
             (0..n_pieces).collect(),
@@ -2799,6 +2864,8 @@ impl SupertableWriter {
         let cell_hints = vec![None; superfiles];
         let user_batch =
             prepare_user_superfile_batch(&self.inner, &manifest, outputs, cell_hints, stem)?;
+            (user_batch, sealed, superfiles)
+        };
         let prepared = sealing.elapsed();
         let output_stats = self
             .op_stats
@@ -3390,6 +3457,11 @@ impl SupertableWriter {
         list_metadata: CommitListMetadata,
     ) -> Result<(), BuildError> {
         let runtime = self.inner.query_runtime();
+        let mut uploads = Some(mem::take(&mut batch.uploads));
+        if !self.shared || batch.new_entries.is_empty() || self.inner.options.storage.is_none() {
+            bridge_on_runtime(await_uploads(uploads.take().unwrap_or_default()), &runtime)
+                .map_err(BuildError::from)?;
+        }
         if !self.shared || batch.new_entries.is_empty() {
             return bridge_on_runtime(
                 persist_superfile_publish_batch_async(&self.inner, batch, list_metadata, None),
@@ -3420,13 +3492,17 @@ impl SupertableWriter {
                     (contributions, reserved)
                 })
             });
+            let uploads = uploads.take().unwrap_or_default();
+            let pending = &mut batch.pending_storage_writes;
             let listed = bridge_on_runtime(
-                write_superfile_list(
-                    storage,
-                    &self.inner.options,
-                    &mut batch.pending_storage_writes,
-                    &mut Vec::new(),
-                ),
+                async move {
+                    let mut replaces = Vec::new();
+                    let (a, b) = tokio::join!(
+                        write_superfile_list(storage, &self.inner.options, pending, &mut replaces),
+                        await_uploads(uploads)
+                    );
+                    a.and(b)
+                },
                 &runtime,
             );
             t_list = t_pub.elapsed().as_secs_f64();
@@ -3441,6 +3517,10 @@ impl SupertableWriter {
             }
         } else if let Some(storage) = &self.inner.options.storage {
             let list_span = detail_span!("publish.write_list").entered();
+            bridge_on_runtime(
+                await_uploads(uploads.take().unwrap_or_default()),
+                &runtime,
+            )?;
             bridge_on_runtime(
                 write_superfile_list(
                     storage,
@@ -4186,6 +4266,28 @@ fn exp_lane_min_chunk_rows() -> usize {
 fn exp_warm_after() -> bool {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| exp_env("INFINO_EXP_WARM_AFTER", 0)) != 0
+}
+
+async fn await_uploads(
+    uploads: Vec<tokio::task::JoinHandle<Result<(), SupertableCommitError>>>,
+) -> Result<(), SupertableCommitError> {
+    let mut first = None;
+    for upload in uploads {
+        let r = upload.await.unwrap_or_else(|e| {
+            Err(SupertableCommitError::from(BuildError::Store(format!(
+                "superfile upload task: {e}"
+            ))))
+        });
+        if let Err(e) = r {
+            first.get_or_insert(e);
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
+fn exp_early_up() -> bool {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| exp_env("INFINO_EXP_EARLY_UP", 0)) != 0
 }
 
 fn exp_put_hedge() -> bool {
@@ -5308,6 +5410,8 @@ pub(super) struct SuperfilePublishBatch {
     /// One per superfile with an FTS index; published as a term-index delta
     /// in the same CAS as the entries.
     term_contributions: Vec<TermContribution>,
+    /// Superfile uploads already started, each to finish before the publish.
+    uploads: Vec<tokio::task::JoinHandle<Result<(), SupertableCommitError>>>,
 }
 
 impl SuperfilePublishBatch {
@@ -5323,6 +5427,7 @@ impl SuperfilePublishBatch {
         self.pending_store_inserts
             .extend(other.pending_store_inserts);
         self.term_contributions.extend(other.term_contributions);
+        self.uploads.extend(other.uploads);
     }
 
     /// Skip the in-memory reader-cache fill. Only for a storage-backed table,
@@ -5364,6 +5469,7 @@ fn collect_prepared_superfiles(
         pending_cache_inserts,
         pending_store_inserts,
         term_contributions,
+        uploads: Vec::new(),
     })
 }
 
@@ -10177,6 +10283,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         pending_cache_inserts: _,
         pending_store_inserts,
         term_contributions,
+        uploads: _,
     } = collect_prepared_superfiles(inner, all_prepared)?;
 
     // Pin the batch's children BEFORE any byte moves: the pin's entries are
@@ -10740,6 +10847,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         pending_cache_inserts: _,
         pending_store_inserts,
         term_contributions,
+        uploads: _,
     } = collect_prepared_superfiles(inner, prepared)?;
 
     // Pin every shard BEFORE any byte moves (entries are metadata): one
@@ -19237,6 +19345,7 @@ supertable:
                 pending_cache_inserts: Vec::new(),
                 pending_store_inserts: Vec::new(),
                 term_contributions: Vec::new(),
+                uploads: Vec::new(),
             },
             list_metadata: CommitListMetadata::empty(),
             segment: ReservedSegment {
