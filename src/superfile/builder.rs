@@ -3236,6 +3236,88 @@ impl SuperfileBuilder {
         let mut timings = FtsMergeTimings::default();
         let copy_span =
             detail_span!("merge_copy_rows", read_parquet = 0, write_parquet = 0).entered();
+        let exp_decoders: usize = std::env::var("INFINO_EXP_DECODERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let exp_timing = std::env::var("INFINO_EXP_COPY_TIMING").is_ok();
+        let exp_started = std::time::Instant::now();
+        if exp_decoders > 0 {
+            let workers = exp_decoders.min(inputs.len()).max(1);
+            thread::scope(|scope| -> Result<(), BuildError> {
+                type Decoded = Result<(RecordBatch, SuperfileStats), BuildError>;
+                let mut receivers = Vec::with_capacity(inputs.len());
+                let mut work: Vec<Vec<(&MergeInput, std::sync::mpsc::SyncSender<Decoded>)>> =
+                    (0..workers).map(|_| Vec::new()).collect();
+                for (i, input) in inputs.iter().enumerate() {
+                    let (sender, decoded) = sync_channel::<Decoded>(DECODED_BATCHES_AHEAD);
+                    receivers.push(decoded);
+                    work[i % workers].push((input, sender));
+                }
+                for share in work {
+                    let opts = self.opts.clone();
+                    scope.spawn(move || {
+                        for (input, sender) in share {
+                            let batches = match input.batches(&opts) {
+                                Ok(batches) => batches,
+                                Err(e) => {
+                                    let _ = sender.send(Err(e));
+                                    return;
+                                }
+                            };
+                            for batch in batches {
+                                let decoded = batch.and_then(|batch| {
+                                    let stats = SuperfileStats::try_compute_from_record_batch(&batch)?;
+                                    Ok((batch, stats))
+                                });
+                                let failed = decoded.is_err();
+                                if sender.send(decoded).is_err() || failed {
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                }
+                for decoded in receivers {
+                    loop {
+                        let start = std::time::Instant::now();
+                        let Ok(next) = decoded.recv() else {
+                            break;
+                        };
+                        let (record_batch, stats) = next?;
+                        #[cfg(test)]
+                        if tests::encode_fault() {
+                            return Err(BuildError::Io(Error::other(
+                                "test fault: the encode failed",
+                            )));
+                        }
+                        timings.read_parquet += start.elapsed();
+                        stats_collector.push(stats);
+                        let start = std::time::Instant::now();
+                        body_encoder.write_batch(&record_batch)?;
+                        timings.write_parquet += start.elapsed();
+                        push_stable_ids(id_sidecar, &record_batch, &id_column)?;
+                        let rows = record_batch.num_rows() as u32;
+                        if reanalyze {
+                            self.index_fts_batch(&record_batch, rows)?;
+                        }
+                        self.next_local_doc_id += rows;
+                    }
+                }
+                Ok(())
+            })?;
+            if exp_timing {
+                eprintln!(
+                    "[copytiming] decoders={workers} wall_ms={} wait_decoded_ms={} encode_ms={}",
+                    exp_started.elapsed().as_millis(),
+                    timings.read_parquet.as_millis(),
+                    timings.write_parquet.as_millis()
+                );
+            }
+            copy_span.record("read_parquet", timings.read_parquet.as_millis());
+            copy_span.record("write_parquet", timings.write_parquet.as_millis());
+            return Ok(());
+        }
         for input in inputs {
             let opts = self.opts.clone();
             let (sender, decoded) = sync_channel::<Result<(RecordBatch, SuperfileStats), BuildError>>(
@@ -3297,6 +3379,14 @@ impl SuperfileBuilder {
                 }
                 Ok(())
             })?;
+        }
+        if exp_timing {
+            eprintln!(
+                "[copytiming] decoders=old wall_ms={} wait_decoded_ms={} encode_ms={}",
+                exp_started.elapsed().as_millis(),
+                timings.read_parquet.as_millis(),
+                timings.write_parquet.as_millis()
+            );
         }
         copy_span.record("read_parquet", timings.read_parquet.as_millis());
         copy_span.record("write_parquet", timings.write_parquet.as_millis());
