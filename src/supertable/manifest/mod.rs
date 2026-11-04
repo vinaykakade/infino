@@ -4700,6 +4700,48 @@ pub(crate) fn column_hll(cols: &[ArrayRef]) -> Option<hll::HllSketch> {
     Some(sketch)
 }
 
+/// The first eight bytes of `s` as a big-endian number, zero-padded. Two
+/// strings whose keys differ order as their keys do; equal keys say nothing.
+#[inline]
+fn order_key(s: &[u8]) -> u64 {
+    let mut head = [0u8; 8];
+    let n = s.len().min(8);
+    head[..n].copy_from_slice(&s[..n]);
+    u64::from_be_bytes(head)
+}
+
+/// The smallest and largest non-null value of `a` in byte order, in one
+/// pass: what [`agg::min_string`] and [`agg::max_string`] return, without
+/// a full comparison for every value. Each value is compared through its
+/// first eight bytes, and in full only when those tie with the bound's.
+fn string_min_max<O: OffsetSizeTrait>(a: &GenericStringArray<O>) -> (Option<&str>, Option<&str>) {
+    let mut bounds: Option<(&str, u64, &str, u64)> = None;
+    for i in 0..a.len() {
+        if a.is_null(i) {
+            continue;
+        }
+        let v = a.value(i);
+        let key = order_key(v.as_bytes());
+        match bounds.as_mut() {
+            None => bounds = Some((v, key, v, key)),
+            Some((mn, mn_key, mx, mx_key)) => {
+                if key < *mn_key || (key == *mn_key && v < *mn) {
+                    *mn = v;
+                    *mn_key = key;
+                }
+                if key > *mx_key || (key == *mx_key && v > *mx) {
+                    *mx = v;
+                    *mx_key = key;
+                }
+            }
+        }
+    }
+    match bounds {
+        Some((mn, _, mx, _)) => (Some(mn), Some(mx)),
+        None => (None, None),
+    }
+}
+
 pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
     // An all-null column yields *null* min/max (not no-stat), so its null
     // count is still recorded for `IS [NOT] NULL` pruning — hence the
@@ -4748,16 +4790,24 @@ pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
         }
         DataType::Utf8 => {
             let a = col.as_any().downcast_ref::<StringArray>()?;
+            let (mn, mx) = match crate::utils::exp::fast_str_minmax() {
+                true => string_min_max(a),
+                false => (agg::min_string(a), agg::max_string(a)),
+            };
             Some((
-                Arc::new(StringArray::from(vec![agg::min_string(a)])),
-                Arc::new(StringArray::from(vec![agg::max_string(a)])),
+                Arc::new(StringArray::from(vec![mn])),
+                Arc::new(StringArray::from(vec![mx])),
             ))
         }
         DataType::LargeUtf8 => {
             let a = col.as_any().downcast_ref::<LargeStringArray>()?;
+            let (mn, mx) = match crate::utils::exp::fast_str_minmax() {
+                true => string_min_max(a),
+                false => (agg::min_string(a), agg::max_string(a)),
+            };
             Some((
-                Arc::new(LargeStringArray::from(vec![agg::min_string(a)])),
-                Arc::new(LargeStringArray::from(vec![agg::max_string(a)])),
+                Arc::new(LargeStringArray::from(vec![mn])),
+                Arc::new(LargeStringArray::from(vec![mx])),
             ))
         }
         DataType::Decimal128(precision, scale) => {

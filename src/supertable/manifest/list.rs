@@ -805,7 +805,17 @@ impl ScalarValueCounts {
         values: impl Fn(&'a ArrayRef) -> Option<I>,
     ) -> Option<Self> {
         // value -> (count, the piece and row it first showed up in)
-        let mut counts: FxHashMap<V, (u64, usize, usize)> = FxHashMap::default();
+        let mut counts: FxHashMap<V, (u64, usize, usize)> =
+            match crate::utils::exp::counts_presize() {
+                true => {
+                    let rows: usize = pieces.iter().map(|p| p.len()).sum();
+                    FxHashMap::with_capacity_and_hasher(
+                        rows.min(MAX_EXACT_VALUE_COUNTS + 1),
+                        Default::default(),
+                    )
+                }
+                false => FxHashMap::default(),
+            };
         for (at, piece) in pieces.iter().enumerate() {
             for (row, value) in values(piece)? {
                 let distinct = counts.len();
@@ -829,7 +839,41 @@ impl ScalarValueCounts {
                 Some((ScalarValue::try_from_array(&pieces[at], row).ok()?, count))
             })
             .collect::<Option<Vec<_>>>()?;
-        Self::from_entries(entries)
+        match crate::utils::exp::counts_presize() {
+            true => Self::from_distinct_entries(entries),
+            false => Self::from_entries(entries),
+        }
+    }
+
+    /// [`Self::from_entries`] for entries whose values are already distinct,
+    /// as counting leaves them: the same table, without folding duplicates.
+    fn from_distinct_entries(mut entries: Vec<(ScalarValue, u64)>) -> Option<Self> {
+        if entries.is_empty() || entries.len() > MAX_EXACT_VALUE_COUNTS {
+            return None;
+        }
+        if !exact_value_counts_type(&entries[0].0.data_type()) {
+            return None;
+        }
+        if entries
+            .iter()
+            .any(|(value, count)| value.is_null() || *count == 0)
+        {
+            return None;
+        }
+        if entries
+            .iter()
+            .any(|(value, _)| value.data_type() != entries[0].0.data_type())
+        {
+            return None;
+        }
+        entries.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].0.partial_cmp(&pair[1].0).is_none())
+        {
+            return None;
+        }
+        Some(Self { entries })
     }
 
     pub(crate) fn from_entries(entries: Vec<(ScalarValue, u64)>) -> Option<Self> {

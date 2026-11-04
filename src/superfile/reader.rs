@@ -1255,6 +1255,16 @@ impl SuperfileReader {
         &self,
         deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
     ) -> Result<ParquetRecordBatchReader, ReadError> {
+        self.record_batches_sized(deleted_docs_bitmap, None)
+    }
+
+    /// [`Self::record_batches`] with `batch_rows` rows per batch (the
+    /// reader's default when `None`).
+    pub(crate) fn record_batches_sized(
+        &self,
+        deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+        batch_rows: Option<usize>,
+    ) -> Result<ParquetRecordBatchReader, ReadError> {
         let bytes = self
             .bytes
             .as_ref()
@@ -1279,6 +1289,9 @@ impl SuperfileReader {
             if let Some(selection) = selection {
                 builder = builder.with_row_selection(selection);
             }
+        }
+        if let Some(rows) = batch_rows {
+            builder = builder.with_batch_size(rows);
         }
         builder
             .build()

@@ -3236,6 +3236,9 @@ impl SuperfileBuilder {
         let mut timings = FtsMergeTimings::default();
         let copy_span =
             detail_span!("merge_copy_rows", read_parquet = 0, write_parquet = 0).entered();
+        let copy_start = std::time::Instant::now();
+        let decode_busy = std::sync::atomic::AtomicU64::new(0);
+        let stats_busy = std::sync::atomic::AtomicU64::new(0);
         for input in inputs {
             let opts = self.opts.clone();
             let (sender, decoded) = sync_channel::<Result<(RecordBatch, SuperfileStats), BuildError>>(
@@ -3247,26 +3250,88 @@ impl SuperfileBuilder {
                 // the scope waiting on a decoder blocked on a full
                 // channel.
                 let decoded = decoded;
+                let split = crate::utils::exp::decode_batch() > 0;
+                let stats_thread = crate::utils::exp::stats_thread();
+                // Batches as the reader would cut them by default: a larger
+                // decode is sliced back to these, so the stats and the
+                // encoder see the same pieces.
+                const READER_BATCH_ROWS: usize = 1024;
+                let (raw_sender, raw) =
+                    sync_channel::<Result<RecordBatch, BuildError>>(DECODED_BATCHES_AHEAD);
+                let decode_busy = &decode_busy;
+                let stats_busy = &stats_busy;
+                let stats_sender = sender.clone();
                 scope.spawn(move || {
+                    let t = std::time::Instant::now();
                     let batches = match input.batches(&opts) {
                         Ok(batches) => batches,
                         Err(e) => {
-                            let _ = sender.send(Err(e));
+                            match stats_thread {
+                                true => drop(raw_sender.send(Err(e))),
+                                false => drop(sender.send(Err(e))),
+                            }
                             return;
                         }
                     };
-                    for batch in batches {
+                    let emit = |batch: Result<RecordBatch, BuildError>| -> bool {
+                        if stats_thread {
+                            let failed = batch.is_err();
+                            return raw_sender.send(batch).is_err() || failed;
+                        }
                         let decoded = batch.and_then(|batch| {
                             let stats = SuperfileStats::try_compute_from_record_batch(&batch)?;
                             Ok((batch, stats))
                         });
                         let failed = decoded.is_err();
                         // The receiver is gone once the merge has failed.
-                        if sender.send(decoded).is_err() || failed {
-                            return;
+                        sender.send(decoded).is_err() || failed
+                    };
+                    'outer: for batch in batches {
+                        match (split, batch) {
+                            (true, Ok(batch)) if batch.num_rows() > READER_BATCH_ROWS => {
+                                let mut at = 0;
+                                while at < batch.num_rows() {
+                                    let take = READER_BATCH_ROWS.min(batch.num_rows() - at);
+                                    if emit(Ok(batch.slice(at, take))) {
+                                        break 'outer;
+                                    }
+                                    at += take;
+                                }
+                            }
+                            (_, batch) => {
+                                if emit(batch) {
+                                    break;
+                                }
+                            }
                         }
                     }
+                    decode_busy.fetch_add(
+                        t.elapsed().as_micros() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 });
+                if stats_thread {
+                    scope.spawn(move || {
+                        let t = std::time::Instant::now();
+                        for batch in raw {
+                            let decoded = batch.and_then(|batch| {
+                                let stats = SuperfileStats::try_compute_from_record_batch(&batch)?;
+                                Ok((batch, stats))
+                            });
+                            let failed = decoded.is_err();
+                            if stats_sender.send(decoded).is_err() || failed {
+                                break;
+                            }
+                        }
+                        stats_busy.fetch_add(
+                            t.elapsed().as_micros() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    });
+                } else {
+                    drop(raw);
+                    drop(stats_sender);
+                }
                 loop {
                     let start = std::time::Instant::now();
                     let Ok(next) = decoded.recv() else {
@@ -3297,6 +3362,16 @@ impl SuperfileBuilder {
                 }
                 Ok(())
             })?;
+        }
+        if crate::utils::exp::copy_timing() {
+            eprintln!(
+                "[copytiming] wall_ms={} decode_thread_ms={} stats_thread_ms={} wait_decoded_ms={} encode_ms={}",
+                copy_start.elapsed().as_millis(),
+                decode_busy.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+                stats_busy.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+                timings.read_parquet.as_millis(),
+                timings.write_parquet.as_millis(),
+            );
         }
         copy_span.record("read_parquet", timings.read_parquet.as_millis());
         copy_span.record("write_parquet", timings.write_parquet.as_millis());
@@ -4661,7 +4736,13 @@ fn adapted_batches<'a>(
     check_id_column(reader, opts)?;
     let schema = Arc::clone(&opts.schema);
     let batches = reader
-        .record_batches(deleted)
+        .record_batches_sized(
+            deleted,
+            match crate::utils::exp::decode_batch() {
+                0 => None,
+                rows => Some(rows),
+            },
+        )
         .map_err(|_| BuildError::BatchReadError)?;
     // Check the file's shape even when no row survives to be read.
     adapt_batch(RecordBatch::new_empty(batches.schema()), adapter, &schema)?;
