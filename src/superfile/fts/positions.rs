@@ -135,6 +135,9 @@ pub(crate) const GROUP_PACKED_FIXED: u8 = 2;
 
 /// Bytes a little-endian field needs to hold `v`: 1, 2 or 4.
 fn field_bytes(v: u32) -> usize {
+    if exp_plan2() {
+        return 1 + usize::from(v > 0xFF) + 2 * usize::from(v > 0xFFFF);
+    }
     match v {
         0..=0xFF => 1,
         0x100..=0xFFFF => 2,
@@ -279,6 +282,11 @@ fn plan_stream(
         plan,
         candidates,
     );
+}
+
+pub(crate) fn exp_plan2() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INFINO_EXP_PLAN2").is_ok_and(|v| v == "1"))
 }
 
 pub(crate) fn exp_bitwriter() -> bool {

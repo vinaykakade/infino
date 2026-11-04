@@ -200,6 +200,49 @@ pub(crate) fn plan_exceptions(
     if narrowest == plain {
         return;
     }
+    if crate::superfile::fts::positions::exp_plan2() {
+        // Exactly `wider` lanes are wider than `narrowest`: each lane is
+        // written to the next free slot and kept by moving past it, with
+        // no branch on whether it is wider. One spare slot takes the
+        // writes after the last kept lane.
+        let wider: usize = at_width[narrowest as usize + 1..].iter().sum();
+        candidates.clear();
+        candidates.resize(wider + 1, (0, 0));
+        let mut kept = 0usize;
+        for (i, &v) in lanes.iter().enumerate() {
+            candidates[kept] = (i as u32, v);
+            kept += usize::from(v >> narrowest != 0);
+        }
+        debug_assert_eq!(kept, wider);
+        candidates.truncate(wider);
+        for width in narrowest..plain {
+            let mut bytes = base(width);
+            if bytes >= plan.bytes {
+                continue;
+            }
+            // The total only grows, so the width is beaten exactly when
+            // the whole sum reaches the best so far.
+            for &(i, v) in candidates.iter() {
+                let hi = v >> width;
+                bytes += match hi {
+                    0 => 0,
+                    _ => per_exception(i, hi),
+                };
+            }
+            if bytes < plan.bytes {
+                plan.width = width;
+                plan.bytes = bytes;
+                plan.exceptions.clear();
+                plan.exceptions.extend(
+                    candidates
+                        .iter()
+                        .map(|&(i, v)| (i, v >> width))
+                        .filter(|&(_, hi)| hi != 0),
+                );
+            }
+        }
+        return;
+    }
     candidates.clear();
     candidates.extend(
         lanes
