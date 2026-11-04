@@ -70,6 +70,14 @@ fn exp_sel() -> u32 {
     static C: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     exp_knob(&C, "INFINO_EXP_SEL")
 }
+fn exp_ready() -> u32 {
+    static C: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    exp_knob(&C, "INFINO_EXP_READY")
+}
+fn exp_loc() -> u32 {
+    static C: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    exp_knob(&C, "INFINO_EXP_LOC")
+}
 fn exp_pack() -> u32 {
     static C: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     exp_knob(&C, "INFINO_EXP_PACK")
@@ -966,7 +974,10 @@ impl BisectState {
         // that way and this runs in a refine's place — so it serves as the
         // global-to-local term map without a second table that size. Zero
         // means "not seen here"; a local id is held as `id + 1`.
-        let mut terms: Vec<u32> = Vec::with_capacity(order.len());
+        let mut terms: Vec<u32> = match exp_loc() & 1 != 0 {
+            true => Vec::with_capacity(order.iter().map(|&d| fwd.doc(d).len()).sum()),
+            false => Vec::with_capacity(order.len()),
+        };
         let mut starts: Vec<u32> = Vec::with_capacity(order.len() + 1);
         starts.push(0);
         let mut n_local = 0u32;
@@ -1285,7 +1296,11 @@ impl BisectState {
                 // the leading `ready` entries need to be in order, and why
                 // extending the block cannot change the outcome.
                 let pairs = left_gains.len().min(right_gains.len());
-                let mut ready = last_swaps.saturating_mul(2).max(SWAP_BLOCK).min(pairs);
+                let mut ready = match exp_ready() {
+                    1 => last_swaps.max(SWAP_BLOCK).min(pairs),
+                    2 => (last_swaps + last_swaps / 4).max(SWAP_BLOCK).min(pairs),
+                    _ => last_swaps.saturating_mul(2).max(SWAP_BLOCK).min(pairs),
+                };
                 order_leading_gains(&mut left_gains, ready, parallel);
                 order_leading_gains(&mut right_gains, ready, parallel);
                 if let Some(step) = step {
