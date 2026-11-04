@@ -126,7 +126,7 @@ use crate::{
         fts::{
             analysis::ChainTokenizer,
             bm25,
-            positions::{TermRuns, encode_group, encode_run, skip_run},
+            positions::{TermRuns, encode_group, encode_group_values, encode_run, skip_run},
             posting::{BLOCK_LEN, Block, EncodedBlock, block_lanes, encode_block_with},
             reader::{ColumnLengthStats, TopKEntry, finish_head},
             short::{SHORT_MAX_DF, encode_short},
