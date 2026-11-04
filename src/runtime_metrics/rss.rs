@@ -55,7 +55,7 @@ pub(crate) fn exp_start_background_purge() {
             }
             let cadence = Duration::from_millis(delay as u64);
             // SAFETY: as above.
-            unsafe { libmimalloc_sys::mi_option_set(PURGE_DELAY, delay.saturating_mul(10)) };
+            unsafe { libmimalloc_sys::mi_option_set(PURGE_DELAY, 86_400_000) };
             let _ = thread::Builder::new()
                 .name("infino-purge".into())
                 .spawn(move || {
