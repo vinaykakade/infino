@@ -59,7 +59,11 @@ pub(crate) fn exp_start_background_purge() {
             let _ = thread::Builder::new()
                 .name("infino-purge".into())
                 .spawn(move || {
+                    // The allocator collects only for a thread that has
+                    // allocated: give this one its heap first.
+                    let warm = std::hint::black_box(vec![0u8; 64]);
                     loop {
+                        std::hint::black_box(&warm);
                         thread::sleep(cadence);
                         purge_allocator();
                     }
