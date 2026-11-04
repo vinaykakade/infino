@@ -538,11 +538,31 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
     }
 }
 
+/// Postings from this many up are ordered by counting passes over their
+/// doc ids; fewer are ordered by a comparison sort of packed keys.
+const RADIX_MIN_POSTINGS: usize = if cfg!(test) { 8 } else { 512 };
+
+/// Widest digit one counting pass orders by: its buckets fit in L1.
+const RADIX_MAX_DIGIT_BITS: u32 = 11;
+
+fn exp_radix() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INFINO_EXP_RADIX_SORT").is_ok_and(|v| v == "1"))
+}
+
 /// Reused buffers for sorting one term's postings by output doc id.
 #[derive(Default)]
 struct SortScratch {
     /// `(output_doc_id, tf, run_start)` per posting.
     entries: Vec<(u32, u32, usize)>,
+    /// `(doc_id - min) << 32 | posting index` per posting.
+    keys: Vec<u64>,
+    /// The other side of a counting pass.
+    spare: Vec<u64>,
+    /// A counting pass's buckets.
+    counts: Vec<u32>,
+    /// Each posting's tf, before the sort.
+    tfs: Vec<u32>,
     /// The run starts in sorted order.
     starts: Vec<usize>,
 }
@@ -551,6 +571,9 @@ impl SortScratch {
     /// Sort `postings` in place by doc id and return `run_starts` in the
     /// same order. Only the starts move; the run values stay where they are.
     fn sort(&mut self, postings: &mut [(u32, u32)], run_starts: &[usize]) -> &[usize] {
+        if exp_radix() {
+            return self.sort_keys(postings, run_starts);
+        }
         self.entries.clear();
         self.entries.extend(
             postings
@@ -567,9 +590,80 @@ impl SortScratch {
         &self.starts
     }
 
+    fn sort_keys(&mut self, postings: &mut [(u32, u32)], run_starts: &[usize]) -> &[usize] {
+        let (mut min, mut max) = (u32::MAX, 0u32);
+        for &(doc, _) in postings.iter() {
+            min = min.min(doc);
+            max = max.max(doc);
+        }
+        self.keys.clear();
+        self.keys.extend(
+            postings
+                .iter()
+                .enumerate()
+                .map(|(i, &(doc, _))| (u64::from(doc - min) << 32) | i as u64),
+        );
+        self.tfs.clear();
+        self.tfs.extend(postings.iter().map(|&(_, tf)| tf));
+        match self.keys.len() >= RADIX_MIN_POSTINGS {
+            true => self.count_sort(u32::BITS - (max - min).leading_zeros()),
+            false => self.keys.sort_unstable(),
+        }
+        self.starts.clear();
+        for (slot, &key) in postings.iter_mut().zip(&self.keys) {
+            let i = key as u32 as usize;
+            *slot = (min + (key >> 32) as u32, self.tfs[i]);
+            self.starts.push(run_starts[i]);
+        }
+        &self.starts
+    }
+
+    /// Order `keys` by their high half, `bits` wide: stable counting passes
+    /// over its digits, lowest first.
+    fn count_sort(&mut self, bits: u32) {
+        let passes = bits.div_ceil(RADIX_MAX_DIGIT_BITS).max(1);
+        let digit = bits.div_ceil(passes);
+        let buckets = 1usize << digit;
+        let mask = buckets as u64 - 1;
+        let n = self.keys.len();
+        self.spare.clear();
+        self.spare.resize(n, 0);
+        self.counts.clear();
+        self.counts.resize(buckets * passes as usize, 0);
+        for &key in &self.keys {
+            let high = key >> 32;
+            for pass in 0..passes as usize {
+                let d = ((high >> (pass as u32 * digit)) & mask) as usize;
+                self.counts[pass * buckets + d] += 1;
+            }
+        }
+        for pass in 0..passes as usize {
+            let counts = &mut self.counts[pass * buckets..(pass + 1) * buckets];
+            // A digit every key shares orders nothing.
+            if counts.iter().any(|&c| c as usize == n) {
+                continue;
+            }
+            let mut before = 0u32;
+            for count in counts.iter_mut() {
+                let here = *count;
+                *count = before;
+                before += here;
+            }
+            let shift = 32 + pass as u32 * digit;
+            for &key in &self.keys {
+                let slot = &mut counts[((key >> shift) & mask) as usize];
+                self.spare[*slot as usize] = key;
+                *slot += 1;
+            }
+            mem::swap(&mut self.keys, &mut self.spare);
+        }
+    }
+
     /// Bytes the buffers hold on to.
     fn capacity_bytes(&self) -> usize {
         self.entries.capacity() * size_of::<(u32, u32, usize)>()
+            + (self.keys.capacity() + self.spare.capacity()) * size_of::<u64>()
+            + (self.counts.capacity() + self.tfs.capacity()) * size_of::<u32>()
             + self.starts.capacity() * size_of::<usize>()
     }
 }
@@ -737,6 +831,46 @@ mod tests {
         })
         .expect("walk");
         out
+    }
+
+    /// The packed-key sort orders postings by doc id exactly as the
+    /// comparison sort does, with each posting's run start beside it, on
+    /// both sides of the counting-pass threshold and over doc ids of every
+    /// width, including spans whose low digits all keys share.
+    #[test]
+    fn the_key_sort_orders_postings_like_the_comparison_sort() {
+        let mut scratch = SortScratch::default();
+        for n in [1, 2, RADIX_MIN_POSTINGS - 1, RADIX_MIN_POSTINGS, 3_000] {
+            for (base, stride) in [
+                (0u32, 1u32),
+                (7, 3),
+                (1 << 20, 4096),
+                (5, 2_654_435),
+                (u32::MAX - 4 * 3_000, 3),
+            ] {
+                let docs: Vec<u32> = (0..n as u32)
+                    .map(|i| base.wrapping_add(i.wrapping_mul(stride)))
+                    .collect();
+                // Scrambled: a fixed odd multiplier permutes the indexes.
+                let mut postings: Vec<(u32, u32)> = (0..n)
+                    .map(|i| (docs[(i * 7_919) % n], 1 + (i as u32 % 5)))
+                    .collect();
+                let run_starts: Vec<usize> = (0..n).map(|i| i * 3).collect();
+                let mut expected: Vec<(u32, u32, usize)> = postings
+                    .iter()
+                    .zip(&run_starts)
+                    .map(|(&(d, tf), &s)| (d, tf, s))
+                    .collect();
+                expected.sort_unstable_by_key(|e| e.0);
+                let starts = scratch.sort_keys(&mut postings, &run_starts).to_vec();
+                let got: Vec<(u32, u32, usize)> = postings
+                    .iter()
+                    .zip(&starts)
+                    .map(|(&(d, tf), &s)| (d, tf, s))
+                    .collect();
+                assert_eq!(got, expected, "{n} postings from {base} by {stride}");
+            }
+        }
     }
 
     /// The ranges a column is walked in cover its terms once each, in
