@@ -156,6 +156,10 @@ pub(crate) fn merge_column<S: Send, T: Send>(
     // time goes: waiting on the walk, dispatching, and at the end waiting
     // for the writer.
     let (mut waited, mut encoded, mut written) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let encode_pool = match crate::utils::exp::encode_pool() {
+        true => crate::supertable::writer::maint_pool().ok(),
+        false => None,
+    };
     let (encoded_tx, encoded_rx) = sync_channel::<(Batch, Vec<Option<T>>)>(ENCODED_BATCHES_AHEAD);
     thread::scope(|scope| -> Result<(), BuildError> {
         let (readers, dicts) = (&readers, &dicts);
@@ -187,7 +191,10 @@ pub(crate) fn merge_column<S: Send, T: Send>(
             waited += started.elapsed();
             let batch = batch?;
             let started = Instant::now();
-            let merged = work.encode(&batch)?;
+            let merged = match encode_pool {
+                Some(pool) => pool.install(|| work.encode(&batch))?,
+                None => work.encode(&batch)?,
+            };
             encoded += started.elapsed();
             // The writer is gone only after an error of its own, which the
             // join below reports.

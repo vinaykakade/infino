@@ -9,6 +9,7 @@ use std::{
 };
 
 use futures::{StreamExt, stream};
+use tracing::Instrument;
 use tokio::task::spawn_blocking;
 use tracing::{debug, error, info, warn};
 
@@ -369,13 +370,17 @@ pub(super) async fn gc_storage_sweep_for_inner(
 ) -> Result<GcReport, GcError> {
     let storage = inner.options.storage.clone().ok_or(GcError::NoStorage)?;
 
-    refresh_to_committed(inner).await?;
+    refresh_to_committed(inner)
+        .instrument(crate::utils::trace::detail_span!("gc.refresh"))
+        .await?;
 
     let LiveSet {
         uris: live_uris,
         superfiles_complete,
         manifest_id: live_manifest_id,
-    } = live_set(inner, &storage).await?;
+    } = live_set(inner, &storage)
+        .instrument(crate::utils::trace::detail_span!("gc.live_set"))
+        .await?;
 
     let cutoff = SystemTime::now()
         .checked_sub(safety_gap)
@@ -404,10 +409,31 @@ pub(super) async fn gc_storage_sweep_for_inner(
     // Referenced superfiles the `data/` listing returned. Only a shortfall against the referenced
     // total sends the sweep down the integrity path below.
     let mut listed_referenced_superfiles = 0usize;
-    for prefix in prefixes {
+    let list_one = |prefix: &'static str| {
+        let storage = Arc::clone(&storage);
+        async move {
+            storage
+                .list_with_prefix_metadata(prefix)
+                .instrument(crate::utils::trace::detail_span!("gc.list", prefix = prefix))
+                .await
+        }
+    };
+    let mut listings = if crate::utils::exp::gc_par_list() {
+        futures::future::try_join_all(prefixes.iter().map(|p| list_one(p)))
+            .await?
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>()
+    } else {
+        prefixes.iter().map(|_| None).collect()
+    };
+    for (prefix, listed_early) in prefixes.into_iter().zip(listings.iter_mut()) {
         // Decided once per prefix. Every referenced key `data/` returns is a superfile.
         let count_referenced = check_integrity && prefix == SUPERFILE_DATA_DIR;
-        let entries = storage.list_with_prefix_metadata(prefix).await?;
+        let entries = match listed_early.take() {
+            Some(entries) => entries,
+            None => list_one(prefix).await?,
+        };
         for (key, meta) in entries {
             if live_uris.contains(&key) {
                 if count_referenced {
@@ -461,7 +487,9 @@ pub(super) async fn gc_storage_sweep_for_inner(
     // above already ran, so only a key the newer manifest still references is loss.
     let mut checked_manifest_id = live_manifest_id;
     if !candidates.is_empty() || !absent.is_empty() {
-        refresh_to_committed(inner).await?;
+        refresh_to_committed(inner)
+            .instrument(crate::utils::trace::detail_span!("gc.recheck"))
+            .await?;
         if inner.manifest.load().manifest_id != live_manifest_id {
             let recheck = live_set(inner, &storage).await?;
             checked_manifest_id = recheck.manifest_id;
@@ -494,6 +522,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
             key
         })
         .collect();
+    let delete_span = crate::utils::trace::detail_span!("gc.delete", keys = keys.len());
     delete_objects(inner, &storage, keys, |key, result| match result {
         Ok(()) => {
             let (size, last_modified) = listed[&key];
@@ -516,6 +545,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
             report.delete_errors += 1;
         }
     })
+    .instrument(delete_span)
     .await;
 
     // A routine sweep stays at `debug`. One that deleted a young superfile (only possible with a

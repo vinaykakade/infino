@@ -43,6 +43,7 @@ use std::{
     future::Future,
     io,
     iter::repeat_n,
+    mem,
     ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -427,7 +428,90 @@ async fn write_objects(
             Ok(())
         }
     });
-    run_bounded(SLICE_WRITE_CONCURRENCY, "object write", jobs).await
+    let _ = SLICE_WRITE_CONCURRENCY;
+    run_bounded(crate::utils::exp::ti_writes(), "object write", jobs).await
+}
+
+/// Write one built object; the job [`write_objects`] runs for each.
+async fn write_built_object(
+    storage: Arc<dyn StorageProvider>,
+    kind: &'static str,
+    hash: ContentHash,
+    built: BuiltBytes,
+) -> Result<(), TermIndexError> {
+    let bytes = match built {
+        BuiltBytes::Resident(bytes) => bytes,
+        BuiltBytes::Spilled { path, .. } => async_fs::read(&path).await?,
+    };
+    let reference = put_content_addressed(storage.as_ref(), kind, bytes).await?;
+    debug_assert_eq!(reference.content_hash, hash);
+    Ok(())
+}
+
+/// Build a layer and write its tier objects and slices as each key range
+/// finishes, rather than all of them after the last range: the uploads of
+/// the ranges done early run beside the ranges still building.
+async fn build_and_write_layer(
+    storage: &Arc<dyn StorageProvider>,
+    contributions: &[Contribution],
+    policy: &BuildPolicy,
+) -> Result<build::BuiltLayer, TermIndexError> {
+    let handle = tokio::runtime::Handle::current();
+    let permits = Arc::new(tokio::sync::Semaphore::new(
+        2 * crate::utils::exp::ti_writes(),
+    ));
+    let uploads: Mutex<Vec<task::JoinHandle<Result<(), TermIndexError>>>> =
+        Mutex::new(Vec::new());
+    let on_part = |part: &build::MergedLayer| {
+        let mut started = uploads.lock().expect("uploads");
+        let objects = part
+            .tiers
+            .iter()
+            .map(|o| ("tier", o))
+            .chain(part.slices.iter().map(|o| ("slice", o)));
+        for (kind, (hash, built)) in objects {
+            let storage = Arc::clone(storage);
+            let permits = Arc::clone(&permits);
+            let (hash, built) = (*hash, built.clone());
+            started.push(handle.spawn(async move {
+                let _permit = permits.acquire_owned().await.expect("never closed");
+                write_built_object(storage, kind, hash, built).await
+            }));
+        }
+    };
+    let built = detail_span!(
+        "term_index.build_layer",
+        inputs = contributions.len(),
+        bytes = tracing::field::Empty,
+        ranges = tracing::field::Empty,
+    )
+    .in_scope(|| build::build_layer_with(contributions, policy, Some(&on_part)));
+    let started = mem::take(&mut *uploads.lock().expect("uploads"));
+    if built.is_err() {
+        for upload in &started {
+            upload.abort();
+        }
+    }
+    let built = built?;
+    let mut failed = None;
+    let wait = async {
+        for upload in started {
+            match upload.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    failed.get_or_insert(e);
+                }
+                Err(e) => {
+                    failed.get_or_insert(TermIndexError::Build(format!("object write: {e}")));
+                }
+            }
+        }
+    };
+    wait.instrument(detail_span!("write_layer_tail")).await;
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(built),
+    }
 }
 
 /// Run `jobs` as spawned tasks, at most `limit` at once, so they spread
@@ -559,14 +643,19 @@ pub(crate) async fn reserve_layer(
     contributions: &[Contribution],
     policy: &BuildPolicy,
 ) -> Result<ReservedLayer, TermIndexError> {
-    let built = detail_span!(
-        "term_index.build_layer",
-        inputs = contributions.len(),
-        bytes = tracing::field::Empty,
-        ranges = tracing::field::Empty,
-    )
-    .in_scope(|| build_layer(contributions, policy))?;
-    write_tiers_and_slices(storage, built.tiers.clone(), built.slices.clone()).await?;
+    let built = if crate::utils::exp::ti_pipe() {
+        build_and_write_layer(storage, contributions, policy).await?
+    } else {
+        let built = detail_span!(
+            "term_index.build_layer",
+            inputs = contributions.len(),
+            bytes = tracing::field::Empty,
+            ranges = tracing::field::Empty,
+        )
+        .in_scope(|| build_layer(contributions, policy))?;
+        write_tiers_and_slices(storage, built.tiers.clone(), built.slices.clone()).await?;
+        built
+    };
     Ok(ReservedLayer {
         superfiles: built.superfiles,
         id_mins: built.id_mins,

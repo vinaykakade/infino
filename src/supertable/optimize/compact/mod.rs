@@ -1374,7 +1374,8 @@ impl Supertable {
                     // cache, same as a normal writer commit does. Without
                     // this every query against it misses and re-fetches +
                     // re-opens from storage every single time.
-                    for prepared in &batch {
+                    let warm_span = detail_span!("warm_reader_cache", jobs = batch.len()).entered();
+                    let warm_one = |prepared: &PreparedJob| {
                         if let Some((uri, bytes)) = prepared.bytes_for_store.clone()
                             && let Err(e) = opts.store.insert(uri, bytes)
                         {
@@ -1384,7 +1385,19 @@ impl Supertable {
                                 "compact: failed to warm reader cache for merged superfile"
                             );
                         }
+                    };
+                    if crate::utils::exp::par_warm() && batch.len() > 1 {
+                        std::thread::scope(|scope| {
+                            for prepared in &batch {
+                                scope.spawn(|| warm_one(prepared));
+                            }
+                        });
+                    } else {
+                        for prepared in &batch {
+                            warm_one(prepared);
+                        }
                     }
+                    drop(warm_span);
 
                     // Drop the merged-away inputs so the in-memory cache
                     // doesn't grow forever across repeated compactions.
@@ -2390,7 +2403,7 @@ where
         }
         (key, Some(result))
     }))
-    .buffer_unordered(MAX_CONCURRENT_SEAL_WRITES)
+    .buffer_unordered(crate::utils::exp::seal_writes())
     .collect()
     .await
 }
