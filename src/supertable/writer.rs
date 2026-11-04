@@ -5776,9 +5776,12 @@ pub(super) async fn persist_superfile_publish_batch_async(
         )
         .await
         .map_err(BuildError::from)?;
+        let t_after = Instant::now();
+        let n_store = batch.pending_store_inserts.len();
         let published_root = new_manifest.term_index_ref().cloned();
         inner.manifest.store(new_manifest);
         apply_pending_store_inserts(inner, batch.pending_store_inserts);
+        let d_store = t_after.elapsed().as_secs_f64();
         // Already async — await the warm-cache fill directly. Do NOT call
         // `warm_cache_after_commit` here: its sync `block_in_place` + nested
         // `block_on` inside the `tokio::join!` commit future deadlocks the
@@ -5796,6 +5799,13 @@ pub(super) async fn persist_superfile_publish_batch_async(
             inner.options.memory_budget_bytes,
         ) {
             cache.sweep_for_budget(budget);
+        }
+        if crate::storage::io_counters::timeline_enabled() {
+            info!(
+                "[publish] after commit store {:.0}ms ({n_store}) total {:.0}ms",
+                d_store * 1e3,
+                t_after.elapsed().as_secs_f64() * 1e3
+            );
         }
         return Ok(published_root);
     }
