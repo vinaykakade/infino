@@ -117,6 +117,10 @@ const REORDER_CONVERGENCE: f32 = 0.05;
 /// what normally ends a split.
 const REORDER_MAX_ROUNDS: usize = 20;
 
+/// Most terms a renumbered partition can carry and still hold its ids in 16
+/// bits: local ids run from zero, so this many fit.
+const NARROW_TERMS: usize = 1 << 16;
+
 /// Fewest items one rayon task takes in the bisection's per-document and
 /// per-term loops. The work per item is a few reads and an atomic store, so
 /// a task that small is mostly the scheduler's: left to split down to one
@@ -496,9 +500,9 @@ const PARALLEL_MIN_PARTITION: usize = 1 << 14;
 /// and the whole structure is two allocations however many documents
 /// there are.
 #[derive(Debug, Default, Clone)]
-pub(crate) struct ForwardIndex {
+pub(crate) struct ForwardIndex<T: TermId = u32> {
     /// Term ids, documents laid end to end.
-    terms: Vec<u32>,
+    terms: Vec<T>,
     /// `starts[d]..starts[d + 1]` is document `d`'s slice of `terms`.
     /// One longer than the document count.
     starts: Vec<u32>,
@@ -531,17 +535,56 @@ impl ForwardIndex {
             n_terms,
         }
     }
+}
 
+impl<T: TermId> ForwardIndex<T> {
     /// Documents in the index.
     pub(crate) fn len(&self) -> usize {
         self.starts.len().saturating_sub(1)
     }
 
     #[inline]
-    fn doc(&self, d: u32) -> &[u32] {
+    fn doc(&self, d: u32) -> &[T] {
         let lo = self.starts[d as usize] as usize;
         let hi = self.starts[d as usize + 1] as usize;
         &self.terms[lo..hi]
+    }
+}
+
+/// The integer a [`ForwardIndex`] stores its term ids as.
+///
+/// A renumbered partition whose terms number at most [`NARROW_TERMS`] holds
+/// them as `u16`, half the bytes of every pass a round makes over its
+/// postings; anything wider keeps `u32`.
+pub(crate) trait TermId: Copy + Default + fmt::Debug + Send + Sync + 'static {
+    fn index(self) -> usize;
+    /// A renumbered id, which the caller has checked fits.
+    fn from_local(id: u32) -> Self;
+}
+
+impl TermId for u32 {
+    #[inline]
+    fn index(self) -> usize {
+        self as usize
+    }
+    #[inline]
+    fn from_local(id: u32) -> Self {
+        id
+    }
+}
+
+impl TermId for u16 {
+    #[inline]
+    fn index(self) -> usize {
+        usize::from(self)
+    }
+    #[inline]
+    fn from_local(id: u32) -> Self {
+        debug_assert!(
+            id <= u32::from(u16::MAX),
+            "term id {id} does not fit 16 bits"
+        );
+        id as u16
     }
 }
 
@@ -655,8 +698,8 @@ fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bi
 
 /// Split `order` as [`BisectState::split`] does, running the two halves
 /// of a large partition in parallel.
-fn split_parallel(
-    fwd: &ForwardIndex,
+fn split_parallel<T: TermId>(
+    fwd: &ForwardIndex<T>,
     order: &mut [u32],
     depth: u32,
     pool: &StatePool,
@@ -670,25 +713,10 @@ fn split_parallel(
     // A partition just renumbered goes straight to its split: its halves
     // decide afresh, so a partition is renumbered at most once.
     if may_localize && localizing_pays(fwd, order, distinct) {
-        let started = REPORT.then(Instant::now);
-        let local = pool.with_state(|state| state.localize(fwd, order));
-        if let Some(started) = started {
-            run.report.add(
-                depth,
-                &LevelReport {
-                    localized: 1,
-                    localize_ns: ns_since(started),
-                    ..LevelReport::default()
-                },
-            );
+        match narrow_ids(distinct) {
+            true => localize_and_split_parallel::<T, u16>(fwd, order, depth, pool, run, distinct),
+            false => localize_and_split_parallel::<T, u32>(fwd, order, depth, pool, run, distinct),
         }
-        let mut inner: Vec<u32> = (0..order.len() as u32).collect();
-        let inner_pool = StatePool {
-            n_terms: local.n_terms,
-            free: Mutex::new(Vec::new()),
-        };
-        split_parallel(&local, &mut inner, depth, &inner_pool, run, false, distinct);
-        apply_inner_order(order, &inner);
         return;
     }
     if order.len() < PARALLEL_MIN_PARTITION {
@@ -750,6 +778,51 @@ fn split_parallel(
     }
 }
 
+/// Renumber `order`'s terms into ids of type `U` and split it as its own
+/// index, then carry the order found back onto `order`.
+fn localize_and_split_parallel<T: TermId, U: TermId>(
+    fwd: &ForwardIndex<T>,
+    order: &mut [u32],
+    depth: u32,
+    pool: &StatePool,
+    run: Bisect<'_>,
+    distinct: usize,
+) {
+    let started = REPORT.then(Instant::now);
+    let local: ForwardIndex<U> = pool.with_state(|state| state.localize(fwd, order));
+    if let Some(started) = started {
+        run.report.add(
+            depth,
+            &LevelReport {
+                localized: 1,
+                localize_ns: ns_since(started),
+                ..LevelReport::default()
+            },
+        );
+    }
+    let mut inner: Vec<u32> = (0..order.len() as u32).collect();
+    let inner_pool = StatePool {
+        n_terms: local.n_terms,
+        free: Mutex::new(Vec::new()),
+    };
+    split_parallel(&local, &mut inner, depth, &inner_pool, run, false, distinct);
+    apply_inner_order(order, &inner);
+}
+
+/// Whether a partition about to be renumbered, carrying `distinct` terms,
+/// gets 16-bit ids. `distinct` is exact wherever a parent's split measured
+/// it, and `usize::MAX` where nothing did, which keeps 32 bits.
+fn narrow_ids(distinct: usize) -> bool {
+    exp_narrow_ids() && distinct <= NARROW_TERMS
+}
+
+/// Experiment: `INFINO_EXP_NARROW_IDS=1` stores a renumbered partition's
+/// term ids in 16 bits when they fit.
+fn exp_narrow_ids() -> bool {
+    static NARROW: OnceLock<bool> = OnceLock::new();
+    *NARROW.get_or_init(|| env::var("INFINO_EXP_NARROW_IDS").is_ok_and(|v| v == "1"))
+}
+
 /// Whether renumbering this partition's terms would pay for itself.
 ///
 /// The degree and move-gain tables are sized by the vocabulary they are
@@ -763,7 +836,7 @@ fn split_parallel(
 /// the relationship between a partition and its vocabulary, which is the thing
 /// that actually decides whether the tables are oversized. Halving at minimum
 /// also bounds how often it can fire on any root-to-leaf path.
-fn localizing_pays(fwd: &ForwardIndex, order: &[u32], distinct: usize) -> bool {
+fn localizing_pays<T: TermId>(fwd: &ForwardIndex<T>, order: &[u32], distinct: usize) -> bool {
     // An empty table cannot shrink, and without this a partition carrying no
     // terms at all satisfies the test against its own renumbering forever.
     if fwd.n_terms == 0 {
@@ -911,29 +984,33 @@ impl BisectState {
     /// Renumbering is a bijection, so every degree, gain and comparison is
     /// unchanged, and the terms within a document keep their order, so the
     /// gain sums add in the same sequence and to the same float.
-    fn localize(&mut self, fwd: &ForwardIndex, order: &[u32]) -> ForwardIndex {
+    fn localize<T: TermId, U: TermId>(
+        &mut self,
+        fwd: &ForwardIndex<T>,
+        order: &[u32],
+    ) -> ForwardIndex<U> {
         // Outside a refine `deg_left` is all zeros — `clear_degrees` leaves it
         // that way and this runs in a refine's place — so it serves as the
         // global-to-local term map without a second table that size. Zero
         // means "not seen here"; a local id is held as `id + 1`.
-        let mut terms: Vec<u32> = Vec::with_capacity(order.len());
+        let mut terms: Vec<U> = Vec::with_capacity(order.len());
         let mut starts: Vec<u32> = Vec::with_capacity(order.len() + 1);
         starts.push(0);
         let mut n_local = 0u32;
         for &d in order.iter() {
             for &t in fwd.doc(d) {
-                let slot = &mut self.deg_left[t as usize];
+                let slot = &mut self.deg_left[t.index()];
                 if *slot == 0 {
                     n_local += 1;
                     *slot = n_local;
-                    self.touched.push(t);
+                    self.touched.push(t.index() as u32);
                 }
-                terms.push(*slot - 1);
+                terms.push(U::from_local(*slot - 1));
             }
             starts.push(terms.len() as u32);
         }
         for &t in &self.touched {
-            self.deg_left[t as usize] = 0;
+            self.deg_left[t.index()] = 0;
         }
         self.touched.clear();
         ForwardIndex {
@@ -943,9 +1020,9 @@ impl BisectState {
         }
     }
 
-    fn split(
+    fn split<T: TermId>(
         &mut self,
-        fwd: &ForwardIndex,
+        fwd: &ForwardIndex<T>,
         order: &mut [u32],
         depth: u32,
         run: Bisect<'_>,
@@ -955,26 +1032,41 @@ impl BisectState {
             return;
         }
         if localizing_pays(fwd, order, distinct) {
-            let started = REPORT.then(Instant::now);
-            let local = self.localize(fwd, order);
-            if let Some(started) = started {
-                self.note(
-                    depth,
-                    &LevelReport {
-                        localized: 1,
-                        localize_ns: ns_since(started),
-                        ..LevelReport::default()
-                    },
-                );
+            match narrow_ids(distinct) {
+                true => self.localize_and_split::<T, u16>(fwd, order, depth, run),
+                false => self.localize_and_split::<T, u32>(fwd, order, depth, run),
             }
-            let mut inner: Vec<u32> = (0..order.len() as u32).collect();
-            let mut inner_state = BisectState::new(local.n_terms);
-            inner_state.split_halves(&local, &mut inner, depth, run);
-            inner_state.flush(run.report);
-            apply_inner_order(order, &inner);
             return;
         }
         self.split_halves(fwd, order, depth, run);
+    }
+
+    /// Renumber `order`'s terms into ids of type `U` and split it as its own
+    /// index, then carry the order found back onto `order`.
+    fn localize_and_split<T: TermId, U: TermId>(
+        &mut self,
+        fwd: &ForwardIndex<T>,
+        order: &mut [u32],
+        depth: u32,
+        run: Bisect<'_>,
+    ) {
+        let started = REPORT.then(Instant::now);
+        let local: ForwardIndex<U> = self.localize(fwd, order);
+        if let Some(started) = started {
+            self.note(
+                depth,
+                &LevelReport {
+                    localized: 1,
+                    localize_ns: ns_since(started),
+                    ..LevelReport::default()
+                },
+            );
+        }
+        let mut inner: Vec<u32> = (0..order.len() as u32).collect();
+        let mut inner_state = BisectState::new(local.n_terms);
+        inner_state.split_halves(&local, &mut inner, depth, run);
+        inner_state.flush(run.report);
+        apply_inner_order(order, &inner);
     }
 
     /// [`Self::split`] with the entry tests already made.
@@ -983,7 +1075,13 @@ impl BisectState {
     /// [`localizing_pays`] walks every posting in `order` to decide, so the
     /// handoff out of the parallel splitter would otherwise pay for that walk
     /// twice to reach the answer it already has.
-    fn split_halves(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32, run: Bisect<'_>) {
+    fn split_halves<T: TermId>(
+        &mut self,
+        fwd: &ForwardIndex<T>,
+        order: &mut [u32],
+        depth: u32,
+        run: Bisect<'_>,
+    ) {
         let mid = order.len() / 2;
         // The root's first round offers the bar from inside `refine`.
         self.refine(fwd, order, mid, depth, false, run);
@@ -996,9 +1094,9 @@ impl BisectState {
     /// Move documents across the split while it lowers the cost, then
     /// leave the two halves in `order`. `parallel` spreads each round's
     /// gains and sorts across threads.
-    fn refine(
+    fn refine<T: TermId>(
         &mut self,
-        fwd: &ForwardIndex,
+        fwd: &ForwardIndex<T>,
         order: &mut [u32],
         mid: usize,
         depth: u32,
@@ -1134,12 +1232,12 @@ impl BisectState {
                     let (ld, rd) = (left[li], right[ri]);
                     // The degree tables follow the documents across.
                     for &t in fwd.doc(ld) {
-                        self.deg_left[t as usize] -= 1;
-                        self.deg_right[t as usize] += 1;
+                        self.deg_left[t.index()] -= 1;
+                        self.deg_right[t.index()] += 1;
                     }
                     for &t in fwd.doc(rd) {
-                        self.deg_right[t as usize] -= 1;
-                        self.deg_left[t as usize] += 1;
+                        self.deg_right[t.index()] -= 1;
+                        self.deg_left[t.index()] += 1;
                     }
                     left[li] = rd;
                     right[ri] = ld;
@@ -1161,12 +1259,12 @@ impl BisectState {
                         .with_min_len(PAR_MIN_ITEMS)
                         .for_each(|(&l, &r)| {
                             for &t in fwd.doc(left_docs[key_pos(l) as usize]) {
-                                deg_left[t as usize].fetch_sub(1, Relaxed);
-                                deg_right[t as usize].fetch_add(1, Relaxed);
+                                deg_left[t.index()].fetch_sub(1, Relaxed);
+                                deg_right[t.index()].fetch_add(1, Relaxed);
                             }
                             for &t in fwd.doc(right_docs[key_pos(r) as usize]) {
-                                deg_right[t as usize].fetch_sub(1, Relaxed);
-                                deg_left[t as usize].fetch_add(1, Relaxed);
+                                deg_right[t.index()].fetch_sub(1, Relaxed);
+                                deg_left[t.index()].fetch_add(1, Relaxed);
                             }
                         });
                     for (&l, &r) in lefts.iter().zip(rights) {
@@ -1221,8 +1319,8 @@ impl BisectState {
         self.right_gains = right_gains;
         self.last_distinct = self.touched.iter().fold((0, 0), |(l, r), &t| {
             (
-                l + usize::from(self.deg_left[t as usize] > 0),
-                r + usize::from(self.deg_right[t as usize] > 0),
+                l + usize::from(self.deg_left[t.index()] > 0),
+                r + usize::from(self.deg_right[t.index()] > 0),
             )
         });
         self.clear_degrees();
@@ -1258,7 +1356,7 @@ impl BisectState {
         let cost_of = |terms: &[u32]| -> f64 {
             terms
                 .iter()
-                .map(|&t| self.term_split_cost(t as usize, n_left, n_right))
+                .map(|&t| self.term_split_cost(t.index(), n_left, n_right))
                 .sum()
         };
         if !parallel {
@@ -1312,7 +1410,7 @@ impl BisectState {
                 .par_iter()
                 .with_min_len(PAR_MIN_ITEMS)
                 .for_each(|&t| {
-                    let t = t as usize;
+                    let t = t.index();
                     let (dl, dr) = (deg_left[t], deg_right[t]);
                     let left = Side {
                         deg: dl,
@@ -1334,7 +1432,7 @@ impl BisectState {
             return;
         }
         for &t in &self.touched {
-            let t = t as usize;
+            let t = t.index();
             let (dl, dr) = (self.deg_left[t], self.deg_right[t]);
             let left = Side {
                 deg: dl,
@@ -1364,7 +1462,13 @@ impl BisectState {
     /// and the sums it makes, runs the same whichever threads counted. The
     /// serial path lists a term as it first meets it, which costs nothing
     /// beyond the count itself; a pass over the whole vocabulary would.
-    fn count_degrees(&mut self, fwd: &ForwardIndex, order: &[u32], mid: usize, parallel: bool) {
+    fn count_degrees<T: TermId>(
+        &mut self,
+        fwd: &ForwardIndex<T>,
+        order: &[u32],
+        mid: usize,
+        parallel: bool,
+    ) {
         if parallel {
             let Self {
                 deg_left,
@@ -1379,14 +1483,14 @@ impl BisectState {
                     || {
                         left.par_iter().with_min_len(PAR_MIN_ITEMS).for_each(|&d| {
                             for &t in fwd.doc(d) {
-                                deg_left[t as usize].fetch_add(1, Relaxed);
+                                deg_left[t.index()].fetch_add(1, Relaxed);
                             }
                         })
                     },
                     || {
                         right.par_iter().with_min_len(PAR_MIN_ITEMS).for_each(|&d| {
                             for &t in fwd.doc(d) {
-                                deg_right[t as usize].fetch_add(1, Relaxed);
+                                deg_right[t.index()].fetch_add(1, Relaxed);
                             }
                         })
                     },
@@ -1398,7 +1502,7 @@ impl BisectState {
                 (0..deg_left.len() as u32)
                     .into_par_iter()
                     .with_min_len(PAR_MIN_ITEMS)
-                    .filter(|&t| deg_left[t as usize] > 0 || deg_right[t as usize] > 0),
+                    .filter(|&t| deg_left[t.index()] > 0 || deg_right[t.index()] > 0),
             );
             return;
         }
@@ -1406,12 +1510,12 @@ impl BisectState {
             let side_left = i < mid;
             for &t in fwd.doc(d) {
                 // Seen on neither side yet: first sight in this partition.
-                if self.deg_left[t as usize] == 0 && self.deg_right[t as usize] == 0 {
-                    self.touched.push(t);
+                if self.deg_left[t.index()] == 0 && self.deg_right[t.index()] == 0 {
+                    self.touched.push(t.index() as u32);
                 }
                 let slot = match side_left {
-                    true => &mut self.deg_left[t as usize],
-                    false => &mut self.deg_right[t as usize],
+                    true => &mut self.deg_left[t.index()],
+                    false => &mut self.deg_right[t.index()],
                 };
                 *slot += 1;
             }
@@ -1420,8 +1524,8 @@ impl BisectState {
 
     fn clear_degrees(&mut self) {
         for &t in &self.touched {
-            self.deg_left[t as usize] = 0;
-            self.deg_right[t as usize] = 0;
+            self.deg_left[t.index()] = 0;
+            self.deg_right[t.index()] = 0;
         }
         self.touched.clear();
     }
@@ -1432,8 +1536,8 @@ impl BisectState {
 ///
 /// Takes the output buffer rather than returning one so a split's rounds
 /// share two allocations instead of making two apiece.
-fn rank_by_gain(
-    fwd: &ForwardIndex,
+fn rank_by_gain<T: TermId>(
+    fwd: &ForwardIndex<T>,
     half: &[u32],
     move_gain: &[f32],
     parallel: bool,
@@ -1483,8 +1587,12 @@ fn rank_by_gain(
 /// different documents do not wait on one another: summed one document at a
 /// time, every add waited on the one before it, and the gather spent its
 /// time in that chain rather than in its loads.
-fn lane_gains(fwd: &ForwardIndex, group: &[u32], move_gain: &[f32]) -> [f32; GAIN_LANES] {
-    let mut terms: [&[u32]; GAIN_LANES] = [&[]; GAIN_LANES];
+fn lane_gains<T: TermId>(
+    fwd: &ForwardIndex<T>,
+    group: &[u32],
+    move_gain: &[f32],
+) -> [f32; GAIN_LANES] {
+    let mut terms: [&[T]; GAIN_LANES] = [&[]; GAIN_LANES];
     for (slot, &d) in terms.iter_mut().zip(group) {
         *slot = fwd.doc(d);
     }
@@ -1493,7 +1601,7 @@ fn lane_gains(fwd: &ForwardIndex, group: &[u32], move_gain: &[f32]) -> [f32; GAI
     for k in 0..longest {
         for (gain, doc) in gains.iter_mut().zip(&terms) {
             if let Some(&t) = doc.get(k) {
-                *gain += move_gain[t as usize];
+                *gain += move_gain[t.index()];
             }
         }
     }
