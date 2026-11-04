@@ -4700,44 +4700,68 @@ pub(crate) fn column_hll(cols: &[ArrayRef]) -> Option<hll::HllSketch> {
     Some(sketch)
 }
 
-/// The first eight bytes of `s` as a big-endian number, zero-padded. Two
-/// strings whose keys differ order as their keys do; equal keys say nothing.
-#[inline]
-fn order_key(s: &[u8]) -> u64 {
-    let mut head = [0u8; 8];
-    let n = s.len().min(8);
-    head[..n].copy_from_slice(&s[..n]);
-    u64::from_be_bytes(head)
+/// A string's place in byte order as far as its first eight bytes tell:
+/// those bytes as a big-endian number, zero-padded, and the length. Two
+/// strings whose numbers differ order as their numbers do; two that tie and
+/// are both at most eight bytes long order by length (the shorter is the
+/// other's prefix, padded with zeros). Only a tie between longer strings
+/// needs the bytes compared.
+#[derive(Clone, Copy)]
+struct OrderKey<'a> {
+    head: u64,
+    bytes: &'a [u8],
+}
+
+impl<'a> OrderKey<'a> {
+    #[inline]
+    fn new(bytes: &'a [u8]) -> Self {
+        let mut head = [0u8; 8];
+        let n = bytes.len().min(8);
+        head[..n].copy_from_slice(&bytes[..n]);
+        Self {
+            head: u64::from_be_bytes(head),
+            bytes,
+        }
+    }
+
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match self.head.cmp(&other.head) {
+            std::cmp::Ordering::Equal if self.bytes.len() <= 8 && other.bytes.len() <= 8 => {
+                self.bytes.len().cmp(&other.bytes.len())
+            }
+            std::cmp::Ordering::Equal => self.bytes.cmp(other.bytes),
+            order => order,
+        }
+    }
 }
 
 /// The smallest and largest non-null value of `a` in byte order, in one
 /// pass: what [`agg::min_string`] and [`agg::max_string`] return, without
-/// a full comparison for every value. Each value is compared through its
-/// first eight bytes, and in full only when those tie with the bound's.
+/// a full comparison for every value (see [`OrderKey`]).
 fn string_min_max<O: OffsetSizeTrait>(a: &GenericStringArray<O>) -> (Option<&str>, Option<&str>) {
-    let mut bounds: Option<(&str, u64, &str, u64)> = None;
+    let mut bounds: Option<(usize, OrderKey<'_>, usize, OrderKey<'_>)> = None;
     for i in 0..a.len() {
         if a.is_null(i) {
             continue;
         }
-        let v = a.value(i);
-        let key = order_key(v.as_bytes());
+        let key = OrderKey::new(a.value(i).as_bytes());
         match bounds.as_mut() {
-            None => bounds = Some((v, key, v, key)),
-            Some((mn, mn_key, mx, mx_key)) => {
-                if key < *mn_key || (key == *mn_key && v < *mn) {
-                    *mn = v;
-                    *mn_key = key;
+            None => bounds = Some((i, key, i, key)),
+            Some((mn_at, mn, mx_at, mx)) => {
+                if key.cmp(mn).is_lt() {
+                    *mn_at = i;
+                    *mn = key;
                 }
-                if key > *mx_key || (key == *mx_key && v > *mx) {
-                    *mx = v;
-                    *mx_key = key;
+                if key.cmp(mx).is_gt() {
+                    *mx_at = i;
+                    *mx = key;
                 }
             }
         }
     }
     match bounds {
-        Some((mn, _, mx, _)) => (Some(mn), Some(mx)),
+        Some((mn, _, mx, _)) => (Some(a.value(mn)), Some(a.value(mx))),
         None => (None, None),
     }
 }

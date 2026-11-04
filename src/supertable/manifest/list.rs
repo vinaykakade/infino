@@ -936,6 +936,53 @@ fn non_null<V>(values: impl Iterator<Item = Option<V>>) -> impl Iterator<Item = 
         .filter_map(|(row, value)| Some((row, value?)))
 }
 
+/// A string counted by value. A string of at most eight bytes is hashed and
+/// compared as one number (its bytes and its length), so the common short
+/// values of a low-cardinality column never reach a byte comparison.
+#[derive(Clone, Copy)]
+struct CountedStr<'a> {
+    head: u64,
+    len: usize,
+    value: &'a str,
+}
+
+impl<'a> CountedStr<'a> {
+    #[inline]
+    fn new(value: &'a str) -> Self {
+        let bytes = value.as_bytes();
+        let mut head = [0u8; 8];
+        let n = bytes.len().min(8);
+        head[..n].copy_from_slice(&bytes[..n]);
+        Self {
+            head: u64::from_le_bytes(head),
+            len: bytes.len(),
+            value,
+        }
+    }
+}
+
+impl PartialEq for CountedStr<'_> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.head == other.head
+            && self.len == other.len
+            && (self.len <= 8 || self.value.as_bytes()[8..] == other.value.as_bytes()[8..])
+    }
+}
+
+impl Eq for CountedStr<'_> {}
+
+impl Hash for CountedStr<'_> {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.head);
+        state.write_usize(self.len);
+        if self.len > 8 {
+            state.write(&self.value.as_bytes()[8..]);
+        }
+    }
+}
+
 /// Counts one column's values, for [`ScalarValueCounts::from_pieces`].
 type Counter = fn(&[ArrayRef]) -> Option<ScalarValueCounts>;
 
@@ -957,15 +1004,27 @@ fn counter(data_type: &DataType) -> Option<Counter> {
         DataType::UInt32 => ScalarValueCounts::primitive::<UInt32Type>,
         DataType::UInt64 => ScalarValueCounts::primitive::<UInt64Type>,
         DataType::Decimal128(_, _) => ScalarValueCounts::primitive::<Decimal128Type>,
-        DataType::Utf8 => |pieces| {
-            ScalarValueCounts::count(pieces, |piece| {
+        DataType::Utf8 => |pieces| match crate::utils::exp::counts_presize() {
+            true => ScalarValueCounts::count(pieces, |piece| {
+                Some(
+                    non_null(piece.as_string_opt::<i32>()?.iter())
+                        .map(|(row, v)| (row, CountedStr::new(v))),
+                )
+            }),
+            false => ScalarValueCounts::count(pieces, |piece| {
                 Some(non_null(piece.as_string_opt::<i32>()?.iter()))
-            })
+            }),
         },
-        DataType::LargeUtf8 => |pieces| {
-            ScalarValueCounts::count(pieces, |piece| {
+        DataType::LargeUtf8 => |pieces| match crate::utils::exp::counts_presize() {
+            true => ScalarValueCounts::count(pieces, |piece| {
+                Some(
+                    non_null(piece.as_string_opt::<i64>()?.iter())
+                        .map(|(row, v)| (row, CountedStr::new(v))),
+                )
+            }),
+            false => ScalarValueCounts::count(pieces, |piece| {
                 Some(non_null(piece.as_string_opt::<i64>()?.iter()))
-            })
+            }),
         },
         _ => return None,
     };
