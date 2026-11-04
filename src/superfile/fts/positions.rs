@@ -19,8 +19,8 @@ use std::ops::Range;
 
 use crate::{
     superfile::bits::{
-        ExceptionPlan, PackScratch, get_bits, payload_bytes, plan_exceptions, put_bits,
-        unpack_lanes_u32,
+        ExceptionPlan, PackScratch, get_bits, pack_lanes_u32, payload_bytes, plan_exceptions,
+        put_bits, unpack_lanes_u32,
     },
     utils::varint::{push_varint, read_varint, varint_len},
 };
@@ -281,6 +281,11 @@ fn plan_stream(
     );
 }
 
+pub(crate) fn exp_bitwriter() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INFINO_EXP_BITWRITER").is_ok_and(|v| v == "1"))
+}
+
 /// Emit one stream per its plan.
 fn write_stream(out: &mut Vec<u8>, lanes: &[u32], plan: &ExceptionPlan, fixed: bool) {
     debug_assert!(plan.width <= GROUP_MAX_WIDTH);
@@ -292,7 +297,9 @@ fn write_stream(out: &mut Vec<u8>, lanes: &[u32], plan: &ExceptionPlan, fixed: b
     }
     let start = out.len();
     out.resize(start + payload_bytes(lanes.len(), plan.width), 0);
-    if plan.width > 0 {
+    if exp_bitwriter() {
+        pack_lanes_u32(&mut out[start..], lanes, plan.width);
+    } else if plan.width > 0 {
         let mask: u64 = (1u64 << plan.width) - 1;
         for (i, &v) in lanes.iter().enumerate() {
             put_bits(
