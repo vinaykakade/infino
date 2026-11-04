@@ -1403,9 +1403,11 @@ impl Supertable {
                     // doesn't grow forever across repeated compactions.
                     // The disk cache is already size-bounded (LRU), so its
                     // stale entries just age out on their own.
+                    let remove_span = detail_span!("commit_store_remove").entered();
                     for entry in &entries_to_remove {
                         opts.store.remove(&entry.uri);
                     }
+                    drop(remove_span);
 
                     // Disk-cache warm + background storage reclaim ride the
                     // shared post-commit finalizer (the same path writer
@@ -1421,7 +1423,25 @@ impl Supertable {
                         &entries_to_remove,
                         pending_cache_inserts,
                     )
+                    .instrument(detail_span!("commit_finalize"))
                     .await;
+
+                    // What the commit no longer needs: the merged outputs'
+                    // spilled term contributions and the layer's spilled
+                    // objects, whose scratch files go with them.
+                    let doomed = (
+                        mem::take(&mut batch),
+                        mem::take(&mut term_contributions),
+                        reserved_layer.take(),
+                        mem::take(&mut rebuilt_parts),
+                        mem::take(&mut pending_storage_writes),
+                    );
+                    if crate::utils::exp::bg_drop() {
+                        std::thread::spawn(move || drop(doomed));
+                    } else {
+                        let _span = detail_span!("commit_drop").entered();
+                        drop(doomed);
+                    }
 
                     return match deferred_error {
                         Some(e) => Err(e),

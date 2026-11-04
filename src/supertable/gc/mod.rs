@@ -193,7 +193,7 @@ async fn delete_objects(
                 (key, result)
             }
         })
-        .buffer_unordered(RECLAIM_CONCURRENCY)
+        .buffer_unordered(crate::utils::exp::gc_deletes())
         .for_each(|(key, result)| {
             on_result(key, result);
             future::ready(())

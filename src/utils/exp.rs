@@ -47,3 +47,7 @@ count!(ti_writes, "INFINO_EXP_TI_WRITES", 64);
 // threads the merges that have finished no longer use, rather than on the
 // merge's own share of them.
 flag!(encode_pool, "INFINO_EXP_ENCODE_POOL");
+// Drop what a compaction commit is done with on a thread of its own.
+flag!(bg_drop, "INFINO_EXP_BG_DROP");
+// Gc deletes in flight at once.
+count!(gc_deletes, "INFINO_EXP_GC_DELETES", 256);
