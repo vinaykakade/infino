@@ -3405,7 +3405,41 @@ impl SupertableWriter {
         let t_pub = Instant::now();
         let mut t_list = 0.0f64;
         let mut ticket = self.inner.append_queue.reserve();
-        if let Some(storage) = &self.inner.options.storage {
+        if let Some(storage) = &self.inner.options.storage
+            && exp_pub_join()
+        {
+            // The layer is built and written while the superfiles upload.
+            let contributions = mem::take(&mut batch.term_contributions);
+            let layer_task = (!contributions.is_empty()).then(|| {
+                let (storage, policy) = (
+                    Arc::clone(storage),
+                    self.inner.options.term_index_build_policy(),
+                );
+                runtime.spawn(async move {
+                    let reserved = term_index::reserve_layer(&storage, &contributions, &policy).await;
+                    (contributions, reserved)
+                })
+            });
+            let listed = bridge_on_runtime(
+                write_superfile_list(
+                    storage,
+                    &self.inner.options,
+                    &mut batch.pending_storage_writes,
+                    &mut Vec::new(),
+                ),
+                &runtime,
+            );
+            t_list = t_pub.elapsed().as_secs_f64();
+            if let Some(task) = layer_task {
+                let (contributions, reserved) = bridge_on_runtime(task, &runtime)
+                    .map_err(|e| BuildError::Store(format!("term-index layer task: {e}")))?;
+                batch.term_contributions = contributions;
+                listed?;
+                layer = Some(reserved.map_err(|e| BuildError::Store(e.to_string()))?);
+            } else {
+                listed?;
+            }
+        } else if let Some(storage) = &self.inner.options.storage {
             let list_span = detail_span!("publish.write_list").entered();
             bridge_on_runtime(
                 write_superfile_list(
@@ -4128,6 +4162,11 @@ fn exp_lane_chunks() -> usize {
 fn exp_lane_min_chunk_rows() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| exp_env("INFINO_EXP_LANE_MIN_CHUNK", 1024))
+}
+
+fn exp_pub_join() -> bool {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| exp_env("INFINO_EXP_PUB_JOIN", 0)) != 0
 }
 
 fn exp_lane_steal() -> bool {
