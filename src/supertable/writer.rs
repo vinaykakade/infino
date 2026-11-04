@@ -1752,7 +1752,6 @@ impl SupertableWriter {
         batch: &RecordBatch,
         label: SourceLabel<'_>,
     ) -> Result<(), BuildError> {
-        crate::runtime_metrics::rss::exp_start_background_purge();
         let options = &self.inner.options;
         let manifest = self.inner.manifest.load();
 
