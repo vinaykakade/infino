@@ -1312,9 +1312,15 @@ impl<const P: bool> BisectState<P> {
         self.right_gains = right_gains;
         let refined = Refined {
             first_round_gain,
-            distinct: self.distinct_by_side(),
+            distinct: match exp_fuse_clear() {
+                true => self.take_distinct_by_side(),
+                false => {
+                    let distinct = self.distinct_by_side();
+                    self.clear_degrees();
+                    distinct
+                }
+            },
         };
-        self.clear_degrees();
 
         let Some(started) = started else {
             return refined;
@@ -1597,6 +1603,22 @@ impl<const P: bool> BisectState<P> {
         }
     }
 
+    /// [`Self::distinct_by_side`] and [`Self::clear_degrees`] in one pass.
+    fn take_distinct_by_side(&mut self) -> [usize; 2] {
+        let mut distinct = [0usize; 2];
+        for i in 0..self.touched.len() {
+            let t = self.touched[i];
+            let (a, b) = (self.l(t), self.r(t));
+            distinct[0] += usize::from(self.deg[a] > 0);
+            distinct[1] += usize::from(self.deg[b] > 0);
+            self.deg[a] = 0;
+            self.deg[b] = 0;
+        }
+        self.touched.clear();
+        self.dirty = None;
+        distinct
+    }
+
     fn clear_degrees(&mut self) {
         for i in 0..self.touched.len() {
             let t = self.touched[i];
@@ -1722,6 +1744,12 @@ fn exp_rank_pf() -> bool {
     cfg!(test) || *ON.get_or_init(|| std::env::var("INFINO_EXP_RANK_PF").is_ok_and(|v| v == "1"))
 }
 
+/// Experiment knob: count each side's terms while clearing the degrees.
+fn exp_fuse_clear() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test) || *ON.get_or_init(|| std::env::var("INFINO_EXP_FUSE_CLEAR").is_ok_and(|v| v == "1"))
+}
+
 /// Ask for the cache line at `p` ahead of its use.
 #[inline(always)]
 fn prefetch<T>(p: *const T) {
@@ -1742,16 +1770,24 @@ fn lane_gains_fast(fwd: &ForwardIndex, group: &[u32], move_gain: &[f32]) -> [f32
         return lane_gains(fwd, group, move_gain);
     };
     let terms: [&[u32]; GAIN_LANES] = group.map(|d| fwd.doc(d));
-    let len = terms[0].len();
-    if terms.iter().any(|t| t.len() != len) {
-        return lane_gains(fwd, group, move_gain);
-    }
+    let shortest = terms.iter().map(|t| t.len()).min().unwrap_or(0);
+    let longest = terms.iter().map(|t| t.len()).max().unwrap_or(0);
     let mut gains = [0.0f32; GAIN_LANES];
-    for k in 0..len {
+    // Every document has its first `shortest` terms; each still adds its
+    // own terms in its own order, so splitting the loop changes no sum.
+    for k in 0..shortest {
         for (gain, doc) in gains.iter_mut().zip(&terms) {
-            // SAFETY: every document in the group carries `len` terms, and a
-            // term id is below the table's length by construction.
+            // SAFETY: every document in the group carries at least
+            // `shortest` terms, and a term id is below the table's length by
+            // construction.
             *gain += unsafe { *move_gain.get_unchecked(*doc.get_unchecked(k) as usize) };
+        }
+    }
+    for k in shortest..longest {
+        for (gain, doc) in gains.iter_mut().zip(&terms) {
+            if let Some(&t) = doc.get(k) {
+                *gain += move_gain[t as usize];
+            }
         }
     }
     gains
