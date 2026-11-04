@@ -496,3 +496,6 @@ path = "examples/locomo-recall/main.rs"
 
 [[example]]
 name = "token_hash"
+
+[[example]]
+name = "parquet_to_jsonl"
