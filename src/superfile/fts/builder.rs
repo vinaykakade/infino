@@ -110,7 +110,7 @@ use rayon::ThreadPool;
 use tempfile::{Builder, TempDir};
 use tracing::debug;
 
-use super::term_table::TermTable;
+use super::term_table::{TermTable, exp_prefetch, term_hash};
 
 use crate::{
     config::scratch_root,
@@ -602,6 +602,50 @@ enum PositionSink<'a> {
     Chain(&'a mut Vec<(u32, u32)>),
 }
 
+/// EXPERIMENT: a document's tokens, from its text or a tokenized chunk.
+#[derive(Clone, Copy)]
+enum DocSource<'t> {
+    Text(&'t str),
+    Batch { start: usize, end: usize },
+}
+
+/// EXPERIMENT: a chunk of documents' tokens.
+#[derive(Default)]
+struct TokenBatch {
+    bytes: Vec<u8>,
+    spans: Vec<(u32, u32)>,
+    positions: Vec<u64>,
+    hashes: Vec<u64>,
+    ids: Vec<u32>,
+    doc_ends: Vec<u32>,
+}
+
+/// EXPERIMENT knob `INFINO_EXP_PF`: 0 off (per-doc add_doc), 1 batch,
+/// 2 batch + prefetch, 3 batch + demand-load touches.
+fn exp_pf_mode() -> u8 {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("INFINO_EXP_PF")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// EXPERIMENT: (tokens per chunk, prefetch distance).
+fn exp_pf_params() -> (usize, usize) {
+    static P: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        let get = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        (get("INFINO_EXP_PF_TOKENS", 256), get("INFINO_EXP_PF_DIST", 16))
+    })
+}
+
 /// Where a column's postings live: in RAM until the column's estimated
 /// bytes cross the builder's `spill_threshold_bytes`, then in hash-
 /// partitioned spill files for the rest of the build. The records in
@@ -965,7 +1009,20 @@ fn intern_term_id(
     arena: &Bump,
     term: &str,
 ) -> (u32, bool) {
-    let (id, is_new) = term_to_id.intern(term.as_bytes(), id_to_term);
+    let hash = term_hash(term.as_bytes());
+    intern_term_id_hashed(term_to_id, id_to_term, arena, term, hash)
+}
+
+/// [`intern_term_id`] with the term's hash already computed.
+#[inline(always)]
+fn intern_term_id_hashed(
+    term_to_id: &mut TermTable,
+    id_to_term: &mut Vec<ArenaStr>,
+    arena: &Bump,
+    term: &str,
+    hash: u64,
+) -> (u32, bool) {
+    let (id, is_new) = term_to_id.intern_hashed(term.as_bytes(), hash, id_to_term);
     if is_new {
         debug_assert_eq!(id as usize, id_to_term.len());
         // Bump-arena copy: one pointer advance + memcpy of the term
@@ -1437,6 +1494,8 @@ pub struct FtsBuilder {
     /// spilled positional drain path (the in-RAM path encodes
     /// straight into the accumulator's per-term buffer instead).
     run_scratch: Vec<u8>,
+    /// EXPERIMENT: a chunk of tokenized documents for `add_docs`.
+    batch: TokenBatch,
     /// The Parquet row each doc id stands for, when the caller fed
     /// documents in an order of its own rather than in row order.
     ///
@@ -1957,6 +2016,7 @@ impl FtsBuilder {
             doc_pos_chain: Vec::new(),
             pos_scratch: Vec::new(),
             run_scratch: Vec::new(),
+            batch: TokenBatch::default(),
             doc_map: None,
             sorted_inputs: Vec::new(),
             head_sink: None,
@@ -2215,6 +2275,158 @@ impl FtsBuilder {
         local_doc_id: u32,
         text: &str,
     ) -> Result<(), BuildError> {
+        self.add_doc_from(column_id, local_doc_id, DocSource::Text(text))
+    }
+
+    /// EXPERIMENT: tokenize `n` documents in chunks, intern each chunk's
+    /// tokens in one tight pass (optionally prefetching), then replay.
+    pub(crate) fn add_docs<'a>(
+        &mut self,
+        column_id: u32,
+        first_doc: u32,
+        n: usize,
+        text_at: impl Fn(usize) -> &'a str,
+    ) -> Result<(), BuildError> {
+        let col_idx = column_id as usize;
+        let mode = exp_pf_mode();
+        let simple = col_idx < self.columns.len() && {
+            let t = self.column_tokenizers[col_idx].as_ref().as_any();
+            t.downcast_ref::<StandardTokenizer>().is_some()
+                || t.downcast_ref::<ChainTokenizer>().is_some()
+        };
+        if mode == 0 || !simple || self.failed {
+            for row in 0..n {
+                self.add_doc(column_id, first_doc + row as u32, text_at(row))?;
+            }
+            return Ok(());
+        }
+        let (max_tokens, dist) = exp_pf_params();
+        let positional = self.columns[col_idx].positions;
+        let mut row = 0;
+        while row < n {
+            let chunk_start = row;
+            {
+                let tokenizer = self.column_tokenizers[col_idx].as_ref().as_any();
+                let standard = tokenizer.downcast_ref::<StandardTokenizer>();
+                let chain = tokenizer.downcast_ref::<ChainTokenizer>();
+                let b = &mut self.batch;
+                b.bytes.clear();
+                b.spans.clear();
+                b.positions.clear();
+                b.hashes.clear();
+                b.ids.clear();
+                b.doc_ends.clear();
+                while row < n && b.spans.len() < max_tokens {
+                    let text = text_at(row);
+                    let TokenBatch { bytes, spans, positions, .. } = b;
+                    let mut push = |tok: &str, pos: u64| {
+                        spans.push((bytes.len() as u32, tok.len() as u32));
+                        bytes.extend_from_slice(tok.as_bytes());
+                        positions.push(pos);
+                    };
+                    if let Some(standard) = standard {
+                        let mut ord = 0u64;
+                        standard.tokenize_each_inline(text, |tok| {
+                            push(tok, ord);
+                            ord += 1;
+                        });
+                    } else if let Some(chain) = chain {
+                        chain.tokenize_each_inline_positioned(text, &mut push);
+                    }
+                    b.doc_ends.push(b.spans.len() as u32);
+                    row += 1;
+                }
+                for &(st, len) in &b.spans {
+                    b.hashes.push(term_hash(&b.bytes[st as usize..(st + len) as usize]));
+                }
+                let ColumnPostings { vocab, store } = &mut self.postings[col_idx];
+                if mode == 3 {
+                    let mut acc = 0u32;
+                    for &h in &b.hashes {
+                        acc ^= vocab.term_to_id.touch(h);
+                    }
+                    std::hint::black_box(acc);
+                }
+                let nt = b.spans.len();
+                for j in 0..nt {
+                    if mode == 2 && j + dist < nt {
+                        vocab.term_to_id.prefetch(b.hashes[j + dist]);
+                    }
+                    let (st, len) = b.spans[j];
+                    let tok = std::str::from_utf8(&b.bytes[st as usize..(st + len) as usize])
+                        .expect("tokens are utf-8");
+                    let (id, _) = intern_term_id_hashed(
+                        &mut vocab.term_to_id,
+                        &mut vocab.id_to_term,
+                        &vocab.term_arena,
+                        tok,
+                        b.hashes[j],
+                    );
+                    if mode == 2 {
+                        let i = id as usize;
+                        if i < vocab.dense_doc_tf.len() {
+                            exp_prefetch(vocab.dense_doc_tf.as_ptr().wrapping_add(i) as *const u8);
+                            if positional {
+                                exp_prefetch(
+                                    vocab.dense_doc_poshead.as_ptr().wrapping_add(i) as *const u8,
+                                );
+                            }
+                            if let PostingStore::Ram(ram) = store {
+                                if i < ram.lists.len() {
+                                    exp_prefetch(ram.lists.as_ptr().wrapping_add(i) as *const u8);
+                                }
+                            }
+                        }
+                    }
+                    b.ids.push(id);
+                }
+                let nterms = vocab.id_to_term.len();
+                if mode == 3 {
+                    let mut acc = 0u32;
+                    for &id in &b.ids {
+                        let i = id as usize;
+                        if i < vocab.dense_doc_tf.len() {
+                            acc ^= vocab.dense_doc_tf[i];
+                            if positional {
+                                acc ^= vocab.dense_doc_poshead[i];
+                            }
+                            if let PostingStore::Ram(ram) = store {
+                                if let Some(l) = ram.lists.get(i) {
+                                    acc ^= l.runs.last().copied().unwrap_or(0) as u32;
+                                }
+                            }
+                        }
+                    }
+                    std::hint::black_box(acc);
+                }
+                vocab.dense_doc_tf.resize(nterms, 0);
+                if positional {
+                    vocab.dense_doc_poshead.resize(nterms, CHAIN_END);
+                }
+                if let PostingStore::Ram(ram) = store {
+                    ram.grow_to(nterms);
+                }
+            }
+            let mut start = 0usize;
+            for d in 0..(row - chunk_start) {
+                let end = self.batch.doc_ends[d] as usize;
+                self.add_doc_from(
+                    column_id,
+                    first_doc + (chunk_start + d) as u32,
+                    DocSource::Batch { start, end },
+                )?;
+                start = end;
+            }
+        }
+        Ok(())
+    }
+
+    fn add_doc_from(
+        &mut self,
+        column_id: u32,
+        local_doc_id: u32,
+        src: DocSource<'_>,
+    ) -> Result<(), BuildError> {
         let col_idx = column_id as usize;
         if col_idx >= self.columns.len() {
             return Err(BuildError::FtsColumnTypeInvalid {
@@ -2273,14 +2485,20 @@ impl FtsBuilder {
         // Run bytes the in-RAM sink appended during the scan.
         let mut run_bytes: usize = 0;
 
+        let (text, batch) = match src {
+            DocSource::Text(t) => (t, None),
+            DocSource::Batch { start, end } => (
+                "",
+                Some((&self.batch.ids[start..end], &self.batch.positions[start..end])),
+            ),
+        };
         // Per-token cost: intern lookup + dense-array tf bump; the
         // positional scan also links each occurrence into the per-doc
         // chain. Both stores share this scan and differ only in where
         // the per-doc drain below puts the postings.
         if !positional {
-            let mut on_token = |tok: &str| {
+            let mut on_id = |term_id: u32, is_new: bool| {
                 tokens_in_doc += 1;
-                let (term_id, is_new) = intern_term_id(term_to_id, id_to_term, term_arena, tok);
                 let idx = term_id as usize;
                 if is_new {
                     debug_assert_eq!(idx, dense_doc_tf.len());
@@ -2297,12 +2515,23 @@ impl FtsBuilder {
                 }
                 *slot += 1;
             };
-            if let Some(standard) = standard_tok {
-                standard.tokenize_each_inline(text, &mut on_token);
-            } else if let Some(chain) = chain_tok {
-                chain.tokenize_each_inline(text, &mut on_token);
+            if let Some((ids, _)) = batch {
+                for &id in ids {
+                    on_id(id, false);
+                }
             } else {
-                tokenizer.tokenize_each(text, &mut on_token);
+                let mut on_token = |tok: &str| {
+                    let (term_id, is_new) =
+                        intern_term_id(term_to_id, id_to_term, term_arena, tok);
+                    on_id(term_id, is_new);
+                };
+                if let Some(standard) = standard_tok {
+                    standard.tokenize_each_inline(text, &mut on_token);
+                } else if let Some(chain) = chain_tok {
+                    chain.tokenize_each_inline(text, &mut on_token);
+                } else {
+                    tokenizer.tokenize_each(text, &mut on_token);
+                }
             }
         } else {
             self.doc_pos_chain.clear();
@@ -2313,16 +2542,15 @@ impl FtsBuilder {
                 },
                 PostingStore::Spilled(_) => PositionSink::Chain(&mut self.doc_pos_chain),
             };
-            // `record` interns the token, bumps its tf, and hands its
-            // `position` to the sink. `position` is the gap-inclusive
-            // ordinal — a token the tokenizer drops still advances it, so
-            // a phrase never treats the tokens on either side of a dropped
-            // word as adjacent. The doc length (`tokens_in_doc`) counts
-            // only *emitted* tokens, bumped by the caller below, so it
-            // stays identical to the positionless build; the two coincide
-            // only when nothing is dropped.
-            let mut record = |tok: &str, position: u64| {
-                let (term_id, is_new) = intern_term_id(term_to_id, id_to_term, term_arena, tok);
+            // `record` bumps the token's tf and hands its `position` to
+            // the sink. `position` is the gap-inclusive ordinal — a token
+            // the tokenizer drops still advances it, so a phrase never
+            // treats the tokens on either side of a dropped word as
+            // adjacent. The doc length (`tokens_in_doc`) counts only
+            // *emitted* tokens, bumped by the caller below, so it stays
+            // identical to the positionless build; the two coincide only
+            // when nothing is dropped.
+            let mut record = |term_id: u32, is_new: bool, position: u64| {
                 let idx = term_id as usize;
                 if is_new {
                     debug_assert_eq!(idx, dense_doc_tf.len());
@@ -2365,13 +2593,20 @@ impl FtsBuilder {
                     }
                 }
             };
-            if let Some(standard) = standard_tok {
+            let mut intern = |tok: &str| intern_term_id(term_to_id, id_to_term, term_arena, tok);
+            if let Some((ids, positions)) = batch {
+                for (&id, &position) in ids.iter().zip(positions) {
+                    record(id, false, position);
+                    tokens_in_doc += 1;
+                }
+            } else if let Some(standard) = standard_tok {
                 // `standard` drops nothing — every segment carrying an
                 // alphanumeric is emitted — so an emission ordinal *is*
                 // the gap-inclusive position and no gap bookkeeping is
                 // needed. Monomorphized for the same reason as above.
                 standard.tokenize_each_inline(text, |tok| {
-                    record(tok, tokens_in_doc);
+                    let (id, is_new) = intern(tok);
+                    record(id, is_new, tokens_in_doc);
                     tokens_in_doc += 1;
                 });
             } else if let Some(chain) = chain_tok {
@@ -2380,7 +2615,8 @@ impl FtsBuilder {
                 // the doc length counts only what is emitted — the token
                 // count Lucene's norms are built from too.
                 chain.tokenize_each_inline_positioned(text, |tok, position| {
-                    record(tok, position);
+                    let (id, is_new) = intern(tok);
+                    record(id, is_new, position);
                     tokens_in_doc += 1;
                 });
             } else {
@@ -2389,7 +2625,8 @@ impl FtsBuilder {
                 // consecutive, which is correct for one that drops
                 // nothing (see the `Tokenizer` trait docs).
                 tokenizer.tokenize_each_positioned(text, &mut |tok, position| {
-                    record(tok, position);
+                    let (id, is_new) = intern(tok);
+                    record(id, is_new, position);
                     tokens_in_doc += 1;
                 });
             }
@@ -2958,6 +3195,7 @@ impl FtsBuilder {
             doc_pos_chain: _,
             pos_scratch: _,
             run_scratch: _,
+            batch: _,
             doc_map,
             sorted_inputs: _,
             mut head_sink,
@@ -3118,6 +3356,7 @@ impl FtsBuilder {
             doc_pos_chain: _,
             pos_scratch: _,
             run_scratch: _,
+            batch: _,
             doc_map,
             sorted_inputs,
             mut head_sink,

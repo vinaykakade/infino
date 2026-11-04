@@ -53,12 +53,22 @@ impl TermTable {
     /// must push `term` onto `keys` before the next call.
     #[inline(always)]
     pub(crate) fn intern<K: AsRef<[u8]>>(&mut self, term: &[u8], keys: &[K]) -> (u32, bool) {
+        self.intern_hashed(term, term_hash(term), keys)
+    }
+
+    /// [`Self::intern`] with the term's [`term_hash`] already computed.
+    #[inline(always)]
+    pub(crate) fn intern_hashed<K: AsRef<[u8]>>(
+        &mut self,
+        term: &[u8],
+        hash: u64,
+        keys: &[K],
+    ) -> (u32, bool) {
         if self.len >= self.grow_at {
             self.grow(keys);
         }
         let n = term.len();
         let words = load_words(&term[..n.min(INLINE_BYTES)]);
-        let hash = hash_term(term, words);
         let tag = tag_of(n);
         let mask = self.slots.len() - 1;
         let mut i = hash as usize & mask;
@@ -78,6 +88,26 @@ impl TermTable {
             }
             i = (i + 1) & mask;
         }
+    }
+
+    /// EXPERIMENT: read the home slot's tag for `hash` (a demand load the
+    /// caller can issue ahead of the probe).
+    #[inline(always)]
+    pub(crate) fn touch(&self, hash: u64) -> u32 {
+        if self.slots.is_empty() {
+            return 0;
+        }
+        self.slots[hash as usize & (self.slots.len() - 1)].tag
+    }
+
+    /// EXPERIMENT: software prefetch of the home slot for `hash`.
+    #[inline(always)]
+    pub(crate) fn prefetch(&self, hash: u64) {
+        if self.slots.is_empty() {
+            return;
+        }
+        let p = self.slots.as_ptr().wrapping_add(hash as usize & (self.slots.len() - 1));
+        exp_prefetch(p as *const u8);
     }
 
     /// Double the capacity (16 slots at first) and reinsert every term.
@@ -102,6 +132,25 @@ impl TermTable {
         }
         self.grow_at = cap / 4 * 3;
     }
+}
+
+/// EXPERIMENT: prefetch the line holding `p` into L1.
+#[inline(always)]
+pub(crate) fn exp_prefetch(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch never faults, whatever the address.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
+/// The table's hash of `term`.
+#[inline(always)]
+pub(crate) fn term_hash(term: &[u8]) -> u64 {
+    let n = term.len();
+    hash_term(term, load_words(&term[..n.min(INLINE_BYTES)]))
 }
 
 #[inline(always)]

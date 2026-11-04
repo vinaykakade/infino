@@ -4265,15 +4265,9 @@ pub(crate) fn index_fts_rows(
             .as_any()
             .downcast_ref::<LargeStringArray>()
             .expect("schema validated as LargeUtf8");
-        for row in 0..batch.num_rows() {
-            let local_doc_id = first_doc + row as u32;
-            let text = if strs.is_null(row) {
-                ""
-            } else {
-                strs.value(row)
-            };
-            fb.add_doc(col_id as u32, local_doc_id, text)?;
-        }
+        fb.add_docs(col_id as u32, first_doc, batch.num_rows(), |row| {
+            if strs.is_null(row) { "" } else { strs.value(row) }
+        })?;
     }
     Ok(())
 }
