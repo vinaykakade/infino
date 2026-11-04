@@ -179,6 +179,8 @@ use crate::{
 ///     total, comfortably L2-resident as one contiguous arena
 ///     instead of ~10K separate heap allocations chasing
 ///     pointers through unrelated allocator buckets).
+use super::term_table::TermTable;
+
 type TermIdMap = HbHashMap<&'static str, u32, FxBuildHasher>;
 
 /// Chain terminator for the per-doc position chains
@@ -498,6 +500,10 @@ impl ColumnState {
 struct Vocab {
     /// Term → dense id. Keys borrow from `term_arena` (see [`TermIdMap`]).
     term_to_id: TermIdMap,
+    /// The inline-key interner, used in place of `term_to_id` when
+    /// `INFINO_EXP_TERM_TABLE` is set.
+    term_table: TermTable,
+    use_table: bool,
     /// Id → term bytes, for the dictionary emit and the lex-rank table.
     /// Entries borrow from `term_arena` like the map's keys.
     id_to_term: Vec<&'static str>,
@@ -526,6 +532,8 @@ impl Vocab {
     fn new() -> Self {
         Self {
             term_to_id: TermIdMap::default(),
+            term_table: TermTable::new(),
+            use_table: exp_term_table(),
             id_to_term: Vec::new(),
             dense_doc_tf: Vec::new(),
             dense_doc_poshead: Vec::new(),
@@ -542,8 +550,10 @@ impl Vocab {
     /// Intern `term`, growing the per-id arrays when it is new.
     #[inline(always)]
     fn intern(&mut self, term: &str, positional: bool) -> u32 {
-        let (term_id, is_new) = intern_term_id(
+        let (term_id, is_new) = intern_any(
             &mut self.term_to_id,
+            &mut self.term_table,
+            self.use_table,
             &mut self.id_to_term,
             &self.term_arena,
             term,
@@ -1030,6 +1040,38 @@ fn intern_term_id(
             (id, true)
         }
     }
+}
+
+/// Experiment knob: intern through [`TermTable`] instead of the
+/// hashbrown map.
+fn exp_term_table() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("INFINO_EXP_TERM_TABLE").is_some_and(|v| v != "0"))
+}
+
+/// [`intern_term_id`] through whichever table the knob picks.
+#[inline(always)]
+fn intern_any(
+    term_to_id: &mut TermIdMap,
+    term_table: &mut TermTable,
+    use_table: bool,
+    id_to_term: &mut Vec<&'static str>,
+    arena: &Bump,
+    term: &str,
+) -> (u32, bool) {
+    if !use_table {
+        return intern_term_id(term_to_id, id_to_term, arena, term);
+    }
+    let (id, is_new) = term_table.intern(term.as_bytes(), id_to_term);
+    if is_new {
+        debug_assert_eq!(id as usize, id_to_term.len());
+        let arena_str: &str = arena.alloc_str(term);
+        // SAFETY: as in `intern_term_id` — the arena outlives every
+        // reader of `id_to_term` (see [`TermIdMap`]).
+        let static_str: &'static str = unsafe { std::mem::transmute(arena_str) };
+        id_to_term.push(static_str);
+    }
+    (id, is_new)
 }
 
 /// Min-heap entry for the k-way merge over sorted partition chunks.
@@ -2320,6 +2362,8 @@ impl FtsBuilder {
         let ColumnPostings { vocab, store } = &mut self.postings[col_idx];
         let Vocab {
             term_to_id,
+            term_table,
+            use_table,
             id_to_term,
             dense_doc_tf,
             dense_doc_poshead,
@@ -2338,7 +2382,9 @@ impl FtsBuilder {
         if !positional {
             let mut on_token = |tok: &str| {
                 tokens_in_doc += 1;
-                let (term_id, is_new) = intern_term_id(term_to_id, id_to_term, term_arena, tok);
+                let (term_id, is_new) = intern_any(
+                    term_to_id, term_table, *use_table, id_to_term, term_arena, tok,
+                );
                 let idx = term_id as usize;
                 if is_new {
                     debug_assert_eq!(idx, dense_doc_tf.len());
@@ -2381,7 +2427,9 @@ impl FtsBuilder {
             // stays identical to the positionless build; the two coincide
             // only when nothing is dropped.
             let mut record = |tok: &str, position: u64| {
-                let (term_id, is_new) = intern_term_id(term_to_id, id_to_term, term_arena, tok);
+                let (term_id, is_new) = intern_any(
+                    term_to_id, term_table, *use_table, id_to_term, term_arena, tok,
+                );
                 let idx = term_id as usize;
                 if is_new {
                     debug_assert_eq!(idx, dense_doc_tf.len());
@@ -2804,11 +2852,13 @@ impl FtsBuilder {
                 };
                 let Vocab {
                     term_to_id,
+                    term_table,
                     id_to_term,
                     term_arena,
                     ..
                 } = vocab;
                 drop(term_to_id);
+                drop(term_table);
                 // Every table in dictionary order: the merged walk at the
                 // finish then reads each lane front to back.
                 let (_, by_lex) = build_lex_rank(&id_to_term);
@@ -3391,10 +3441,12 @@ impl FtsBuilder {
                     PostingStore::Spilled(partitions) => {
                         let Vocab {
                             term_to_id,
+                            term_table,
                             id_to_term,
                             term_arena,
                             ..
                         } = vocab;
+                        drop(term_table);
                         // Term interner is finished being written to; drop the
                         // forward map (`term_to_id`) immediately — the rest of
                         // the spilled finish only needs the reverse map
@@ -4521,10 +4573,12 @@ fn emit_ram_column<W: Write>(
     let col_positions = sink.col_positions;
     let Vocab {
         term_to_id,
+        term_table,
         id_to_term,
         term_arena,
         ..
     } = vocab;
+    drop(term_table);
     // The forward map is finished with; only the reverse map is read
     // below. Its keys borrow from `term_arena`, which outlives every
     // read of `id_to_term` here (dropped explicitly at the end).
