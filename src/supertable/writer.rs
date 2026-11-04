@@ -1752,6 +1752,7 @@ impl SupertableWriter {
         batch: &RecordBatch,
         label: SourceLabel<'_>,
     ) -> Result<(), BuildError> {
+        crate::runtime_metrics::rss::exp_start_background_purge();
         let options = &self.inner.options;
         let manifest = self.inner.manifest.load();
 
@@ -2701,6 +2702,11 @@ impl SupertableWriter {
         let manifest = Arc::clone(&live.manifest);
         let sealing = Instant::now();
         let lanes = live.join()?;
+        // Experiment: the lanes are done feeding, so this append stops
+        // counting against the share later appends' lanes take.
+        if exp_lane_release() {
+            drop(live.open_append.take());
+        }
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         let fed: usize = lanes
             .iter()
@@ -3711,6 +3717,11 @@ impl Drop for OpenAppend {
 /// process's memory-map lock and left the host idle for seconds at a
 /// time: a 1B-row ingest took 60.6 s where this share took 46.4 s. The
 /// lanes do not change what is written, only how the tokenising is split.
+fn exp_lane_release() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("INFINO_EXP_LANE_RELEASE").is_some_and(|v| v == "1"))
+}
+
 fn lanes_for(threads: usize, open: usize) -> usize {
     (threads / open.max(1)).clamp(1, MAX_LANES)
 }

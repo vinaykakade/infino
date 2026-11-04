@@ -37,6 +37,37 @@ pub fn purge_allocator() {
     }
 }
 
+/// Experiment: return freed memory to the OS from one dedicated thread
+/// instead of from whichever allocating thread finds the purge due.
+pub(crate) fn exp_start_background_purge() {
+    #[cfg(all(not(miri), feature = "mimalloc"))]
+    {
+        static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if std::env::var_os("INFINO_EXP_BG_PURGE").is_none_or(|v| v != "1") {
+            return;
+        }
+        STARTED.get_or_init(|| {
+            const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+            // SAFETY: option reads and writes are thread-safe in mimalloc.
+            let delay = unsafe { libmimalloc_sys::mi_option_get(PURGE_DELAY) };
+            if delay <= 0 {
+                return;
+            }
+            let cadence = Duration::from_millis(delay as u64);
+            // SAFETY: as above.
+            unsafe { libmimalloc_sys::mi_option_set(PURGE_DELAY, delay.saturating_mul(10)) };
+            let _ = thread::Builder::new()
+                .name("infino-purge".into())
+                .spawn(move || {
+                    loop {
+                        thread::sleep(cadence);
+                        purge_allocator();
+                    }
+                });
+        });
+    }
+}
+
 const DEFAULT_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Bytes per kibibyte — `/proc/self/status` reports `VmRSS` in kB
