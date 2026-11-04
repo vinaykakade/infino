@@ -937,6 +937,39 @@ fn build_lex_rank(id_to_term: &[&str]) -> (Vec<u32>, Vec<u32>) {
     (rank, by_lex)
 }
 
+/// Experiment knob: compare interned terms inline. Read once.
+fn exp_term_eq() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INFINO_EXP_TERM_EQ").is_ok_and(|v| v == "1"))
+}
+
+/// Byte equality for the term dictionary's probe, inline for the short
+/// keys a dictionary holds.
+///
+/// Every token of every document is looked up, and a hit compares the
+/// token against the stored key. Slice `==` lowers to a call into the C
+/// library's `memcmp`, whose entry and length dispatch cost more than the
+/// comparison itself for a term of a few bytes. Up to 16 bytes the
+/// comparison here is two loads per side that overlap in the middle —
+/// both within bounds, so no padding is needed — and only a longer key
+/// takes the library routine.
+#[inline(always)]
+fn term_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len();
+    if n != b.len() {
+        return false;
+    }
+    let u64_at = |s: &[u8], i: usize| u64::from_le_bytes(s[i..i + 8].try_into().expect("8"));
+    let u32_at = |s: &[u8], i: usize| u32::from_le_bytes(s[i..i + 4].try_into().expect("4"));
+    match n {
+        0 => true,
+        1..=3 => a[0] == b[0] && a[n / 2] == b[n / 2] && a[n - 1] == b[n - 1],
+        4..=7 => u32_at(a, 0) == u32_at(b, 0) && u32_at(a, n - 4) == u32_at(b, n - 4),
+        8..=16 => u64_at(a, 0) == u64_at(b, 0) && u64_at(a, n - 8) == u64_at(b, n - 8),
+        _ => a == b,
+    }
+}
+
 #[inline(always)]
 fn compute_hash<Q: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &Q) -> u64 {
     hash_builder.hash_one(key)
@@ -1009,10 +1042,16 @@ fn intern_term_id(
     term: &str,
 ) -> (u32, bool) {
     let hash = compute_hash(term_to_id.hasher(), term);
-    match term_to_id
-        .raw_entry_mut()
-        .from_hash(hash, |existing| *existing == term)
-    {
+    let entry = if exp_term_eq() {
+        term_to_id.raw_entry_mut().from_hash(hash, |existing| {
+            term_bytes_eq(existing.as_bytes(), term.as_bytes())
+        })
+    } else {
+        term_to_id
+            .raw_entry_mut()
+            .from_hash(hash, |existing| *existing == term)
+    };
+    match entry {
         RawEntryMut::Occupied(entry) => (*entry.get(), false),
         RawEntryMut::Vacant(entry) => {
             let id = id_to_term.len() as u32;
@@ -5141,6 +5180,51 @@ fn sort_partition_to_file<const N: usize>(
     }
     w.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod term_eq_tests {
+    use proptest::prelude::*;
+
+    use super::term_bytes_eq;
+
+    #[test]
+    fn term_bytes_eq_matches_slice_equality_at_every_short_length() {
+        // Every length the inline arms cover, with a difference planted
+        // at each byte, so each overlapping load is shown to see every
+        // byte it is responsible for.
+        for n in 0..=40usize {
+            let a: Vec<u8> = (0..n as u8)
+                .map(|i| i.wrapping_mul(37).wrapping_add(1))
+                .collect();
+            assert!(term_bytes_eq(&a, &a.clone()), "len {n} equal");
+            for i in 0..n {
+                let mut b = a.clone();
+                b[i] ^= 0x20;
+                assert!(!term_bytes_eq(&a, &b), "len {n} differs at {i}");
+            }
+            let mut longer = a.clone();
+            longer.push(0);
+            assert!(!term_bytes_eq(&a, &longer), "len {n} vs {}", n + 1);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn term_bytes_eq_matches_slice_equality(
+            a in proptest::collection::vec(any::<u8>(), 0..40),
+            b in proptest::collection::vec(any::<u8>(), 0..40),
+            flip in any::<(usize, u8)>(),
+        ) {
+            prop_assert_eq!(term_bytes_eq(&a, &b), a == b);
+            let mut c = a.clone();
+            if !c.is_empty() {
+                let i = flip.0 % c.len();
+                c[i] ^= flip.1;
+            }
+            prop_assert_eq!(term_bytes_eq(&a, &c), a == c);
+        }
+    }
 }
 
 #[cfg(test)]
