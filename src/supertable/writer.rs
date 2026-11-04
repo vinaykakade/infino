@@ -5564,10 +5564,61 @@ pub(super) fn prepare_user_superfile_batch(
     hints: Vec<Option<u32>>,
     stem: Option<&str>,
 ) -> Result<SuperfilePublishBatch, BuildError> {
-    inner
-        .options
-        .writer_pool
-        .install(|| prepare_user_superfile_batch_in_scope(inner, manifest, outputs, hints, stem))
+    let k = exp_prep_local();
+    if k == 0 {
+        return inner
+            .options
+            .writer_pool
+            .install(|| prepare_user_superfile_batch_in_scope(inner, manifest, outputs, hints, stem));
+    }
+    if outputs.len() != hints.len() {
+        return Err(BuildError::Store("superfile publish inputs out of sync".into()));
+    }
+    let items: Vec<(usize, ShardOutput, Option<u32>)> = outputs
+        .into_iter()
+        .zip(hints)
+        .enumerate()
+        .map(|(i, (o, h))| (i, o, h))
+        .collect();
+    let queue = Mutex::new(items);
+    let done: Mutex<Vec<(usize, Result<Option<PreparedSuperfile>, BuildError>)>> = Mutex::new(Vec::new());
+    let work = || loop {
+        let Some((i, shard, hint)) = queue.lock().unwrap_or_else(PoisonError::into_inner).pop() else {
+            break;
+        };
+        let r = match prepare_superfile_named(inner, manifest, shard, stem) {
+            Ok(Some(p)) => finish_superfile_entry(p.entry, hint).map(|entry| {
+                Some(PreparedSuperfile {
+                    entry,
+                    bytes_for_store: p.bytes_for_store,
+                    bytes_for_storage: p.bytes_for_storage,
+                    bytes_for_cache: p.bytes_for_cache,
+                    term_contribution: p.term_contribution,
+                })
+            }),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        };
+        done.lock().unwrap_or_else(PoisonError::into_inner).push((i, r));
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..k {
+            scope.spawn(work);
+        }
+        work();
+    });
+    let mut done = done.into_inner().unwrap_or_else(PoisonError::into_inner);
+    done.sort_by_key(|(i, _)| *i);
+    let prepared = done
+        .into_iter()
+        .filter_map(|(_, r)| r.transpose())
+        .collect::<Result<Vec<_>, _>>()?;
+    collect_prepared_superfiles(inner, prepared)
+}
+
+fn exp_prep_local() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| exp_env("INFINO_EXP_PREP_LOCAL", 0))
 }
 
 /// Publish `batch`, returning the term-index root of the manifest it
