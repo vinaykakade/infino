@@ -374,7 +374,12 @@ pub(crate) async fn write_root(
     storage: &dyn StorageProvider,
     root: &Root,
 ) -> Result<RoutingRef, TermIndexError> {
-    put_content_addressed(storage, "root", root.encode()).await
+    let reference = put_content_addressed(storage, "root", root.encode()).await?;
+    if exp_root_cache() {
+        *EXP_LAST_ROOT.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((reference.content_hash, root.clone()));
+    }
+    Ok(reference)
 }
 
 /// Persist every slice of a build; idempotent by content hash.
@@ -486,6 +491,7 @@ async fn build_and_write_layer(
             }));
         }
     };
+    let t_layer = std::time::Instant::now();
     let built = detail_span!(
         "term_index.build_layer",
         inputs = contributions.len(),
@@ -514,7 +520,16 @@ async fn build_and_write_layer(
             }
         }
     };
+    let t_built = t_layer.elapsed().as_secs_f64();
+    let n_objects = started.len();
     wait.await;
+    if crate::storage::io_counters::timeline_enabled() {
+        tracing::info!(
+            "[layer] build {:.0} puts_after {:.0} objects {n_objects}",
+            t_built * 1e3,
+            (t_layer.elapsed().as_secs_f64() - t_built) * 1e3
+        );
+    }
     match failed {
         Some(e) => Err(e),
         None => Ok(built),
@@ -1674,9 +1689,27 @@ pub(crate) async fn load_root(
     storage: &dyn StorageProvider,
     reference: &RoutingRef,
 ) -> Result<Root, TermIndexError> {
+    if exp_root_cache() {
+        let cached = EXP_LAST_ROOT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((hash, root)) = cached.as_ref()
+            && *hash == reference.content_hash
+        {
+            return Ok(root.clone());
+        }
+    }
     let bytes = fetch_verified(storage, None, &reference.uri, &reference.content_hash).await?;
     Root::decode(&bytes)
 }
+
+/// EXPERIMENT: keep the root this process wrote last, by content hash, so
+/// the next commit's turn reads it from memory instead of from storage.
+fn exp_root_cache() -> bool {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::supertable::writer::exp_env("INFINO_EXP_ROOT_CACHE", 0)) != 0
+}
+
+/// EXPERIMENT: the last root written, by its content hash.
+static EXP_LAST_ROOT: Mutex<Option<(ContentHash, Root)>> = Mutex::new(None);
 
 /// A term's run from one slice, with the slice's tier object when the
 /// slice has one: what a run's chunk offsets are relative to.

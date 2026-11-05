@@ -3430,6 +3430,8 @@ impl SupertableWriter {
             .check_schema(&self.inner.manifest.load())
             .map_err(BuildError::from)?;
         let mut layer = None;
+        let t_pub = Instant::now();
+        let (mut t_list, mut t_layer) = (0.0f64, 0.0f64);
         let mut ticket = self.inner.append_queue.reserve();
         match &self.inner.options.storage {
             Some(storage) => {
@@ -3469,6 +3471,7 @@ impl SupertableWriter {
                     .instrument(detail_span!("publish.write_list")),
                     &runtime,
                 );
+                t_list = t_pub.elapsed().as_secs_f64();
                 if let Some(task) = layer_task {
                     let (contributions, reserved) = bridge_on_runtime(task, &runtime)
                         .map_err(|e| BuildError::Store(format!("term-index layer task: {e}")))?;
@@ -3478,6 +3481,7 @@ impl SupertableWriter {
                 } else {
                     listed?;
                 }
+                t_layer = t_pub.elapsed().as_secs_f64();
             }
             None => bridge_on_runtime(await_uploads(uploads), &runtime)?,
         }
@@ -3493,8 +3497,20 @@ impl SupertableWriter {
         };
         let mut run = match self.inner.append_queue.lead_or_follow(&mut ticket, parked) {
             Turn::Lead(run) => run,
-            Turn::Published(result) => return result,
+            Turn::Published(result) => {
+                if crate::storage::io_counters::timeline_enabled() {
+                    info!(
+                        "[pub] follower uploads {:.0} layer {:.0} done {:.0}",
+                        t_list * 1e3,
+                        t_layer * 1e3,
+                        t_pub.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                return result;
+            }
         };
+        let t_lead = t_pub.elapsed().as_secs_f64();
+        let n_run = run.len();
         drop(wait_span);
         let _turn_span = detail_span!("publish.turn", publishes = run.len()).entered();
         // This ticket's own publish first, then the ones it took on, oldest
@@ -3516,6 +3532,15 @@ impl SupertableWriter {
             &runtime,
         );
         let published = published.map(drop);
+        if crate::storage::io_counters::timeline_enabled() {
+            info!(
+                "[pub] leader uploads {:.0} layer {:.0} lead {:.0} done {:.0} run {n_run}",
+                t_list * 1e3,
+                t_layer * 1e3,
+                t_lead * 1e3,
+                t_pub.elapsed().as_secs_f64() * 1e3
+            );
+        }
         self.inner
             .append_queue
             .publish_followers(&mut ticket, &published);
@@ -13282,12 +13307,121 @@ async fn put_new_superfile_bytes(
             }
         }
     }
-    let result = if (bytes.len() as u64) >= multipart_threshold {
+    let n = bytes.len() as u64;
+    let t = Instant::now();
+    let hedged = AtomicBool::new(false);
+    let result = if n >= multipart_threshold {
         put_superfile_multipart(storage.as_ref(), &path, bytes).await
+    } else if exp_tail_hedge() > 0 {
+        put_overwrite_hedged(storage.as_ref(), &path, bytes, &hedged).await
     } else {
         storage.put_overwrite(&path, bytes).await
     };
+    exp_note_put("sf", n, t.elapsed().as_secs_f64(), hedged.load(Ordering::Relaxed));
     result.map_err(SupertableCommitError::from)
+}
+
+/// EXPERIMENT: an overwrite PUT hedged once it runs past [`exp_hedge_delay`].
+async fn put_overwrite_hedged(
+    storage: &dyn StorageProvider,
+    uri: &str,
+    bytes: Bytes,
+    hedged: &AtomicBool,
+) -> Result<(), StorageError> {
+    let delay = exp_hedge_delay(bytes.len() as u64);
+    let mut first = pin!(storage.put_overwrite(uri, bytes.clone()));
+    tokio::select! {
+        answer = &mut first => answer.map(|_| ()),
+        () = sleep(delay) => {
+            hedged.store(true, Ordering::Relaxed);
+            let mut second = pin!(storage.put_overwrite(uri, bytes));
+            tokio::select! {
+                answer = &mut first => match answer {
+                    Ok(_) => Ok(()),
+                    Err(_) => second.await.map(drop),
+                },
+                answer = &mut second => match answer {
+                    Ok(_) => Ok(()),
+                    Err(_) => first.await.map(drop),
+                },
+            }
+        }
+    }
+}
+
+/// EXPERIMENT knob reader.
+pub(in crate::supertable) fn exp_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// EXPERIMENT: hedge multiplier in tenths over the PUT latency the process
+/// has observed (0 = the fixed stuck-after delay, as before).
+fn exp_tail_hedge() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| exp_env("INFINO_EXP_TAIL_HEDGE", 0))
+}
+
+/// EXPERIMENT: recent PUTs, (bytes, seconds).
+static EXP_PUTS: Mutex<std::collections::VecDeque<(u64, f64)>> =
+    Mutex::new(std::collections::VecDeque::new());
+const EXP_PUT_WINDOW: usize = 512;
+const EXP_PUT_MIN_SAMPLES: usize = 64;
+const EXP_BIG: u64 = 1 << 20;
+
+fn exp_note_put(kind: &str, bytes: u64, secs: f64, hedged: bool) {
+    {
+        let mut q = EXP_PUTS.lock().unwrap_or_else(PoisonError::into_inner);
+        if q.len() == EXP_PUT_WINDOW {
+            q.pop_front();
+        }
+        q.push_back((bytes, secs));
+    }
+    if crate::storage::io_counters::timeline_enabled() {
+        info!("[putlog] {kind} {bytes} {:.0} {}", secs * 1e3, u8::from(hedged));
+    }
+}
+
+fn exp_median(mut v: Vec<f64>) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(f64::total_cmp);
+    Some(v[v.len() / 2])
+}
+
+/// EXPERIMENT: how long a PUT of `bytes` runs before a hedge: the knob's
+/// multiple of what the recent PUTs predict (median latency of the small
+/// ones, median seconds per byte of the big ones), never past the fixed
+/// stuck-after delay.
+fn exp_hedge_delay(bytes: u64) -> time::Duration {
+    let cap = stuck_after(bytes);
+    let mult = exp_tail_hedge();
+    if mult == 0 {
+        return cap;
+    }
+    let (small, big) = {
+        let q = EXP_PUTS.lock().unwrap_or_else(PoisonError::into_inner);
+        if q.len() < EXP_PUT_MIN_SAMPLES {
+            return cap;
+        }
+        let small: Vec<f64> = q.iter().filter(|s| s.0 < EXP_BIG).map(|s| s.1).collect();
+        let big: Vec<f64> = q
+            .iter()
+            .filter(|s| s.0 >= EXP_BIG)
+            .map(|s| s.1 / s.0 as f64)
+            .collect();
+        (small, big)
+    };
+    let base = exp_median(small).unwrap_or(0.0);
+    let per_byte = exp_median(big).unwrap_or(0.0);
+    let expected = base.max(per_byte * bytes as f64);
+    if expected <= 0.0 {
+        return cap;
+    }
+    time::Duration::from_secs_f64(expected * mult as f64 / 10.0).min(cap)
 }
 
 /// Put `sealed` at `dest` without copying: a hard link next to `dest`, then
@@ -13477,6 +13611,8 @@ pub(crate) async fn try_commit_attempt(
     // Checked immediately before the pointer PUT; see [`CommitFence`].
     fence: Option<&mut dyn CommitFence>,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
+    let t_att = Instant::now();
+    let mut marks: Vec<(&str, f64)> = Vec::new();
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(
         &storage,
@@ -13511,6 +13647,7 @@ pub(crate) async fn try_commit_attempt(
         removed = entries_to_remove.len(),
     ))
     .await?;
+    marks.push(("update", t_att.elapsed().as_secs_f64()));
 
     // 2a. Name any already-written sidecar in this same successor; a later
     //     manifest would leave its tombstones unreadable in between.
@@ -13605,6 +13742,7 @@ pub(crate) async fn try_commit_attempt(
     //     built no contribution) leaves it incomplete, so part selection
     //     keeps its summary-based choice instead of trusting an index that
     //     would never route to that superfile.
+    marks.push(("etag", t_att.elapsed().as_secs_f64()));
     let contributed: HashSet<Uuid> = term_contributions.iter().map(|c| c.superfile_id).collect();
     let every_new_covered = new_entries
         .iter()
@@ -13632,6 +13770,7 @@ pub(crate) async fn try_commit_attempt(
         }
         _ => None,
     };
+    marks.push(("load_root", t_att.elapsed().as_secs_f64()));
     if let Some(reference) = unreadable_prior {
         new_manifest = new_manifest.with_term_index_ref(reference, false);
     } else if !term_contributions.is_empty() {
@@ -13696,6 +13835,7 @@ pub(crate) async fn try_commit_attempt(
     //    content-hashes) are unchanged in the new list. Each touched
     //    part ships both wire forms, full and the routing sibling the
     //    list entry references, and its summaries section.
+    marks.push(("root", t_att.elapsed().as_secs_f64()));
     let encoded_parts: Vec<(String, Bytes)> =
         parts_to_write.iter().flat_map(|ep| ep.objects()).collect();
     // Whatever this commit's safety rests on has to still hold here. What is left after it is the
@@ -13715,6 +13855,19 @@ pub(crate) async fn try_commit_attempt(
     // from inside `build_part_and_entry`).
     let _ = PhantomData::<(PartId, part_mod::ContentHash)>;
 
+    marks.push(("write", t_att.elapsed().as_secs_f64()));
+    if crate::storage::io_counters::timeline_enabled() {
+        let mut last = 0.0;
+        let parts: Vec<String> = marks
+            .iter()
+            .map(|(n, t)| {
+                let d = t - last;
+                last = *t;
+                format!("{n} {:.0}", d * 1e3)
+            })
+            .collect();
+        info!("[turn] {}", parts.join(" "));
+    }
     Ok(new_manifest)
 }
 
@@ -13966,11 +14119,27 @@ async fn put_new_hedged(
     uri: &str,
     bytes: Bytes,
 ) -> Result<(), StorageError> {
-    let delay = stuck_after(bytes.len() as u64);
+    let n = bytes.len() as u64;
+    let delay = exp_hedge_delay(n);
+    let t = Instant::now();
+    let hedged = AtomicBool::new(false);
+    let out = put_new_hedged_inner(storage, uri, bytes, delay, &hedged).await;
+    exp_note_put("obj", n, t.elapsed().as_secs_f64(), hedged.load(Ordering::Relaxed));
+    out
+}
+
+async fn put_new_hedged_inner(
+    storage: &dyn StorageProvider,
+    uri: &str,
+    bytes: Bytes,
+    delay: time::Duration,
+    hedged: &AtomicBool,
+) -> Result<(), StorageError> {
     let mut first = pin!(storage.put_atomic(uri, bytes.clone()));
     tokio::select! {
         answer = &mut first => answer.map(|_| ()),
         () = sleep(delay) => {
+            hedged.store(true, Ordering::Relaxed);
             let mut second = pin!(storage.put_atomic(uri, bytes));
             tokio::select! {
                 answer = &mut first => match answer {
