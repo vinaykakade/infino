@@ -506,6 +506,8 @@ async fn build_and_write_layer(
         }
     }
     let built = built?;
+    let t_built = t_layer.elapsed().as_secs_f64();
+    let n_objects = started.len();
     let mut failed = None;
     let wait = async {
         for upload in started {
@@ -520,8 +522,6 @@ async fn build_and_write_layer(
             }
         }
     };
-    let t_built = t_layer.elapsed().as_secs_f64();
-    let n_objects = started.len();
     wait.await;
     if crate::storage::io_counters::timeline_enabled() {
         tracing::info!(
