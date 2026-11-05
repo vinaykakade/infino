@@ -51,17 +51,15 @@ use std::{
     },
 };
 
+#[cfg(test)]
+use build::merge_layers;
 pub(crate) use build::{
     BuildPolicy, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
     HeadSink, SliceFile, build_onto, scratch_dir, tier_path,
 };
 #[cfg(test)]
 pub(crate) use build::{Built, build, first_contribution_difference};
-use build::{
-    BuiltLayer, MERGE_RANGES_MAX, MergedLayer, build_layer, merge_layers_into, rebase_run,
-};
-#[cfg(test)]
-use build::merge_layers;
+use build::{BuiltLayer, MERGE_RANGES_MAX, build_layer, merge_layers_into, rebase_run};
 use bytes::Bytes;
 #[cfg(test)]
 pub(crate) use format::TierRef;
@@ -9154,20 +9152,27 @@ mod tests {
     const RESERVE_TEST_TERMS: usize = 4_000;
 
     /// Contributions with [`RESERVE_TEST_TERMS`] terms between them, the
-    /// `id`th holding every `id`th term.
+    /// `id`th holding every `id`th term, each term with a head deep enough
+    /// that its tier is an object of its own rather than inline.
     fn reserve_test_contributions(dir: &TempDir) -> Vec<Contribution> {
         let terms: Vec<String> = (0..RESERVE_TEST_TERMS)
             .map(|t| format!("t{t:04}"))
             .collect();
+        let docs = 2 * TIER_INLINE_MAX as u32;
         (1..=RESERVE_TEST_CONTRIBUTIONS)
             .map(|id| {
-                let mine: Vec<(&str, &str, u64)> = terms
+                let mine: Vec<(&str, &str, Vec<(u32, f32)>)> = terms
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| (*i as u128).is_multiple_of(id))
-                    .map(|(i, t)| ("body", t.as_str(), 1 + (i as u64 % 3)))
+                    .map(|(i, t)| {
+                        let head = (0..docs)
+                            .map(|row| (row, 1.0 + ((i as u32 + row) % 7) as f32))
+                            .collect();
+                        ("body", t.as_str(), head)
+                    })
                     .collect();
-                contribution(dir, id, &mine)
+                contribution_with_heads(dir, id, &mine, docs as usize)
             })
             .collect()
     }
@@ -9227,6 +9232,7 @@ mod tests {
         let counted = Arc::clone(&ranges);
         let policy = BuildPolicy {
             merge_ranges: Some(RESERVE_TEST_RANGES),
+            slice_target_bytes: 16 * 1024,
             after_range: Some(build::RangeHook(Arc::new(move || {
                 counted.fetch_add(1, AtomicOrdering::SeqCst);
             }))),
@@ -9254,7 +9260,14 @@ mod tests {
         assert_eq!(distinct.len(), sent.len(), "no object is sent twice");
         sent.sort_by_key(|(kind, hash, _)| (*kind, hash.to_hex()));
         kept.sort_by_key(|(kind, hash, _)| (*kind, hash.to_hex()));
-        assert!(kept.len() > RESERVE_TEST_RANGES, "several objects per range");
+        assert!(
+            kept.len() > 2 * RESERVE_TEST_RANGES,
+            "several objects per range"
+        );
+        assert!(
+            kept.iter().any(|(kind, ..)| *kind == "tier"),
+            "tier objects too"
+        );
         assert!(sent == kept, "the sink gets what the layer keeps");
 
         let plain = build_layer(&contributions, &policy, None).expect("build");
@@ -9285,7 +9298,11 @@ mod tests {
             let local: Arc<dyn StorageProvider> =
                 Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local fs"));
             let faults = FaultStorage::wrap(local);
-            faults.fail(FaultOp::PutAtomic, &format!("term-index/{kind}"), usize::MAX);
+            faults.fail(
+                FaultOp::PutAtomic,
+                &format!("term-index/{kind}"),
+                usize::MAX,
+            );
             let storage: Arc<dyn StorageProvider> = faults.clone();
             let reserved = tokio::time::timeout(
                 Duration::from_secs(60),
