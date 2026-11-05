@@ -16,7 +16,7 @@ use std::{
     pin::pin,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -60,7 +60,10 @@ use crate::{
             RebuiltParts, SuperfileUri,
             list::PartitionStrategy,
             listed_once,
-            term_index::{Contribution as TermContribution, ReservedLayer, ReservedSegment},
+            term_index::{
+                BuildPolicy, Contribution as TermContribution, LayerPart, ReservedLayer,
+                ReservedSegment, build_layer_part,
+            },
         },
         opann::rerank_pool_hint,
         query::{dispatch::open_whole_superfile, vector},
@@ -1141,6 +1144,7 @@ impl Supertable {
             bytes_for_cache,
             merged_superfile_id,
             term_contributions,
+            term_layer_part: None,
         })
     }
 
@@ -1304,6 +1308,13 @@ impl Supertable {
             // A term contribution owns a spilled file and is not cloneable, so
             // the batch's are borrowed out for the attempt and handed back if
             // it has to be retried. `owners` records which job each came from.
+            // Each contribution's own layer, when every one has one, in the
+            // order the contributions are taken below.
+            let parts: Vec<Arc<LayerPart>> = batch
+                .iter()
+                .filter(|p| !p.term_contributions.is_empty())
+                .filter_map(|p| p.term_layer_part.clone())
+                .collect();
             let mut term_contributions: Vec<TermContribution> = Vec::new();
             let mut contribution_owners: Vec<usize> = Vec::new();
             for (i, prepared) in batch.iter_mut().enumerate() {
@@ -1337,6 +1348,7 @@ impl Supertable {
             let mut reserved_run = [ReservedSegment {
                 contributions: term_contributions.len(),
                 layer: reserved_layer.take(),
+                parts,
             }];
             let attempt_outcome = try_commit_attempt(
                 storage.clone(),
@@ -1599,6 +1611,7 @@ impl Supertable {
         let settings = MergeSettings {
             stale_seal_timeout,
             merge_threads: merge_pool_widths(maint_pool()?.current_num_threads(), in_flight, &jobs),
+            freed_threads: Arc::new(AtomicUsize::new(0)),
         };
         let mut charges = MergeCharges::new(indexed);
         let mut queued: VecDeque<(usize, CompactionJob)> = jobs.into_iter().enumerate().collect();
@@ -1843,6 +1856,7 @@ impl Supertable {
         let job = job.clone();
         let stale_seal_timeout = settings.stale_seal_timeout;
         let merge_threads = settings.merge_threads[plan_index];
+        let freed_threads = Arc::clone(&settings.freed_threads);
         let task = merging.spawn(async move {
             // Each merge is a trace of its own, linked back to the pass, so
             // a pass of many merges does not grow into one huge trace.
@@ -1861,13 +1875,85 @@ impl Supertable {
                     Ok(prepared) => prepared,
                     Err(e) => return (plan_index, Err(e)),
                 };
-                let uploaded = table.upload_prepared_output(prepared).await;
+                let uploaded = table
+                    .upload_and_build_part(prepared, merge_threads, &freed_threads)
+                    .await;
                 (plan_index, uploaded)
             }
             .instrument(span)
             .await
         });
         task.id()
+    }
+
+    /// Upload this job's merged bytes and, beside the upload, build its term
+    /// contribution into a layer of its own for the commit to merge from
+    /// (see [`build_layer_part`]).
+    ///
+    /// The commit's layer is the batch's last step before its pointer swap:
+    /// built from the contributions once every merge had finished, it held a
+    /// billion-row optimize for 4.2 s on the whole host, while in the seconds
+    /// before it the merges had been finishing one by one and leaving their
+    /// threads idle. The part is built on the threads its own merge just
+    /// gave back, together with those of the merges whose parts are done, so
+    /// it takes no thread a merge still running could use, and the last
+    /// merges' parts get most of the host. A part that cannot be built
+    /// leaves the commit to build from the contributions as before.
+    async fn upload_and_build_part(
+        &self,
+        mut prepared: PreparedJob,
+        threads: usize,
+        freed: &Arc<AtomicUsize>,
+    ) -> Result<PreparedJob, CompactionError> {
+        let policy = self
+            .inner()
+            .manifest
+            .load()
+            .options
+            .term_index_build_policy();
+        let contributions = mem::take(&mut prepared.term_contributions);
+        let build = async {
+            if contributions.len() != 1 {
+                freed.fetch_add(threads, Ordering::AcqRel);
+                return (contributions, None);
+            }
+            let width = threads + freed.swap(0, Ordering::AcqRel);
+            let built = tokio::task::spawn_blocking(move || {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(width.max(1))
+                    .thread_name(|i| format!("term-part-{i}"))
+                    .build()
+                    .map(Arc::new);
+                let part = pool.ok().and_then(|pool| {
+                    let policy = BuildPolicy {
+                        pool: Some(pool),
+                        ..policy
+                    };
+                    match build_layer_part(&contributions[0], &policy) {
+                        Ok(part) => part.map(Arc::new),
+                        Err(e) => {
+                            warn!(error = %e, "compact: term-index layer part failed; the commit builds the layer");
+                            None
+                        }
+                    }
+                });
+                (contributions, part)
+            })
+            .await;
+            freed.fetch_add(width, Ordering::AcqRel);
+            match built {
+                Ok(built) => built,
+                // The contributions went with the task; the commit indexes
+                // the superfile from its bytes, as for any merge without one.
+                Err(_) => (Vec::new(), None),
+            }
+        };
+        let (uploaded, (contributions, part)) =
+            tokio::join!(self.upload_prepared_output(prepared), build);
+        let mut prepared = uploaded?;
+        prepared.term_contributions = contributions;
+        prepared.term_layer_part = part;
+        Ok(prepared)
     }
 
     /// Put this job's merged bytes in storage, inside its own task.
@@ -2008,6 +2094,10 @@ struct MergeSettings {
     stale_seal_timeout: Duration,
     /// Threads in each merge's own pool, by plan index.
     merge_threads: Vec<usize>,
+    /// Threads of the merges that have finished, given back for the
+    /// term-index layer parts still to build (see
+    /// [`Supertable::upload_and_build_part`]).
+    freed_threads: Arc<AtomicUsize>,
 }
 
 /// What one admitted merge is charged: its expected footprint while it
@@ -2359,6 +2449,11 @@ pub(crate) struct PreparedJob {
     bytes_for_cache: Option<(SuperfileUri, Bytes)>,
     merged_superfile_id: Uuid,
     term_contributions: Vec<TermContribution>,
+    /// Its contribution built into a term-index layer of its own beside the
+    /// upload, which the commit's layer is merged from rather than built
+    /// (see [`build_layer_part`]). Scratch only; nothing of it is written
+    /// to storage.
+    term_layer_part: Option<Arc<LayerPart>>,
 }
 
 /// Re-stamps a batch's seals once the uploads are behind it.
@@ -8716,6 +8811,7 @@ mod tests {
             bytes_for_cache: None,
             merged_superfile_id: Uuid::new_v4(),
             term_contributions: Vec::new(),
+            term_layer_part: None,
         }
     }
 

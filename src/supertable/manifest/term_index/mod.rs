@@ -53,11 +53,12 @@ use std::{
 use build::build_layer;
 pub(crate) use build::{
     BuildPolicy, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
-    HeadSink, SliceFile, build_onto, merge_layers, scratch_dir, tier_path,
+    HeadSink, LayerPart, SliceFile, build_layer_part, build_onto, merge_layers, scratch_dir,
+    tier_path,
 };
 #[cfg(test)]
 pub(crate) use build::{Built, build, first_contribution_difference};
-use build::{BuiltLayer, MergedLayer, build_layer_with, rebase_run};
+use build::{BuiltLayer, MergedLayer, build_layer_with, merge_layer_parts_with, rebase_run};
 use bytes::Bytes;
 #[cfg(test)]
 pub(crate) use format::TierRef;
@@ -464,6 +465,7 @@ async fn write_built_object(
 async fn build_and_write_layer(
     storage: &Arc<dyn StorageProvider>,
     contributions: &[Contribution],
+    parts: Option<&[&LayerPart]>,
     policy: &BuildPolicy,
 ) -> Result<BuiltLayer, TermIndexError> {
     let handle = Handle::current();
@@ -489,10 +491,14 @@ async fn build_and_write_layer(
     let built = detail_span!(
         "term_index.build_layer",
         inputs = contributions.len(),
+        from_parts = parts.is_some(),
         bytes = tracing::field::Empty,
         ranges = tracing::field::Empty,
     )
-    .in_scope(|| build_layer_with(contributions, policy, Some(&on_part)));
+    .in_scope(|| match parts {
+        Some(parts) => merge_layer_parts_with(contributions, parts, policy, Some(&on_part)),
+        None => build_layer_with(contributions, policy, Some(&on_part)),
+    });
     let started = mem::take(&mut *uploads.lock().expect("uploads"));
     if built.is_err() {
         for upload in &started {
@@ -659,7 +665,18 @@ pub(crate) async fn reserve_layer(
     contributions: &[Contribution],
     policy: &BuildPolicy,
 ) -> Result<ReservedLayer, TermIndexError> {
-    let built = build_and_write_layer(storage, contributions, policy).await?;
+    reserve_layer_from(storage, contributions, None, policy).await
+}
+
+/// [`reserve_layer`], merged from `parts` when given (one per contribution,
+/// in order; see [`build_layer_part`]) rather than built: the same layer.
+async fn reserve_layer_from(
+    storage: &Arc<dyn StorageProvider>,
+    contributions: &[Contribution],
+    parts: Option<&[&LayerPart]>,
+    policy: &BuildPolicy,
+) -> Result<ReservedLayer, TermIndexError> {
+    let built = build_and_write_layer(storage, contributions, parts, policy).await?;
     Ok(ReservedLayer {
         superfiles: built.superfiles,
         id_mins: built.id_mins,
@@ -692,6 +709,7 @@ pub(crate) async fn append_reserved(
     let mut run = [ReservedSegment {
         contributions: contributions.len(),
         layer: reserved.take(),
+        parts: Vec::new(),
     }];
     let result = append_reserved_run(storage, prior, contributions, policy, &mut run, pool).await;
     let [segment] = run;
@@ -706,6 +724,11 @@ pub(crate) async fn append_reserved(
 pub(crate) struct ReservedSegment {
     pub(crate) contributions: usize,
     pub(crate) layer: Option<ReservedLayer>,
+    /// Its contributions built into layers of their own as each was
+    /// written, one per contribution and in order, when every one was:
+    /// what its layer is merged from rather than built, should it have to
+    /// be reserved here. Empty, it is built from the contributions.
+    pub(crate) parts: Vec<Arc<LayerPart>>,
 }
 
 /// [`append_reserved`] for a run of segments: each segment's layer is
@@ -742,7 +765,13 @@ pub(crate) async fn append_reserved_run(
         let base = root.superfiles.len() as u32;
         let reusable = segment.layer.as_ref().is_some_and(|r| r.built_from(own));
         if !reusable {
-            let next = reserve_layer(storage, own, policy).await?;
+            let parts: Vec<&LayerPart> = segment.parts.iter().map(|p| p.as_ref()).collect();
+            let fits = parts.len() == own.len()
+                && parts
+                    .iter()
+                    .zip(own)
+                    .all(|(part, c)| part.superfile_id == c.superfile_id);
+            let next = reserve_layer_from(storage, own, fits.then_some(&parts[..]), policy).await?;
             // The replaced layer's objects are written; its spilled copies
             // are read by nothing again.
             if let Some(replaced) = segment.layer.replace(next) {
@@ -8219,6 +8248,175 @@ mod tests {
         }
     }
 
+    /// Contributions for the layer-part tests: terms shared unevenly
+    /// between superfiles, with heads from one document to past the
+    /// policy's depth, so the parts' tiers are inline, chunked and cut.
+    fn part_test_contributions(dir: &TempDir, n: u128) -> Vec<Contribution> {
+        let terms: Vec<String> = (0..PART_TEST_TERMS).map(|t| format!("t{t:04}")).collect();
+        (1..=n)
+            .map(|id| {
+                let mine: Vec<(&str, &str, Vec<(u32, f32)>)> = terms
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| (*i as u128 + id).is_multiple_of(1 + id % 3))
+                    .map(|(i, t)| {
+                        let docs = (0..1 + (i as u32 * 7 + id as u32) % PART_TEST_HEAD)
+                            .map(|d| (d * 5 + id as u32, 0.25 + ((d + i as u32) % 13) as f32))
+                            .collect();
+                        ("body", t.as_str(), docs)
+                    })
+                    .collect();
+                contribution_with_heads(dir, id, &mine, PART_TEST_DEPTH as usize * 2)
+            })
+            .collect()
+    }
+
+    /// Terms in the layer-part tests' vocabulary.
+    const PART_TEST_TERMS: usize = 300;
+    /// Most documents a term's head holds in the layer-part tests, past the
+    /// depth the policy cuts heads to.
+    const PART_TEST_HEAD: u32 = 40;
+    /// The head depth of the layer-part tests' policy.
+    const PART_TEST_DEPTH: u32 = 12;
+
+    fn part_test_policy() -> BuildPolicy {
+        BuildPolicy {
+            slice_target_bytes: 2048,
+            head_depth_per_superfile: PART_TEST_DEPTH as usize,
+            merge_ranges: Some(4),
+            ..BuildPolicy::default()
+        }
+    }
+
+    /// A layer merged from each contribution's own layer writes the bytes a
+    /// build from the contributions writes: every slice, every tier object
+    /// and the layer's slice list, across key ranges and with heads cut to
+    /// the policy's depth.
+    #[test]
+    fn a_layer_merged_from_parts_is_the_layer_built_from_contributions() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = part_test_policy();
+        for n in [1, 2, 5] {
+            let contributions = part_test_contributions(&dir, n);
+            let built = build_layer(&contributions, &policy).expect("build");
+            let parts: Vec<LayerPart> = contributions
+                .iter()
+                .map(|c| {
+                    build_layer_part(c, &policy)
+                        .expect("part")
+                        .expect("no budget")
+                })
+                .collect();
+            let refs: Vec<&LayerPart> = parts.iter().collect();
+            let merged =
+                merge_layer_parts_with(&contributions, &refs, &policy, None).expect("merge");
+            assert!(built.layer.slices.len() > n as usize, "several slices");
+            assert_eq!(merged.layer, built.layer, "{n} parts: the slice list");
+            assert_eq!(merged.slices, built.slices, "{n} parts: the slices");
+            assert_eq!(merged.tiers, built.tiers, "{n} parts: the tier objects");
+            assert_eq!(merged.superfiles, built.superfiles);
+            assert_eq!(merged.id_mins, built.id_mins);
+        }
+    }
+
+    /// A budget across superfiles cuts by how many share a term, which one
+    /// contribution cannot know, so no part is built under one; and parts
+    /// that are not the contributions' own are refused.
+    #[test]
+    fn a_part_is_built_only_where_it_can_match_the_build() {
+        let dir = TempDir::new().expect("tempdir");
+        let contributions = part_test_contributions(&dir, 2);
+        let budget = BuildPolicy {
+            tier_entries_per_term: 16,
+            ..part_test_policy()
+        };
+        assert!(
+            build_layer_part(&contributions[0], &budget)
+                .expect("part")
+                .is_none()
+        );
+        let policy = part_test_policy();
+        let parts: Vec<LayerPart> = contributions
+            .iter()
+            .map(|c| {
+                build_layer_part(c, &policy)
+                    .expect("part")
+                    .expect("no budget")
+            })
+            .collect();
+        let swapped = [&parts[1], &parts[0]];
+        assert!(merge_layer_parts_with(&contributions, &swapped, &policy, None).is_err());
+        assert!(merge_layer_parts_with(&contributions, &[&parts[0]], &policy, None).is_err());
+    }
+
+    /// A commit's reserved layer is the same whether it is merged from the
+    /// contributions' parts or built from the contributions — with every
+    /// part, after one merge of the pass failed and took its contribution
+    /// and part with it, and with a part missing, which builds instead.
+    #[tokio::test]
+    async fn a_reserved_layer_from_parts_writes_the_built_layers_objects() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = part_test_policy();
+        let all = part_test_contributions(&dir, 4);
+        let parts: Vec<Arc<LayerPart>> = all
+            .iter()
+            .map(|c| {
+                Arc::new(
+                    build_layer_part(c, &policy)
+                        .expect("part")
+                        .expect("no budget"),
+                )
+            })
+            .collect();
+        // The second merge failed: its contribution and its part are gone.
+        let survivors: Vec<Contribution> = part_test_contributions(&dir, 4)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, c)| c)
+            .collect();
+        let surviving_parts: Vec<Arc<LayerPart>> = parts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, p)| Arc::clone(p))
+            .collect();
+        for (contributions, parts) in [
+            (&all, parts.clone()),
+            (&survivors, surviving_parts.clone()),
+            (&survivors, surviving_parts[..2].to_vec()),
+        ] {
+            let store_dir = TempDir::new().expect("store dir");
+            let local: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local fs"));
+            let mut run = [ReservedSegment {
+                contributions: contributions.len(),
+                layer: None,
+                parts,
+            }];
+            let reference =
+                append_reserved_run(&local, None, contributions, &policy, &mut run, None)
+                    .await
+                    .expect("append");
+            let root = load_root(local.as_ref(), &reference).await.expect("root");
+            let expected = build_onto(Root::default(), contributions, &policy).expect("build");
+            assert_eq!(root, expected.root, "the root");
+            let got: HashSet<ContentHash> = run[0]
+                .layer
+                .as_ref()
+                .expect("reserved")
+                .written_objects()
+                .collect();
+            let want: HashSet<ContentHash> = expected
+                .slices
+                .iter()
+                .chain(&expected.tiers)
+                .map(|(hash, _)| *hash)
+                .collect();
+            assert_eq!(got, want, "the objects");
+        }
+    }
+
     /// A root whose list grew since the layer was built places the layer
     /// at its length as it is — the layer's ordinals are relative to the
     /// base it is given, so nothing is written again; other contributions
@@ -8295,10 +8493,12 @@ mod tests {
             ReservedSegment {
                 contributions: 1,
                 layer: None,
+                parts: Vec::new(),
             },
             ReservedSegment {
                 contributions: 0,
                 layer: None,
+                parts: Vec::new(),
             },
         ];
         let reference = append_reserved_run(
@@ -8325,6 +8525,7 @@ mod tests {
         let mut short = [ReservedSegment {
             contributions: 0,
             layer: None,
+            parts: Vec::new(),
         }];
         assert!(
             append_reserved_run(&local, Some(prior), &indexed, &policy, &mut short, None)
@@ -8354,6 +8555,7 @@ mod tests {
             .map(|_| ReservedSegment {
                 contributions: 1,
                 layer: None,
+                parts: Vec::new(),
             })
             .collect();
         let reference = append_reserved_run(

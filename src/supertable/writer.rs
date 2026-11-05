@@ -3487,6 +3487,7 @@ impl SupertableWriter {
             segment: ReservedSegment {
                 contributions: batch.term_contributions.len(),
                 layer,
+                parts: Vec::new(),
             },
             batch,
             list_metadata,
@@ -19025,6 +19026,7 @@ supertable:
             segment: ReservedSegment {
                 contributions: 0,
                 layer: None,
+                parts: Vec::new(),
             },
         }
     }

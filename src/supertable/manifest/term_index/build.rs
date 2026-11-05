@@ -1659,6 +1659,169 @@ pub(crate) fn build_layer_with(
     })
 }
 
+/// One contribution's terms built into a layer of their own, as soon as
+/// the contribution is written, and kept in scratch: the slices a commit's
+/// layer is merged from instead of built from the contributions (see
+/// [`merge_layer_parts_with`]). Nothing here is ever written to storage.
+pub(crate) struct LayerPart {
+    /// The superfile the contribution came from.
+    pub(crate) superfile_id: Uuid,
+    /// The slices, in key order, each with its tier object beside it.
+    files: Vec<SliceFile>,
+    /// The spilled slice and tier objects, kept alive with their scratch
+    /// directories for as long as the part is.
+    _bytes: (
+        Vec<(ContentHash, BuiltBytes)>,
+        Vec<(ContentHash, BuiltBytes)>,
+    ),
+}
+
+impl fmt::Debug for LayerPart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LayerPart")
+            .field("superfile_id", &self.superfile_id)
+            .field("slices", &self.files.len())
+            .finish()
+    }
+}
+
+/// Build `contribution` into a [`LayerPart`], spilling under the policy's
+/// scratch root and ranging over the policy's pool.
+///
+/// A part cuts each head to the policy's depth, as a build from the
+/// contributions does, and a merge of parts cuts to that depth again, which
+/// keeps what the first cut kept. A budget across superfiles would cut by
+/// how many superfiles share a term, which one contribution cannot know, so
+/// under one no part is built (`None`) and the commit builds from the
+/// contributions as before.
+pub(crate) fn build_layer_part(
+    contribution: &Contribution,
+    policy: &BuildPolicy,
+) -> Result<Option<LayerPart>, TermIndexError> {
+    if !parts_keep_every_entry(policy) {
+        return Ok(None);
+    }
+    let policy = BuildPolicy {
+        spill_to_disk: true,
+        ..policy.clone()
+    };
+    let built = build_layer(std::slice::from_ref(contribution), &policy)?;
+    let keys: HashMap<ContentHash, (&[u8], &[u8])> = built
+        .layer
+        .slices
+        .iter()
+        .map(|r| {
+            (
+                r.content_hash,
+                (r.first_key.as_slice(), r.last_key.as_slice()),
+            )
+        })
+        .collect();
+    let files = built
+        .slices
+        .iter()
+        .map(|(hash, bytes)| {
+            let (first_key, last_key) = keys.get(hash).ok_or_else(|| {
+                TermIndexError::Build("a built slice its layer does not list".into())
+            })?;
+            match bytes {
+                BuiltBytes::Spilled { path, .. } => Ok(SliceFile {
+                    path: path.clone(),
+                    first_key: first_key.to_vec(),
+                    last_key: last_key.to_vec(),
+                    base: 0,
+                }),
+                BuiltBytes::Resident(_) => {
+                    Err(TermIndexError::Build("a layer part was not spilled".into()))
+                }
+            }
+        })
+        .collect::<Result<Vec<_>, TermIndexError>>()?;
+    Ok(Some(LayerPart {
+        superfile_id: contribution.superfile_id,
+        files,
+        _bytes: (built.slices, built.tiers),
+    }))
+}
+
+/// Whether layers built one contribution at a time cut every head as a
+/// build from all of them would: only when no budget across superfiles
+/// applies.
+fn parts_keep_every_entry(policy: &BuildPolicy) -> bool {
+    policy.tier_entries_per_term == u64::MAX
+}
+
+/// [`build_layer_with`] merged from `parts`, one per contribution in the
+/// same order, rather than built from the contributions: the writes are
+/// the same bytes. The key ranges are the ones a build from `contributions`
+/// would cut, and each range merges the parts' slices that reach into it
+/// as that build's range merges the contributions, so every range writes
+/// what the build's would. The parts' heads arrive already keyed and
+/// grouped, so a range splices most tiers rather than sorting and encoding
+/// their entries again.
+pub(crate) fn merge_layer_parts_with(
+    contributions: &[Contribution],
+    parts: &[&LayerPart],
+    policy: &BuildPolicy,
+    on_part: Option<&(dyn Fn(&MergedLayer) + Sync)>,
+) -> Result<BuiltLayer, TermIndexError> {
+    if parts.len() != contributions.len()
+        || parts
+            .iter()
+            .zip(contributions)
+            .any(|(part, c)| part.superfile_id != c.superfile_id)
+    {
+        return Err(TermIndexError::Build(
+            "layer parts do not match the contributions".into(),
+        ));
+    }
+    let ranges = build_ranges(contributions, policy)?;
+    let ordinals: Vec<Option<u32>> = (0..contributions.len() as u32).map(Some).collect();
+    let policy = BuildPolicy {
+        scoring_by_ordinal: Arc::new(contributions.iter().map(|c| c.scoring.clone()).collect()),
+        ..policy.clone()
+    };
+    let sources: Vec<Vec<SliceFile>> = parts
+        .iter()
+        .enumerate()
+        .map(|(ordinal, part)| {
+            part.files
+                .iter()
+                .map(|file| SliceFile {
+                    base: ordinal as u32,
+                    ..file.clone()
+                })
+                .collect()
+        })
+        .collect();
+    let mut built = run_ranges_with(
+        &ranges,
+        &policy,
+        |start, end| {
+            let in_range: Vec<Vec<SliceFile>> = sources
+                .iter()
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter(|slice| slice_reaches(slice, start, end))
+                        .cloned()
+                        .collect()
+                })
+                .collect();
+            merge_range(&in_range, start, end, &ordinals, &policy)
+        },
+        on_part,
+    )?;
+    built.layer.ordinals = Some(0..contributions.len() as u32);
+    Ok(BuiltLayer {
+        superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
+        id_mins: contributions.iter().map(|c| c.id_min).collect(),
+        layer: built.layer,
+        slices: built.slices,
+        tiers: built.tiers,
+    })
+}
+
 /// Ranges a build from contributions is cut into at most. A range holds a
 /// reader per contribution and the writer's open slice and tier chunk, a
 /// few tens of megabytes, so a wide host's pool is the bound in practice
